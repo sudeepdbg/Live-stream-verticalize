@@ -1,15 +1,18 @@
-# ── Desktop (PyQt6) ──────────────────────────────────────────
-PyQt6>=6.6.0
-opencv-python>=4.9.0
-numpy>=1.26.0
-
-# ── Web / Streamlit ──────────────────────────────────────────
+# ── Core Web Dependencies ─────────────────────────────────────
 streamlit>=1.35.0
+pandas>=2.0.0
 
-# NOTE: FFmpeg must be installed at the OS level.
-#   Ubuntu/Debian : sudo apt-get install ffmpeg
-#   macOS         : brew install ffmpeg
-#   Windows       : https://ffmpeg.org/download.html  → add to PATH
-#
-# The opencv-python wheel bundles its own FFmpeg build which is sufficient
-# for common codecs (H.264, HEVC, AV1 require the full FFmpeg CLI for encoding).
+# ── Optional: AI Enhancement Features (Uncomment to enable) ──
+# realesrgan-pytorch>=0.3.0          # True neural upscaling (Real-ESRGAN)
+# onnxruntime>=1.16.0                # CPU inference for ONNX models
+# onnxruntime-gpu>=1.16.0            # GPU inference (CUDA required)
+
+# ── Development / Desktop (Not needed for Streamlit web app) ─
+# PyQt6>=6.6.0                       # Desktop GUI only
+# opencv-python>=4.9.0               # Optional: if adding OpenCV-based filters
+
+# ── Note: FFmpeg must be installed at OS level ────────────────
+# Ubuntu/Debian: sudo apt-get install ffmpeg
+# macOS:         brew install ffmpeg  
+# Windows:       https://ffmpeg.org/download.html → add to PATH
+# Streamlit Cloud / HF Spaces: add "ffmpeg" to packages.txt (above)
