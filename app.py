@@ -13,7 +13,7 @@ import pandas as pd
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="VideoForge · Pro Encoder + AI Enhancement",
+    page_title="AI Encoder",
     page_icon="▶️",
     layout="wide",
     initial_sidebar_state="collapsed",
