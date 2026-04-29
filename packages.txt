@@ -1,4 +1,1 @@
 ffmpeg
-# Optional for advanced AI features:
-realesrgan-pytorch  # For true neural upscaling
-onnxruntime-gpu     # For GPU-accelerated inference
