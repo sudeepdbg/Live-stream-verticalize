@@ -1353,7 +1353,7 @@ with tab_dl:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center;color:#94a3b8;font-size:0.78rem;padding:12px 0">'
-    "VideoForge AI Pro · FFmpeg + Streamlit · ✨ Vnova-style enhancements · DM Sans"
+    "AI Encoder · FFmpeg + Streamlit · ✨ Vnova-style enhancements · DM Sans"
     "</div>",
     unsafe_allow_html=True,
 )
