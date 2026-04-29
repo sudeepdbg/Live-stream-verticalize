@@ -434,18 +434,57 @@ def encode(input_path, output_path, codec, crf, enhance_settings: dict, src_meta
         return False, str(e), "\n".join(lines), time.time() - t0
 
 
+def get_resolution(path: str):
+    """Return (width, height) of first video stream, or (0, 0) on failure."""
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-select_streams", "v:0", path],
+            text=True, stderr=subprocess.DEVNULL, timeout=15,
+        )
+        d = json.loads(out)
+        s = d.get("streams", [{}])[0]
+        return int(s.get("width", 0)), int(s.get("height", 0))
+    except Exception:
+        return 0, 0
+
+
 def quality_metrics(ref: str, dist: str, do_vmaf: bool) -> dict:
-    """Compute PSNR, SSIM and optionally VMAF via FFmpeg."""
+    """Compute PSNR, SSIM and optionally VMAF via FFmpeg.
+
+    Handles resolution mismatches (e.g. upscaled output) by scaling the
+    reference UP to match the distorted file before comparison, which is the
+    correct approach: we want to measure how well the upscaled output
+    reproduces the *upscaled* reference, not punish for resolution change.
+    """
     res = {"psnr": None, "ssim": None, "vmaf": None}
 
-    # PSNR + SSIM
+    # Detect whether ref and dist have matching dimensions
+    ref_w, ref_h = get_resolution(ref)
+    dist_w, dist_h = get_resolution(dist)
+    resolutions_match = (ref_w == dist_w and ref_h == dist_h)
+
+    # Build a filter_complex that scales ref to dist resolution when needed.
+    # [0:v] = dist (encoded output), [1:v] = ref (original source)
+    if resolutions_match:
+        # Simple path — no scaling required
+        psnr_fc = "[0:v][1:v]psnr[po];[0:v][1:v]ssim[so]"
+        vmaf_fc = "[0:v][1:v]libvmaf=log_fmt=json:log_path={path}"
+    else:
+        # Scale ref to match dist so filters can run.
+        # Use the same algorithm as the encode (lanczos) for fairness.
+        scale_filter = f"[1:v]scale={dist_w}:{dist_h}:flags=lanczos[ref_scaled]"
+        psnr_fc = f"{scale_filter};[0:v][ref_scaled]psnr[po];[0:v][ref_scaled]ssim[so]"
+        vmaf_fc = f"{scale_filter};[0:v][ref_scaled]libvmaf=log_fmt=json:log_path={{path}}"
+
+    # ── PSNR + SSIM ────────────────────────────────────────────────────────
     try:
         cmd = [
             "ffmpeg", "-y", "-i", dist, "-i", ref,
-            "-filter_complex", "[0:v][1:v]psnr[po];[0:v][1:v]ssim[so]",
-            "-map", "[po]", "-map", "[so]", "-f", "null", "-"
+            "-filter_complex", psnr_fc,
+            "-map", "[po]", "-map", "[so]", "-f", "null", "-",
         ]
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=180)
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=240)
         for line in out.splitlines():
             if re.search(r"PSNR", line, re.I):
                 m = re.search(r"average[:\s]+([0-9.]+|inf)", line, re.I)
@@ -459,16 +498,15 @@ def quality_metrics(ref: str, dist: str, do_vmaf: bool) -> dict:
     except Exception:
         pass
 
-    # VMAF (optional)
+    # ── VMAF (optional) ────────────────────────────────────────────────────
     if do_vmaf:
         try:
             vf = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
             vf.close()
             cmd = [
                 "ffmpeg", "-y", "-i", dist, "-i", ref,
-                "-filter_complex",
-                f"[0:v][1:v]libvmaf=log_fmt=json:log_path={vf.name}",
-                "-f", "null", "-"
+                "-filter_complex", vmaf_fc.format(path=vf.name),
+                "-f", "null", "-",
             ]
             subprocess.run(cmd, capture_output=True, timeout=300, check=True)
             with open(vf.name) as f:
@@ -1038,7 +1076,21 @@ if enable_encoding:
             bar.progress(1.0, text="✅ Encoding complete — computing quality metrics…")
             out_meta = probe(out_path)
             out_sz = os.path.getsize(out_path) / (1024 * 1024)
-            saved_pct = (1 - out_sz / sz_mb) * 100 if sz_mb > 0 else 0.0
+
+            # Raw size delta
+            raw_saved = (1 - out_sz / sz_mb) * 100 if sz_mb > 0 else 0.0
+
+            # Detect upscaling and compute pixel-normalised metrics
+            src_w, src_h = meta["width"], meta["height"]
+            out_w = out_meta.get("width") or src_w
+            out_h = out_meta.get("height") or src_h
+            pixel_scale = (out_w * out_h) / (src_w * src_h) if src_w * src_h > 0 else 1.0
+            is_upscaled = pixel_scale > 1.05
+
+            # Pixel-normalised: how big would the output be at source resolution?
+            norm_out_sz = out_sz / pixel_scale if pixel_scale > 0 else out_sz
+            norm_cr = sz_mb / norm_out_sz if norm_out_sz > 0 else 0.0
+            norm_saved = (1 - norm_out_sz / sz_mb) * 100 if sz_mb > 0 else 0.0
 
             qual = {"psnr": None, "ssim": None, "vmaf": None}
             if do_psnr or (do_vmaf and HAS_VMAF):
@@ -1049,14 +1101,18 @@ if enable_encoding:
             st.session_state.results.append({
                 "codec": codec, "crf": crf,
                 "size_mb": out_sz, "bitrate": out_meta.get("vbitrate_kbps", 0),
-                "enc_time": enc_t, "saved": saved_pct,
-                "cr": sz_mb / out_sz if out_sz > 0 else 0.0,
+                "enc_time": enc_t,
+                "saved": norm_saved if is_upscaled else raw_saved,
+                "cr": norm_cr if is_upscaled else (sz_mb / out_sz if out_sz > 0 else 0.0),
+                "raw_saved": raw_saved,
+                "is_upscaled": is_upscaled,
+                "pixel_scale": pixel_scale,
                 "psnr": qual["psnr"], "ssim": qual["ssim"], "vmaf": qual["vmaf"],
                 "path": out_path,
                 "acodec": meta["acodec"], "abitrate": meta["abitrate_kbps"],
                 "sample_rate": meta["sample_rate"], "channels": meta["channels"],
                 "enhancements": active_enh_dict,
-                "out_res": f"{out_meta.get('width', meta['width'])}×{out_meta.get('height', meta['height'])}",
+                "out_res": f"{out_w}×{out_h}",
                 "out_fps": out_meta.get("fps", meta["fps"]),
             })
             bar.empty()
@@ -1066,18 +1122,21 @@ if enable_encoding:
                 q_parts.append(f"VMAF {qual['vmaf']:.1f}")
             if qual["psnr"] is not None:
                 q_parts.append(f"PSNR {qual['psnr']:.2f} dB")
-            q_str = " · ".join(q_parts) if q_parts else "Analysis complete"
+            q_str = " · ".join(q_parts) if q_parts else "No quality metrics (check PSNR/SSIM checkbox)"
 
-            enh_summary = " + ".join(
-                k.capitalize() for k in _enh_keys if es.get(k)
-            )
+            enh_summary = " + ".join(k.capitalize() for k in _enh_keys if es.get(k))
             enh_str = f" · ✨ {enh_summary}" if enh_summary else ""
 
-            st.success(
-                f"✅ {codec} CRF {crf}{enh_str} · "
-                f"{out_sz:.2f} MB · saved {saved_pct:.1f}% · "
-                f"{enc_t:.1f}s · {q_str}"
-            )
+            if is_upscaled:
+                size_str = (
+                    f"{out_sz:.2f} MB ({pixel_scale:.1f}× pixels | "
+                    f"norm. {norm_saved:.1f}% {'saved' if norm_saved >= 0 else 'larger vs src'})"
+                )
+            else:
+                dir_word = "saved" if raw_saved >= 0 else "larger by"
+                size_str = f"{out_sz:.2f} MB · {dir_word} {abs(raw_saved):.1f}%"
+
+            st.success(f"✅ {codec} CRF {crf}{enh_str} · {size_str} · {enc_t:.1f}s · {q_str}")
 
 else:
     # ── Test Player Mode ──────────────────────────────────────────────────────
@@ -1161,13 +1220,33 @@ with tab_tbl:
         res_info = r.get("out_res", f"{meta['width']}×{meta['height']}")
         fps_info = r.get("out_fps", meta["fps"])
 
+        # Build Saved column — show normalised value with tooltip for upscaled
+        if r.get("is_upscaled"):
+            ps = r.get("pixel_scale", 1.0)
+            saved_cell = (
+                f'<span title="Raw: {r["raw_saved"]:+.1f}% (output is {ps:.1f}× more pixels). '
+                f'Shown value is pixel-normalised." style="color:#7c3aed;font-weight:600">'
+                f'{r["saved"]:.1f}%<sup style="font-size:0.65em"> norm</sup></span>'
+            )
+            cr_cell = (
+                f'<span title="Pixel-normalised compression ratio" style="color:#7c3aed;font-weight:600">'
+                f'{r["cr"]:.2f}×<sup style="font-size:0.65em"> norm</sup></span>'
+            )
+        else:
+            saved_val = r["saved"]
+            if saved_val < 0:
+                saved_cell = f'<span style="color:#b91c1c;font-weight:600">{saved_val:.1f}%</span>'
+            else:
+                saved_cell = f"{saved_val:.1f}%"
+            cr_cell = best_mark(r["cr"], best_cr, "{:.2f}×", True)
+
         rows_html += f"""<tr>
           <td>{tag}</td>
           <td>{r['crf']}</td>
           <td>{best_mark(r['size_mb'], best_sz, '{:.2f} MB')}</td>
           <td>{r['bitrate']} kbps</td>
-          <td>{best_mark(r['cr'], best_cr, '{:.2f}×', True)}</td>
-          <td>{r['saved']:.1f}%</td>
+          <td>{cr_cell}</td>
+          <td>{saved_cell}</td>
           <td>{best_mark(r['enc_time'], best_spd, '{:.1f}s')}</td>
           <td>{vmaf_cell}</td>
           <td>{psnr_display(r['psnr'])}</td>
