@@ -1,5 +1,5 @@
 """
-VideoForge Web – Encoder + VMAF Analytics + AI Video Enhancement
+VideoForge Web – Encoder + VMAF Analytics + AI Video Enhancement + Real-Time Player Performance
 Run:  streamlit run app.py
 
 Deploy:
@@ -8,33 +8,28 @@ Deploy:
 
 Changelog (bug-fixes + enhancements):
   BUG  1 – quality_metrics: fixed PSNR/SSIM lavfi filter graph so both filters
-            run independently with their own null sinks (previous graph caused
-            "Output with label [so] does not exist" FFmpeg errors).
-  BUG  2 – unsharp filter: corrected to 6-param form
-            `lx:ly:la:cx:cy:ca` (was missing chroma params → FFmpeg warning /
-            ignored chroma sharpening).
-  BUG  3 – best_mark(): higher_better flag was declared but never used — both
-            branches did the same min comparison. Fixed to use max() for metrics
-            where higher is better (VMAF, PSNR, compression ratio).
-  BUG  4 – SSE SSIM filter mapped output `[so]` was sent to `-map [so] -f null`
-            which conflicts; fixed to use `nullsink` for each filter output.
-  BUG  5 – deblock alpha/beta mapping was correct but the slider range comment
-            was misleading — added clear inline docs.
-  BUG  6 – `encode()` AV1 `-crf` flag: libaom-av1 uses `-crf` but also needs
-            `-b:v 0` to enable CRF mode; added that flag.
-  NEW  1 – Batch CRF Sweep: encode the same source at a range of CRFs in one
-            click and plot the rate-distortion curve.
+            run independently with their own null sinks.
+  BUG  2 – unsharp filter: corrected to 6-param form `lx:ly:la:cx:cy:ca`.
+  BUG  3 – best_mark(): higher_better flag was declared but never used.
+  BUG  4 – SSE SSIM filter mapped output fixed to use nullsink.
+  BUG  5 – deblock alpha/beta mapping range comment clarified.
+  BUG  6 – encode() AV1 `-crf` flag: added `-b:v 0` to enable CRF mode.
+  NEW  1 – Batch CRF Sweep: encode at a range of CRFs and plot rate-distortion.
   NEW  2 – CSV Export: download the full comparison table as a CSV file.
-  NEW  3 – Per-result expandable FFmpeg log preserved in session for debugging.
-  NEW  4 – Enhancement diff preview: shows before/after resolution & FPS side
-            by side before encoding starts.
-  NEW  5 – Color-coded SSIM display (was always shown as raw float).
+  NEW  3 – Per-result expandable FFmpeg log preserved in session.
+  NEW  4 – Enhancement diff preview: before/after resolution & FPS side by side.
+  NEW  5 – Color-coded SSIM display.
   NEW  6 – Audio loudness probe via `ffmpeg -af volumedetect`.
   NEW  7 – Quality Radar chart (VMAF / PSNR / SSIM normalised) when ≥2 results.
+  NEW  8 – Real-Time Player Performance Panel: adaptive bitrate dashboard with
+            bandwidth history, buffer level, bitrate ladder, ABR decisions log,
+            RTT, drop events, and guardrail toggles — all rendered as a live
+            HTML/JS component inside Streamlit.
 """
 
 import os, io, csv, json, subprocess, tempfile, time, re
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -283,10 +278,7 @@ def probe(path: str) -> dict:
 
 
 def probe_loudness(path: str) -> dict:
-    """
-    NEW: Measure integrated loudness + true peak via ffmpeg volumedetect.
-    Returns dict with mean_volume, max_volume (dBFS).
-    """
+    """Measure integrated loudness + true peak via ffmpeg volumedetect."""
     res = {"mean_volume": None, "max_volume": None}
     try:
         cmd = ["ffmpeg", "-y", "-i", path, "-af", "volumedetect", "-f", "null", "-"]
@@ -307,43 +299,33 @@ def build_enhance_filters(settings: dict, src_meta: dict) -> list:
     """Build FFmpeg filter chain for AI enhancements."""
     filters = []
 
-    # ── Denoise ──────────────────────────────────────────────────────────────
     if settings.get("denoise"):
         strength = float(settings.get("denoise_strength", 5))
         s2 = round(strength / 2, 1)
         filters.append(f"hqdn3d={strength}:{strength}:{s2}:{s2}")
 
-    # ── Deblock ───────────────────────────────────────────────────────────────
-    # Slider 1-10 → FFmpeg alpha 0.1-1.0, beta = alpha * 0.5
     if settings.get("deblock"):
         strength = int(settings.get("deblock_strength", 5))
         alpha = round(strength / 10.0, 2)
         beta  = round(alpha * 0.5, 2)
         filters.append(f"deblock=filter=strong:alpha={alpha}:beta={beta}")
 
-    # ── Sharpening ────────────────────────────────────────────────────────────
-    # BUG FIX: unsharp takes 6 params: lx:ly:la:cx:cy:ca
-    # Old code: f"unsharp=5:5:{amount}:{threshold}" — only 4 params, wrong meaning
     if settings.get("sharpen"):
         amount    = float(settings.get("sharpen_amount", 0.5))
-        # cx/cy chroma kernel: use smaller kernel for chroma (3×3)
-        c_amount  = round(amount * 0.5, 2)   # softer chroma sharpening
+        c_amount  = round(amount * 0.5, 2)
         filters.append(f"unsharp=lx=5:ly=5:la={amount}:cx=3:cy=3:ca={c_amount}")
 
-    # ── Color Enhancement ─────────────────────────────────────────────────────
     if settings.get("color_enhance"):
         vibrance = float(settings.get("vibrance", 0.15))
         contrast = float(settings.get("contrast", 1.0))
         sat = round(1.0 + vibrance, 4)
         filters.append(f"eq=contrast={contrast}:saturation={sat}")
 
-    # ── HDR Conversion ────────────────────────────────────────────────────────
     if settings.get("hdr_convert") and src_meta.get("bit_depth", 8) >= 10:
         filters.append("zscale=transfer=linear,format=gbrpf32le")
         filters.append(f"tonemap={settings.get('tonemap_algo','hable')}:desat=0.2")
         filters.append("zscale=transfer=bt709:matrix=bt709:range=tv,format=yuv420p10le")
 
-    # ── Upscaling ─────────────────────────────────────────────────────────────
     if settings.get("upscale"):
         target_w = int(settings.get("upscale_width",  src_meta["width"]  * 2))
         target_h = int(settings.get("upscale_height", src_meta["height"] * 2))
@@ -354,7 +336,6 @@ def build_enhance_filters(settings: dict, src_meta: dict) -> list:
             f"scale={target_w}:{target_h}:flags={algo}+accurate_rnd+full_chroma_int"
         )
 
-    # ── Frame Interpolation ───────────────────────────────────────────────────
     if settings.get("frame_interp"):
         target_fps = int(settings.get("target_fps", 60))
         filters.append(
@@ -386,16 +367,10 @@ def estimate_processing_time(src_meta: dict, settings: dict) -> str:
 
 def encode(input_path, output_path, codec, crf, enhance_settings: dict, src_meta: dict,
            progress_cb=None, duration=0.0):
-    """
-    Encode with optional enhancement filters.
-
-    BUG FIX (AV1): libaom-av1 requires `-b:v 0` alongside `-crf` to activate
-    CRF mode; without it the CRF value is silently ignored and ABR is used.
-    """
+    """Encode with optional enhancement filters."""
     cmap = {
         "AVC (H.264)":  ("libx264",    ["-preset", "fast"]),
         "HEVC (H.265)": ("libx265",    ["-preset", "fast"]),
-        # BUG FIX: added -b:v 0 for libaom-av1 CRF mode
         "AV1":          ("libaom-av1", ["-b:v", "0", "-cpu-used", "8",
                                         "-tile-columns", "2", "-threads", "4",
                                         "-usage", "realtime"]),
@@ -425,16 +400,16 @@ def encode(input_path, output_path, codec, crf, enhance_settings: dict, src_meta
                     pass
         proc.wait()
         elapsed = time.time() - t0
-        log = "\n".join(lines[-80:])   # keep more log lines for debugging
+        log = "\n".join(lines[-80:])
 
         if proc.returncode == 0:
             return True, "Done!", log, elapsed
 
         hints = {
-            -6:  "OOM — AI enhancements need extra RAM. Try disabling upscaling/frame interpolation.",
-            -9:  "OOM (SIGKILL) — reduce enhancement complexity or file size.",
-            -11: "Segfault — check filter compatibility with your FFmpeg build.",
-            1:   "FFmpeg error — see log below for details.",
+            -6:  "OOM — AI enhancements need extra RAM.",
+            -9:  "OOM (SIGKILL) — reduce enhancement complexity.",
+            -11: "Segfault — check filter compatibility.",
+            1:   "FFmpeg error — see log below.",
         }
         return False, hints.get(proc.returncode, f"FFmpeg exited with code {proc.returncode}"), log, elapsed
 
@@ -445,19 +420,9 @@ def encode(input_path, output_path, codec, crf, enhance_settings: dict, src_meta
 
 
 def quality_metrics(ref: str, dist: str, do_vmaf: bool) -> dict:
-    """
-    Compute PSNR, SSIM and optionally VMAF via FFmpeg.
-
-    BUG FIX: The original code used a split filter graph that mapped [po] and
-    [so] outputs to `-map` then `-f null -`, which causes FFmpeg to error
-    ("Output with label … does not exist in any defined filter graph").
-
-    Fix: run PSNR and SSIM as separate filter chains with `nullsink`, matching
-    the documented FFmpeg usage for these filters.
-    """
+    """Compute PSNR, SSIM and optionally VMAF via FFmpeg."""
     res = {"psnr": None, "ssim": None, "vmaf": None}
 
-    # ── PSNR ─────────────────────────────────────────────────────────────────
     try:
         cmd = [
             "ffmpeg", "-y", "-i", dist, "-i", ref,
@@ -474,7 +439,6 @@ def quality_metrics(ref: str, dist: str, do_vmaf: bool) -> dict:
     except Exception:
         pass
 
-    # ── SSIM ─────────────────────────────────────────────────────────────────
     try:
         cmd = [
             "ffmpeg", "-y", "-i", dist, "-i", ref,
@@ -490,7 +454,6 @@ def quality_metrics(ref: str, dist: str, do_vmaf: bool) -> dict:
     except Exception:
         pass
 
-    # ── VMAF (optional) ──────────────────────────────────────────────────────
     if do_vmaf:
         try:
             vf = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
@@ -532,7 +495,6 @@ def vmaf_display(v):
     return           f"{v:.1f} · Poor",          "q-bad"
 
 def ssim_display(v) -> str:
-    """NEW: colour-coded SSIM (was raw float)."""
     if v is None:
         return "—"
     label = (
@@ -564,19 +526,7 @@ def format_channels(ch: int) -> str:
     return {1: "Mono", 2: "Stereo", 6: "5.1", 8: "7.1"}.get(ch, f"{ch} ch")
 
 
-# ── BUG FIX: best_mark now correctly uses higher_better ──────────────────────
 def best_mark(val, best, fmt="{}", higher_better=False):
-    """
-    Format a metric value and append a 'Best' badge if it matches the best.
-
-    BUG FIX: Original code used the same comparison branch regardless of
-    higher_better, meaning compression ratio (higher=better) was incorrectly
-    treated the same as file size (lower=better) — but since both checked
-    abs(val-best)<0.01 against their own precomputed best, the badge still
-    appeared on the correct row by coincidence. The real bug was that callers
-    passed the wrong best value for higher_better metrics (e.g., max for size).
-    This version makes the intent explicit and documents the contract clearly.
-    """
     if val is None or best is None:
         return "—"
     s = fmt.format(val)
@@ -587,7 +537,6 @@ def best_mark(val, best, fmt="{}", higher_better=False):
 
 
 def results_to_csv(results: list, src_meta: dict, sz_mb: float) -> bytes:
-    """NEW: Export comparison table as CSV bytes."""
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow([
@@ -616,6 +565,671 @@ def results_to_csv(results: list, src_meta: dict, sz_mb: float) -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Player Performance Panel HTML Component
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_player_performance_html(meta: dict, sz_mb: float) -> str:
+    """
+    Build the real-time player performance dashboard as a self-contained
+    HTML/JS component. Simulates live ABR (adaptive bitrate) analytics based
+    on actual source metadata, with animated updates every second.
+    """
+    width  = meta.get("width", 1920)
+    height = meta.get("height", 1080)
+    fps    = meta.get("fps", 30.0)
+    bitrate_kbps = meta.get("vbitrate_kbps", 4000) or 4000
+    duration = meta.get("duration", 154.0)
+
+    # Build a realistic bitrate ladder from source resolution
+    def ladder_from_res(w, h, bps):
+        rungs = []
+        if h >= 2160 or w >= 3840:
+            rungs = [("4K", 16000), ("1080p", 8000), ("720p", 4000), ("540p", 2000), ("480p", 1200), ("360p", 600)]
+        elif h >= 1080 or w >= 1920:
+            rungs = [("1080p", 8000), ("720p", 4000), ("540p", 2000), ("480p", 1200), ("360p", 600)]
+        elif h >= 720 or w >= 1280:
+            rungs = [("720p", 4000), ("540p", 2000), ("480p", 1200), ("360p", 600)]
+        else:
+            rungs = [("480p", 1200), ("360p", 600), ("240p", 300)]
+        # Label the current/active rung as the one matching source bitrate best
+        return rungs
+
+    ladder = ladder_from_res(width, height, bitrate_kbps)
+    # active rung = closest bitrate to source
+    active_idx = min(range(len(ladder)), key=lambda i: abs(ladder[i][1] - bitrate_kbps))
+    active_label = ladder[active_idx][0]
+    active_bps   = ladder[active_idx][1]
+    max_bps = ladder[0][1]
+
+    ladder_js = json.dumps([{"label": l, "bps": b} for l, b in ladder])
+    active_js = active_label
+    duration_js = max(int(duration), 10)
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #f7f7f5;
+    color: #1a1a1a;
+    font-size: 13px;
+  }}
+  .panel {{
+    background: #f7f7f5;
+    padding: 0;
+    min-height: 100vh;
+  }}
+  .panel-header {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 18px 12px;
+    border-bottom: 1px solid #e8e8e5;
+    background: #ffffff;
+  }}
+  .panel-title {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    color: #1a1a1a;
+  }}
+  .status-dot {{
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #22c55e;
+    animation: pulse 2s ease-in-out infinite;
+  }}
+  @keyframes pulse {{
+    0%, 100% {{ opacity: 1; transform: scale(1); }}
+    50%       {{ opacity: 0.6; transform: scale(0.85); }}
+  }}
+  .explain-btn {{
+    font-size: 12px; color: #3b82f6; cursor: pointer;
+    background: none; border: 1px solid #dbeafe;
+    border-radius: 6px; padding: 4px 10px; font-weight: 500;
+    display: flex; align-items: center; gap: 4px;
+  }}
+  .explain-btn:hover {{ background: #eff6ff; }}
+
+  /* ── Metrics grid ─────────────────────────────────────── */
+  .metrics-grid {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    padding: 14px 16px;
+  }}
+  .metric-card {{
+    background: #ffffff;
+    border: 1px solid #e8e8e5;
+    border-radius: 10px;
+    padding: 13px 16px;
+  }}
+  .metric-label {{
+    font-size: 11px;
+    color: #888;
+    font-weight: 500;
+    margin-bottom: 4px;
+    letter-spacing: 0.01em;
+  }}
+  .metric-value {{
+    font-size: 26px;
+    font-weight: 700;
+    color: #1a1a1a;
+    line-height: 1;
+    letter-spacing: -0.03em;
+  }}
+  .metric-value .unit {{
+    font-size: 14px;
+    font-weight: 500;
+    color: #888;
+    margin-left: 2px;
+  }}
+  .metric-sub {{
+    font-size: 11px;
+    margin-top: 5px;
+    font-weight: 500;
+  }}
+  .sub-good  {{ color: #16a34a; }}
+  .sub-warn  {{ color: #ca8a04; }}
+  .sub-bad   {{ color: #dc2626; }}
+  .sub-neutral {{ color: #64748b; }}
+
+  /* ── Buffer level ─────────────────────────────────────── */
+  .section {{
+    padding: 0 16px 14px;
+  }}
+  .section-label {{
+    font-size: 12px;
+    font-weight: 600;
+    color: #1a1a1a;
+    margin-bottom: 8px;
+  }}
+  .buffer-track {{
+    background: #e8e8e5;
+    border-radius: 6px;
+    height: 10px;
+    position: relative;
+    overflow: hidden;
+  }}
+  .buffer-fill {{
+    height: 100%;
+    border-radius: 6px;
+    background: #22c55e;
+    transition: width 0.8s ease;
+    position: relative;
+  }}
+  .buffer-fill::after {{
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.25) 50%, transparent 100%);
+    animation: shimmer 2s ease-in-out infinite;
+    background-size: 200% 100%;
+  }}
+  @keyframes shimmer {{
+    0%   {{ background-position: -200% 0; }}
+    100% {{ background-position: 200% 0; }}
+  }}
+  .buffer-labels {{
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    color: #888;
+    margin-top: 4px;
+  }}
+  .guard-marker {{
+    color: #f59e0b;
+    font-weight: 600;
+  }}
+
+  /* ── Bitrate ladder ───────────────────────────────────── */
+  .ladder-row {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 0;
+  }}
+  .ladder-badge {{
+    font-size: 11px;
+    font-weight: 600;
+    color: #64748b;
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
+    border-radius: 5px;
+    padding: 2px 8px;
+    min-width: 46px;
+    text-align: center;
+  }}
+  .ladder-badge.active {{
+    background: #dbeafe;
+    border-color: #93c5fd;
+    color: #1e40af;
+  }}
+  .ladder-bar-track {{
+    flex: 1;
+    background: #f1f5f9;
+    border-radius: 4px;
+    height: 6px;
+    overflow: hidden;
+  }}
+  .ladder-bar-fill {{
+    height: 100%;
+    border-radius: 4px;
+    background: #cbd5e1;
+    transition: width 1s ease;
+  }}
+  .ladder-bar-fill.active {{
+    background: #22c55e;
+  }}
+  .ladder-bps {{
+    font-size: 11px;
+    color: #64748b;
+    min-width: 38px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }}
+
+  /* ── Bandwidth history chart ──────────────────────────── */
+  .chart-wrap {{
+    position: relative;
+    height: 72px;
+    margin: 0 16px 14px;
+  }}
+  canvas {{
+    width: 100%;
+    height: 100%;
+    border-radius: 6px;
+  }}
+
+  /* ── ABR decisions ────────────────────────────────────── */
+  .decisions-list {{
+    max-height: 130px;
+    overflow-y: auto;
+    border: 1px solid #e8e8e5;
+    border-radius: 8px;
+    background: #ffffff;
+  }}
+  .decisions-list::-webkit-scrollbar {{ width: 4px; }}
+  .decisions-list::-webkit-scrollbar-thumb {{ background: #e2e8f0; border-radius: 2px; }}
+  .decision-row {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 12px;
+    border-bottom: 1px solid #f1f5f9;
+    font-size: 12px;
+    animation: fadeIn 0.3s ease;
+  }}
+  @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(-4px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+  .decision-row:last-child {{ border-bottom: none; }}
+  .dec-time {{ color: #888; min-width: 32px; font-variant-numeric: tabular-nums; font-size: 11px; }}
+  .dec-arrow {{ font-size: 11px; }}
+  .dec-up   {{ color: #16a34a; }}
+  .dec-down {{ color: #dc2626; }}
+  .dec-label {{ font-weight: 500; }}
+
+  /* ── Guardrails ───────────────────────────────────────── */
+  .guardrails-grid {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    padding: 0 16px 16px;
+  }}
+  .guardrail-row {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #ffffff;
+    border: 1px solid #e8e8e5;
+    border-radius: 8px;
+    padding: 9px 12px;
+  }}
+  .guardrail-label {{ font-size: 12px; font-weight: 500; color: #1a1a1a; }}
+  .toggle {{
+    width: 36px; height: 20px;
+    background: #3b82f6;
+    border-radius: 10px;
+    position: relative;
+    cursor: pointer;
+    transition: background 0.2s;
+    flex-shrink: 0;
+  }}
+  .toggle.off {{ background: #e2e8f0; }}
+  .toggle::after {{
+    content: '';
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 16px; height: 16px;
+    background: white;
+    border-radius: 50%;
+    transition: transform 0.2s;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+  }}
+  .toggle:not(.off)::after {{ transform: translateX(16px); }}
+
+  /* Divider */
+  hr {{ border: none; border-top: 1px solid #e8e8e5; margin: 0 0 14px; }}
+</style>
+</head>
+<body>
+<div class="panel">
+
+  <!-- Header -->
+  <div class="panel-header">
+    <div class="panel-title">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="abrStatus">adaptive bitrate — stable</span>
+    </div>
+    <button class="explain-btn" onclick="toggleExplain()">explain ↗</button>
+  </div>
+
+  <!-- Metrics grid -->
+  <div class="metrics-grid">
+    <div class="metric-card">
+      <div class="metric-label">bandwidth</div>
+      <div class="metric-value"><span id="bwVal">4.9</span><span class="unit">Mbps</span></div>
+      <div class="metric-sub sub-good" id="bwSub">+ above threshold</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">buffer health</div>
+      <div class="metric-value"><span id="bufVal">20.0</span><span class="unit">s</span></div>
+      <div class="metric-sub sub-good" id="bufSub">healthy</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">RTT</div>
+      <div class="metric-value"><span id="rttVal">129</span><span class="unit">ms</span></div>
+      <div class="metric-sub sub-warn" id="rttSub">high</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">drop events</div>
+      <div class="metric-value" id="dropVal">0</div>
+      <div class="metric-sub sub-neutral" id="dropSub">— no rebuffer</div>
+    </div>
+  </div>
+
+  <!-- Buffer level -->
+  <div class="section">
+    <div class="section-label">buffer level</div>
+    <div class="buffer-track">
+      <div class="buffer-fill" id="bufferBar" style="width:100%"></div>
+    </div>
+    <div class="buffer-labels">
+      <span>0s</span>
+      <span class="guard-marker">guard: 4s</span>
+      <span id="bufMax">20s</span>
+    </div>
+  </div>
+
+  <hr>
+
+  <!-- Bitrate ladder -->
+  <div class="section">
+    <div class="section-label">bitrate ladder</div>
+    <div id="ladderContainer"></div>
+  </div>
+
+  <hr>
+
+  <!-- Bandwidth history chart -->
+  <div class="section">
+    <div class="section-label">bandwidth history (30s)</div>
+  </div>
+  <div class="chart-wrap">
+    <canvas id="bwChart"></canvas>
+  </div>
+
+  <hr>
+
+  <!-- ABR decisions -->
+  <div class="section">
+    <div class="section-label">abr decisions</div>
+    <div class="decisions-list" id="decisionsList"></div>
+  </div>
+
+  <hr style="margin-top:8px">
+
+  <!-- Guardrails -->
+  <div class="section" style="padding-bottom:4px">
+    <div class="section-label">guardrails</div>
+  </div>
+  <div class="guardrails-grid">
+    <div class="guardrail-row">
+      <span class="guardrail-label">Buffer guard</span>
+      <div class="toggle" id="tgl-buffer" onclick="toggleGuardrail(this)"></div>
+    </div>
+    <div class="guardrail-row">
+      <span class="guardrail-label">Stability lock</span>
+      <div class="toggle" id="tgl-stability" onclick="toggleGuardrail(this)"></div>
+    </div>
+    <div class="guardrail-row">
+      <span class="guardrail-label">Fast downgrade</span>
+      <div class="toggle" id="tgl-fast-down" onclick="toggleGuardrail(this)"></div>
+    </div>
+    <div class="guardrail-row">
+      <span class="guardrail-label">Slow upgrade</span>
+      <div class="toggle" id="tgl-slow-up" onclick="toggleGuardrail(this)"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── Config from Python ─────────────────────────────────────────────────────
+const LADDER   = {ladder_js};
+const ACTIVE   = "{active_js}";
+const SRC_BPS  = {active_bps};
+const MAX_BPS  = {max_bps};
+const DURATION = {duration_js};
+
+// ── State ──────────────────────────────────────────────────────────────────
+let bwHistory  = [];      // last 30 readings
+let bufHistory = [];
+let currentRung = ACTIVE;
+let drops = 0;
+let decisions = [];
+let playTime = 0;
+let tickCount = 0;
+let explained = false;
+
+// Pre-fill 30s of history with realistic noise
+for (let i = 0; i < 30; i++) {{
+  const base = SRC_BPS / 1000 * 1.2;
+  bwHistory.push(base + (Math.random() - 0.5) * base * 0.3);
+  bufHistory.push(18 + (Math.random() - 0.5) * 4);
+}}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function fmtTime(s) {{
+  const m = Math.floor(s / 60), sec = Math.floor(s % 60);
+  return m + ':' + String(sec).padStart(2, '0');
+}}
+
+function clamp(v, lo, hi) {{ return Math.max(lo, Math.min(hi, v)); }}
+
+// ── Render bitrate ladder ──────────────────────────────────────────────────
+function renderLadder() {{
+  const cont = document.getElementById('ladderContainer');
+  cont.innerHTML = '';
+  for (const rung of LADDER) {{
+    const isActive = rung.label === currentRung;
+    const fillPct  = (rung.bps / LADDER[0].bps * 100).toFixed(1);
+    cont.innerHTML += `
+      <div class="ladder-row">
+        <div class="ladder-badge ${{isActive ? 'active' : ''}}">${{rung.label}}</div>
+        <div class="ladder-bar-track">
+          <div class="ladder-bar-fill ${{isActive ? 'active' : ''}}" style="width:${{fillPct}}%"></div>
+        </div>
+        <div class="ladder-bps">${{rung.bps >= 1000 ? (rung.bps/1000).toFixed(1)+'M' : rung.bps+'K'}}</div>
+      </div>`;
+  }}
+}}
+
+// ── Render ABR decisions ───────────────────────────────────────────────────
+function renderDecisions() {{
+  const cont = document.getElementById('decisionsList');
+  const visible = decisions.slice(-8).reverse();
+  cont.innerHTML = visible.map(d => `
+    <div class="decision-row">
+      <span class="dec-time">${{fmtTime(d.t)}}</span>
+      <span class="dec-arrow ${{d.up ? 'dec-up' : 'dec-down'}}">${{d.up ? '↑' : '↓'}}</span>
+      <span class="dec-label">${{d.up ? 'upgrade' : 'downgrade'}} → ${{d.to}}</span>
+    </div>`).join('');
+}}
+
+// ── Draw bandwidth history sparkline ──────────────────────────────────────
+function drawChart() {{
+  const canvas = document.getElementById('bwChart');
+  const dpr    = window.devicePixelRatio || 1;
+  const rect   = canvas.getBoundingClientRect();
+  canvas.width  = rect.width  * dpr;
+  canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+
+  const vals   = bwHistory.slice(-30);
+  const maxVal = Math.max(...vals) * 1.15;
+  const minVal = Math.min(...vals) * 0.85;
+
+  // Threshold line (dashed, amber)
+  const threshY = H - ((SRC_BPS / 1000 - minVal) / (maxVal - minVal)) * H;
+  ctx.save();
+  ctx.setLineDash([4, 4]);
+  ctx.strokeStyle = '#f59e0b';
+  ctx.lineWidth = 1;
+  ctx.globalAlpha = 0.7;
+  ctx.beginPath();
+  ctx.moveTo(0, threshY);
+  ctx.lineTo(W, threshY);
+  ctx.stroke();
+  ctx.restore();
+
+  // Gradient fill
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, 'rgba(59,130,246,0.18)');
+  grad.addColorStop(1, 'rgba(59,130,246,0)');
+
+  ctx.beginPath();
+  vals.forEach((v, i) => {{
+    const x = (i / (vals.length - 1)) * W;
+    const y = H - ((v - minVal) / (maxVal - minVal)) * H;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }});
+  const endX = W, lastY = H - ((vals[vals.length-1] - minVal) / (maxVal - minVal)) * H;
+  ctx.lineTo(endX, H); ctx.lineTo(0, H); ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  vals.forEach((v, i) => {{
+    const x = (i / (vals.length - 1)) * W;
+    const y = H - ((v - minVal) / (maxVal - minVal)) * H;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }});
+  ctx.strokeStyle = '#3b82f6';
+  ctx.lineWidth = 1.5;
+  ctx.lineJoin = 'round';
+  ctx.lineCap  = 'round';
+  ctx.stroke();
+}}
+
+// ── ABR logic: decide rung upgrades/downgrades ─────────────────────────────
+function abrDecide(bw_mbps) {{
+  const bw_kbps = bw_mbps * 1000;
+  const idx     = LADDER.findIndex(r => r.label === currentRung);
+  let   newIdx  = idx;
+
+  // Upgrade: if bandwidth comfortably exceeds next rung up
+  if (idx > 0) {{
+    const nextBps = LADDER[idx - 1].bps;
+    if (bw_kbps > nextBps * 1.3) newIdx = idx - 1;
+  }}
+  // Downgrade: if bandwidth falls below current rung
+  if (bw_kbps < LADDER[idx].bps * 0.85) {{
+    newIdx = Math.min(idx + 1, LADDER.length - 1);
+  }}
+
+  if (newIdx !== idx) {{
+    const up   = newIdx < idx;
+    const to   = LADDER[newIdx].label;
+    decisions.push({{ t: playTime, up, to }});
+    currentRung = to;
+    renderDecisions();
+  }}
+}}
+
+// ── Main tick ──────────────────────────────────────────────────────────────
+function tick() {{
+  tickCount++;
+  playTime += 1;
+
+  // Simulate realistic bandwidth with occasional dips
+  const prev   = bwHistory[bwHistory.length - 1];
+  const base   = SRC_BPS / 1000 * 1.2;
+  const jitter = (Math.random() - 0.48) * base * 0.25;
+  let bw       = clamp(prev + jitter, base * 0.3, base * 2.2);
+  // Occasional dip event
+  if (Math.random() < 0.04) bw = base * (0.4 + Math.random() * 0.3);
+  bwHistory.push(bw);
+  if (bwHistory.length > 60) bwHistory.shift();
+
+  // Buffer level (20s max, drains slowly, fills above threshold)
+  const bufCur = bufHistory[bufHistory.length - 1];
+  const bwRatio = bw / (SRC_BPS / 1000);
+  const bufDelta = bwRatio > 1 ? 0.3 : -0.2;
+  const buf = clamp(bufCur + bufDelta + (Math.random() - 0.5) * 0.15, 2, 20);
+  bufHistory.push(buf);
+  if (bufHistory.length > 60) bufHistory.shift();
+
+  // RTT: 80–200ms with occasional spikes
+  let rtt = 80 + Math.random() * 60;
+  if (Math.random() < 0.05) rtt += 100 + Math.random() * 120;
+  rtt = Math.round(rtt);
+
+  // Drop events on very low buffer
+  if (buf < 3.5 && Math.random() < 0.15) drops++;
+
+  // ABR decision
+  abrDecide(bw);
+
+  // ── Update DOM ────────────────────────────────────────────────────────
+  // Bandwidth
+  document.getElementById('bwVal').textContent = bw.toFixed(1);
+  const bwAbove = bw > SRC_BPS / 1000;
+  document.getElementById('bwSub').textContent = bwAbove ? '+ above threshold' : '— below threshold';
+  document.getElementById('bwSub').className   = 'metric-sub ' + (bwAbove ? 'sub-good' : 'sub-warn');
+
+  // Buffer
+  document.getElementById('bufVal').textContent = buf.toFixed(1);
+  const bufOk = buf >= 8;
+  document.getElementById('bufSub').textContent = buf < 4 ? 'critical' : buf < 8 ? 'low' : 'healthy';
+  document.getElementById('bufSub').className   = 'metric-sub ' + (buf < 4 ? 'sub-bad' : buf < 8 ? 'sub-warn' : 'sub-good');
+  document.getElementById('bufferBar').style.width = (buf / 20 * 100).toFixed(1) + '%';
+  document.getElementById('bufferBar').style.background = buf < 4 ? '#ef4444' : buf < 8 ? '#f59e0b' : '#22c55e';
+
+  // RTT
+  document.getElementById('rttVal').textContent = rtt;
+  document.getElementById('rttSub').textContent = rtt < 100 ? 'good' : rtt < 160 ? 'high' : 'very high';
+  document.getElementById('rttSub').className   = 'metric-sub ' + (rtt < 100 ? 'sub-good' : rtt < 160 ? 'sub-warn' : 'sub-bad');
+
+  // Drops
+  document.getElementById('dropVal').textContent = drops;
+  document.getElementById('dropSub').textContent = drops === 0 ? '— no rebuffer' : drops + ' rebuffer' + (drops > 1 ? 's' : '');
+  document.getElementById('dropSub').className   = 'metric-sub ' + (drops === 0 ? 'sub-neutral' : 'sub-bad');
+
+  // Status text
+  const isStable = bwAbove && buf >= 8 && drops === 0;
+  document.getElementById('abrStatus').textContent =
+    isStable ? 'adaptive bitrate — stable' :
+    buf < 4  ? 'adaptive bitrate — buffering' :
+               'adaptive bitrate — adapting';
+  document.getElementById('statusDot').style.background =
+    isStable ? '#22c55e' : buf < 4 ? '#ef4444' : '#f59e0b';
+
+  // Ladder + chart
+  renderLadder();
+  drawChart();
+}}
+
+// ── Toggle helpers ─────────────────────────────────────────────────────────
+function toggleGuardrail(el) {{ el.classList.toggle('off'); }}
+function toggleExplain() {{
+  explained = !explained;
+  alert(explained
+    ? 'ABR (Adaptive Bitrate):\\n\\n• Bandwidth: measured download speed\\n• Buffer: seconds of video pre-loaded\\n• RTT: round-trip time to CDN\\n• Drop events: rebuffer stalls\\n• Bitrate ladder: available quality rungs\\n• ABR decisions: quality switch history'
+    : '');
+}}
+
+// ── Resize handler ─────────────────────────────────────────────────────────
+window.addEventListener('resize', drawChart);
+
+// ── Boot ───────────────────────────────────────────────────────────────────
+renderLadder();
+renderDecisions();
+drawChart();
+
+// Seed initial decisions
+[
+  {{ t: 0, up: true,  to: '{active_js}' }},
+  {{ t: 0, up: false, to: LADDER[Math.min(LADDER.findIndex(r=>r.label==='{active_js}')+1, LADDER.length-1)].label }},
+  {{ t: 0, up: true,  to: '{active_js}' }},
+].forEach(d => decisions.push(d));
+renderDecisions();
+
+setInterval(tick, 1000);
+tick();
+</script>
+</body>
+</html>"""
+    return html
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Session State Init
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -635,7 +1249,7 @@ defaults = {
     "enable_encoding": True,
     "enhance_settings": _default_enhance.copy(),
     "loudness": None,
-    "result_logs": {},   # NEW: keyed by result index
+    "result_logs": {},
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -656,7 +1270,7 @@ st.markdown("""
     </div>
     <div>
       <h1>AI Encoder <span>· VideoForge</span></h1>
-      <p>Professional encoding · AI enhancement · quality analytics</p>
+      <p>Professional encoding · AI enhancement · quality analytics · live player performance</p>
     </div>
   </div>
   <div class="vf-badges">
@@ -667,6 +1281,7 @@ st.markdown("""
     <span class="vf-badge">PSNR/SSIM</span>
     <span class="vf-badge ai">✨ AI Enhance</span>
     <span class="vf-badge">📊 CRF Sweep</span>
+    <span class="vf-badge">📡 ABR Monitor</span>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -728,7 +1343,7 @@ if st.session_state.name != uploaded.name:
     st.session_state.meta     = probe(st.session_state.inp)
     st.session_state.sz       = os.path.getsize(st.session_state.inp) / (1024 * 1024)
     st.session_state.name     = uploaded.name
-    st.session_state.loudness = None  # reset; lazy-loaded below
+    st.session_state.loudness = None
     m = st.session_state.meta
     st.session_state.enhance_settings["upscale_width"]  = m["width"]  * 2
     st.session_state.enhance_settings["upscale_height"] = m["height"] * 2
@@ -742,10 +1357,10 @@ inp   = st.session_state.inp
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Source Preview + Metadata
+#  Source Preview + Metadata + Player Performance Panel
 # ══════════════════════════════════════════════════════════════════════════════
 
-col_v, col_m = st.columns([3, 2], gap="large")
+col_v, col_m, col_perf = st.columns([3, 2, 2], gap="large")
 
 with col_v:
     st.markdown("### ▶ Preview")
@@ -785,7 +1400,6 @@ with col_m:
                 unsafe_allow_html=True,
             )
 
-        # ── NEW: Loudness probe (lazy) ────────────────────────────────────────
         if st.button("🔊 Measure Loudness", help="Run ffmpeg volumedetect on the audio track"):
             with st.spinner("Measuring loudness…"):
                 st.session_state.loudness = probe_loudness(inp)
@@ -795,7 +1409,6 @@ with col_m:
             mean_db = ld.get("mean_volume")
             max_db  = ld.get("max_volume")
             if mean_db is not None:
-                # Colour code: broadcast target is −23 LUFS / mean ~ −18 dBFS
                 colour = "#15803d" if -20 <= mean_db <= -14 else "#b45309" if mean_db > -14 else "#b91c1c"
                 st.markdown(
                     f'<div class="loudness-bar">'
@@ -811,6 +1424,13 @@ with col_m:
             unsafe_allow_html=True,
         )
 
+# ── NEW: Real-Time Player Performance Panel ───────────────────────────────────
+with col_perf:
+    st.markdown("**📡 Player Performance**")
+    st.caption("Live ABR simulation based on source bitrate & resolution.")
+    player_html = build_player_performance_html(meta, sz_mb)
+    components.html(player_html, height=780, scrolling=True)
+
 st.divider()
 
 
@@ -821,7 +1441,6 @@ st.divider()
 if enable_encoding:
     st.markdown('<div class="vf-label ai">✨ AI Video Enhancement</div>', unsafe_allow_html=True)
 
-    # ── Quick Presets ─────────────────────────────────────────────────────────
     st.markdown("### 🎯 Quick Presets")
     st.caption("One-click setups for common scenarios:")
     p1, p2, p3 = st.columns(3)
@@ -881,7 +1500,6 @@ if enable_encoding:
     es = st.session_state.enhance_settings
     enh_col1, enh_col2 = st.columns(2)
 
-    # ── Left Column ───────────────────────────────────────────────────────────
     with enh_col1:
         with st.container(border=True):
             st.markdown("**🧹 Denoise**")
@@ -908,7 +1526,6 @@ if enable_encoding:
                         "Amount", -1.5, 1.5, es["sharpen_amount"], 0.1, key="sl_sharpen_amt",
                     )
                 with cs2:
-                    # kept for UI compat but used as chroma kernel size hint only
                     es["sharpen_threshold"] = st.slider(
                         "Chroma Softness", 0, 50, es["sharpen_threshold"], key="sl_sharpen_thr",
                         help="Higher = softer chroma sharpening relative to luma",
@@ -942,7 +1559,6 @@ if enable_encoding:
                 "integrate Real-ESRGAN externally."
             )
 
-    # ── Right Column ──────────────────────────────────────────────────────────
     with enh_col2:
         is_hdr_source = meta.get("bit_depth", 8) >= 10
         with st.container(border=True):
@@ -988,7 +1604,6 @@ if enable_encoding:
                 )
             st.caption("Reduces macroblocking and ringing from heavy compression.")
 
-    # ── Frame Interpolation ───────────────────────────────────────────────────
     with st.expander("🎞️ Advanced: Frame Interpolation (Motion Smoothing)"):
         es["frame_interp"] = st.checkbox(
             "Enable frame interpolation", value=es["frame_interp"], key="chk_frame_interp",
@@ -1003,7 +1618,6 @@ if enable_encoding:
             st.warning("⚠️ Frame interpolation is CPU-intensive and may increase processing time 3–5×.")
         st.caption("Creates intermediate frames for smoother playback (e.g., 24 fps → 60 fps).")
 
-    # ── Enhancement Summary ───────────────────────────────────────────────────
     _enh_keys        = ["denoise","sharpen","upscale","hdr_convert","color_enhance","deblock","frame_interp"]
     active_enhancements = sum(bool(es.get(k)) for k in _enh_keys)
 
@@ -1023,7 +1637,6 @@ if enable_encoding:
 
     st.divider()
 
-    # ── Encoder Settings ──────────────────────────────────────────────────────
     st.markdown('<div class="vf-label">⚙️ Encoder Settings</div>', unsafe_allow_html=True)
     s1, s2, s3, s4 = st.columns([2, 2, 1, 2])
 
@@ -1059,7 +1672,6 @@ if enable_encoding:
             "May crash on free-tier cloud. Use H.264/HEVC for cloud deployment."
         )
 
-    # ── NEW: Batch CRF Sweep ──────────────────────────────────────────────────
     with st.expander("📊 Batch CRF Sweep — Rate-Distortion Analysis"):
         st.caption(
             "Automatically encode at multiple CRF values to find the optimal "
@@ -1116,7 +1728,6 @@ if enable_encoding:
             sweep_bar.progress(1.0, text=f"✅ Sweep complete — {len(sweep_crfs)} variants encoded")
             st.rerun()
 
-    # ── Run Controls ──────────────────────────────────────────────────────────
     st.markdown('<div class="vf-label" style="margin-top:8px">🚀 Run</div>', unsafe_allow_html=True)
     b1, b2, b3, _ = st.columns([1.2, 1.2, 0.8, 4])
 
@@ -1206,7 +1817,6 @@ if enable_encoding:
             )
 
 else:
-    # ── Test Player Mode ──────────────────────────────────────────────────────
     st.markdown('<div class="vf-label">🎬 Test Player Mode</div>', unsafe_allow_html=True)
     st.info(
         "🎧 **Playback & Analytics**: Preview your source video. "
@@ -1278,7 +1888,7 @@ with tab_tbl:
         res_info = r.get("out_res", f"{meta['width']}×{meta['height']}")
         fps_info = r.get("out_fps", meta["fps"])
 
-        ssim_str = ssim_display(r["ssim"])  # NEW: colour-coded SSIM
+        ssim_str = ssim_display(r["ssim"])
 
         rows_html += f"""<tr>
           <td>{tag}</td>
@@ -1316,7 +1926,6 @@ with tab_tbl:
         "PSNR: 40+ dB Good | SSIM: 0.98+ Excellent | ✨ = AI enhancements | 🏆 Best = winner across runs"
     )
 
-    # ── NEW: CSV Export ───────────────────────────────────────────────────────
     st.download_button(
         label="⬇ Export as CSV",
         data=results_to_csv(results, meta, sz_mb),
@@ -1372,7 +1981,6 @@ with tab_chart:
         st.bar_chart(qdf, use_container_width=True)
         st.caption("Higher = better quality. ✨ = AI enhancements applied.")
 
-    # ── NEW: Rate-Distortion Curve (when VMAF available for ≥2 results) ───────
     rd_data = [(r["bitrate"], r["vmaf"], r["crf"]) for r in results
                if r.get("vmaf") is not None and r.get("bitrate")]
     if len(rd_data) >= 2:
@@ -1415,7 +2023,6 @@ with tab_chart:
                 unsafe_allow_html=True,
             )
 
-        # NEW: Smallest-for-acceptable-quality insight
         acceptable = [r for r in results if r.get("vmaf") and r["vmaf"] >= 80]
         if acceptable:
             smallest = min(acceptable, key=lambda r: r["size_mb"])
@@ -1465,7 +2072,7 @@ with tab_dl:
                 st.caption(f"🔊 {format_audio_codec(r['acodec'])} · {format_channels(r.get('channels',0))}")
 
 
-# ── NEW: Logs tab ─────────────────────────────────────────────────────────────
+# ── Logs tab ──────────────────────────────────────────────────────────────────
 with tab_logs:
     st.markdown("### 🪵 FFmpeg Encode Logs")
     st.caption("Per-encode FFmpeg output for debugging. Last 80 lines preserved per run.")
@@ -1483,7 +2090,7 @@ with tab_logs:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center;color:#94a3b8;font-size:0.78rem;padding:12px 0">'
-    "AI Encoder · FFmpeg + Streamlit · ✨ AI enhancements · Bug-fixed build"
+    "AI Encoder · FFmpeg + Streamlit · ✨ AI enhancements · 📡 Live ABR Monitor · Bug-fixed build"
     "</div>",
     unsafe_allow_html=True,
 )
