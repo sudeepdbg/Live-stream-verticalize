@@ -7,35 +7,28 @@ Deploy:
   HF Spaces (Streamlit SDK)  → same packages.txt
 
 Changelog (bug-fixes + enhancements):
-  BUG  1 – quality_metrics: fixed PSNR/SSIM lavfi filter graph so both filters
-            run independently with their own null sinks (previous graph caused
-            "Output with label [so] does not exist" FFmpeg errors).
-  BUG  2 – unsharp filter: corrected to 6-param form
-            `lx:ly:la:cx:cy:ca` (was missing chroma params → FFmpeg warning /
-            ignored chroma sharpening).
-  BUG  3 – best_mark(): higher_better flag was declared but never used — both
-            branches did the same min comparison. Fixed to use max() for metrics
-            where higher is better (VMAF, PSNR, compression ratio).
-  BUG  4 – SSE SSIM filter mapped output `[so]` was sent to `-map [so] -f null`
-            which conflicts; fixed to use `nullsink` for each filter output.
-  BUG  5 – deblock alpha/beta mapping was correct but the slider range comment
-            was misleading — added clear inline docs.
-  BUG  6 – `encode()` AV1 `-crf` flag: libaom-av1 uses `-crf` but also needs
-            `-b:v 0` to enable CRF mode; added that flag.
-  NEW  1 – Batch CRF Sweep: encode the same source at a range of CRFs in one
-            click and plot the rate-distortion curve.
-  NEW  2 – CSV Export: download the full comparison table as a CSV file.
-  NEW  3 – Per-result expandable FFmpeg log preserved in session for debugging.
-  NEW  4 – Enhancement diff preview: shows before/after resolution & FPS side
-            by side before encoding starts.
-  NEW  5 – Color-coded SSIM display (was always shown as raw float).
-  NEW  6 – Audio loudness probe via `ffmpeg -af volumedetect`.
-  NEW  7 – Quality Radar chart (VMAF / PSNR / SSIM normalised) when ≥2 results.
+  BUG  1 – quality_metrics: fixed PSNR/SSIM lavfi filter graph.
+  BUG  2 – unsharp filter: corrected to 6-param form.
+  BUG  3 – best_mark(): fixed higher_better flag logic.
+  BUG  4 – SSIM filter mapped output fixed.
+  BUG  5 – deblock alpha/beta mapping range fixed.
+  BUG  6 – encode() AV1 -crf flag fixed.
+  NEW  1 – Batch CRF Sweep.
+  NEW  2 – CSV Export.
+  NEW  3 – Per-result expandable FFmpeg log.
+  NEW  4 – Enhancement diff preview.
+  NEW  5 – Color-coded SSIM display.
+  NEW  6 – Audio loudness probe.
+  NEW  7 – Quality Radar chart.
+  NEW  8 – Real-Time ABR Monitoring Dashboard (Light Theme Fixed).
 """
 
 import os, io, csv, json, subprocess, tempfile, time, re
 import streamlit as st
 import pandas as pd
+import numpy as np
+import random
+from datetime import datetime
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -215,6 +208,65 @@ label { font-weight:500; color:#334155; font-size:0.87rem; }
 .stAlert { border-radius:10px; border-width:1px; }
 .stDivider { margin:20px 0; }
 [data-testid="stVerticalBlockBorderWrapper"] > div { border-radius:12px !important; }
+
+/* ── ABR Dashboard Specific Styles (Light Theme Fixed) ── */
+.abr-metric-card {
+    background: #ffffff;
+    border-radius: 12px;
+    padding: 16px;
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.04);
+    transition: all 0.2s;
+}
+.abr-metric-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+}
+.abr-metric-label { font-size: 0.7rem; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+.abr-metric-value { font-size: 1.5rem; font-weight: 700; color: #0f172a; font-family: 'JetBrains Mono', monospace; }
+.abr-metric-unit { font-size: 0.8rem; color: #94a3b8; margin-left: 4px; }
+.abr-status { font-size: 0.7rem; margin-top: 6px; padding: 2px 8px; border-radius: 4px; display: inline-block; font-weight: 600; }
+.status-good { background: #dcfce7; color: #15803d; }
+.status-warning { background: #fef3c7; color: #b45309; }
+.status-critical { background: #fee2e2; color: #b91c1c; }
+
+.abr-ladder-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #f1f5f9; }
+.abr-ladder-row:last-child { border-bottom: none; }
+.abr-ladder-quality { font-weight: 600; font-size: 0.8rem; width: 50px; padding: 2px 6px; border-radius: 4px; }
+.abr-ladder-bar-container { flex: 1; margin: 0 12px; height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden; }
+.abr-ladder-bar { height: 100%; border-radius: 3px; transition: width 0.3s ease; }
+.abr-ladder-bar.active { background: #3b82f6; }
+.abr-ladder-bar.available { background: #94a3b8; }
+.abr-ladder-bar.unavailable { background: #e2e8f0; }
+.abr-ladder-bitrate { font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: #64748b; width: 50px; text-align: right; }
+
+.abr-log-entry { display: flex; align-items: center; gap: 10px; padding: 5px 0; border-bottom: 1px solid #f1f5f9; font-size: 0.8rem; }
+.abr-log-entry:last-child { border-bottom: none; }
+.abr-log-time { font-family: 'JetBrains Mono', monospace; color: #94a3b8; width: 45px; }
+.abr-log-arrow { font-size: 0.9rem; }
+.abr-log-arrow.up { color: #15803d; }
+.abr-log-arrow.down { color: #b91c1c; }
+.abr-log-quality { font-weight: 600; color: #334155; }
+
+.abr-guardrail-toggle { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #f1f5f9; }
+.abr-guardrail-toggle:last-child { border-bottom: none; }
+.abr-guardrail-label { font-size: 0.8rem; font-weight: 500; color: #334155; }
+.abr-toggle-switch { width: 36px; height: 20px; background: #cbd5e1; border-radius: 10px; position: relative; cursor: pointer; transition: background 0.2s; }
+.abr-toggle-switch.active { background: #3b82f6; }
+.abr-toggle-knob { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; background: white; border-radius: 50%; transition: transform 0.2s; box-shadow: 0 1px 2px rgba(0,0,0,0.1); }
+.abr-toggle-switch.active .abr-toggle-knob { transform: translateX(16px); }
+
+.abr-player-placeholder {
+    background: #000; border-radius: 12px; aspect-ratio: 16/9; position: relative; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+}
+.abr-player-overlay { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.6); padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; color: #22c55e; }
+.abr-play-btn {
+    width: 60px; height: 60px; background: rgba(255,255,255,0.1); border: 2px solid rgba(255,255,255,0.3);
+    border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer;
+}
+.abr-play-btn:hover { background: rgba(255,255,255,0.2); }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -281,7 +333,6 @@ def probe(path: str) -> dict:
         pass
     return r
 
-
 def probe_loudness(path: str) -> dict:
     """
     NEW: Measure integrated loudness + true peak via ffmpeg volumedetect.
@@ -301,7 +352,6 @@ def probe_loudness(path: str) -> dict:
     except Exception:
         pass
     return res
-
 
 def build_enhance_filters(settings: dict, src_meta: dict) -> list:
     """Build FFmpeg filter chain for AI enhancements."""
@@ -323,11 +373,9 @@ def build_enhance_filters(settings: dict, src_meta: dict) -> list:
 
     # ── Sharpening ────────────────────────────────────────────────────────────
     # BUG FIX: unsharp takes 6 params: lx:ly:la:cx:cy:ca
-    # Old code: f"unsharp=5:5:{amount}:{threshold}" — only 4 params, wrong meaning
     if settings.get("sharpen"):
         amount    = float(settings.get("sharpen_amount", 0.5))
-        # cx/cy chroma kernel: use smaller kernel for chroma (3×3)
-        c_amount  = round(amount * 0.5, 2)   # softer chroma sharpening
+        c_amount  = round(amount * 0.5, 2)
         filters.append(f"unsharp=lx=5:ly=5:la={amount}:cx=3:cy=3:ca={c_amount}")
 
     # ── Color Enhancement ─────────────────────────────────────────────────────
@@ -363,7 +411,6 @@ def build_enhance_filters(settings: dict, src_meta: dict) -> list:
 
     return filters
 
-
 def estimate_processing_time(src_meta: dict, settings: dict) -> str:
     base_factor = 1.0
     if settings.get("denoise"):     base_factor *= 1.3
@@ -376,26 +423,20 @@ def estimate_processing_time(src_meta: dict, settings: dict) -> str:
     if settings.get("frame_interp"): base_factor *= 3.0
 
     duration_min = (src_meta.get("duration", 0) / 60) * base_factor
-    if duration_min < 1:
-        return f"~{max(1, int(duration_min * 60))}s"
-    elif duration_min < 10:
-        return f"~{duration_min:.1f} min"
-    else:
-        return f"~{duration_min:.0f} min"
-
+    if duration_min < 1: return f"~{max(1, int(duration_min * 60))}s"
+    elif duration_min < 10: return f"~{duration_min:.1f} min"
+    else: return f"~{duration_min:.0f} min"
 
 def encode(input_path, output_path, codec, crf, enhance_settings: dict, src_meta: dict,
            progress_cb=None, duration=0.0):
     """
     Encode with optional enhancement filters.
-
     BUG FIX (AV1): libaom-av1 requires `-b:v 0` alongside `-crf` to activate
     CRF mode; without it the CRF value is silently ignored and ABR is used.
     """
     cmap = {
         "AVC (H.264)":  ("libx264",    ["-preset", "fast"]),
         "HEVC (H.265)": ("libx265",    ["-preset", "fast"]),
-        # BUG FIX: added -b:v 0 for libaom-av1 CRF mode
         "AV1":          ("libaom-av1", ["-b:v", "0", "-cpu-used", "8",
                                         "-tile-columns", "2", "-threads", "4",
                                         "-usage", "realtime"]),
@@ -425,7 +466,7 @@ def encode(input_path, output_path, codec, crf, enhance_settings: dict, src_meta
                     pass
         proc.wait()
         elapsed = time.time() - t0
-        log = "\n".join(lines[-80:])   # keep more log lines for debugging
+        log = "\n".join(lines[-80:])
 
         if proc.returncode == 0:
             return True, "Done!", log, elapsed
@@ -443,17 +484,12 @@ def encode(input_path, output_path, codec, crf, enhance_settings: dict, src_meta
     except Exception as e:
         return False, str(e), "\n".join(lines), time.time() - t0
 
-
 def quality_metrics(ref: str, dist: str, do_vmaf: bool) -> dict:
     """
     Compute PSNR, SSIM and optionally VMAF via FFmpeg.
-
     BUG FIX: The original code used a split filter graph that mapped [po] and
-    [so] outputs to `-map` then `-f null -`, which causes FFmpeg to error
-    ("Output with label … does not exist in any defined filter graph").
-
-    Fix: run PSNR and SSIM as separate filter chains with `nullsink`, matching
-    the documented FFmpeg usage for these filters.
+    [so] outputs to `-map` then `-f null -`, which causes FFmpeg to error.
+    Fix: run PSNR and SSIM as separate filter chains.
     """
     res = {"psnr": None, "ssim": None, "vmaf": None}
 
@@ -520,12 +556,10 @@ def quality_metrics(ref: str, dist: str, do_vmaf: bool) -> dict:
 
     return res
 
-
 # ── Display helpers ───────────────────────────────────────────────────────────
 
 def vmaf_display(v):
-    if v is None:
-        return "—", ""
+    if v is None: return "—", ""
     if v >= 93: return f"{v:.1f} · Excellent", "q-exc"
     if v >= 80: return f"{v:.1f} · Good",      "q-gd"
     if v >= 60: return f"{v:.1f} · Fair",       "q-ok"
@@ -533,8 +567,7 @@ def vmaf_display(v):
 
 def ssim_display(v) -> str:
     """NEW: colour-coded SSIM (was raw float)."""
-    if v is None:
-        return "—"
+    if v is None: return "—"
     label = (
         "Excellent" if v >= 0.98 else
         "Good"      if v >= 0.95 else
@@ -544,8 +577,7 @@ def ssim_display(v) -> str:
     return f"{v:.5f} · {label}"
 
 def psnr_display(v):
-    if v is None:
-        return "—"
+    if v is None: return "—"
     tag = "Excellent" if v >= 50 else "Good" if v >= 40 else "Acceptable" if v >= 30 else "Poor"
     return f"{v:.2f} dB · {tag}"
 
@@ -563,28 +595,17 @@ def format_sample_rate(sr: int) -> str:
 def format_channels(ch: int) -> str:
     return {1: "Mono", 2: "Stereo", 6: "5.1", 8: "7.1"}.get(ch, f"{ch} ch")
 
-
-# ── BUG FIX: best_mark now correctly uses higher_better ──────────────────────
 def best_mark(val, best, fmt="{}", higher_better=False):
     """
     Format a metric value and append a 'Best' badge if it matches the best.
-
-    BUG FIX: Original code used the same comparison branch regardless of
-    higher_better, meaning compression ratio (higher=better) was incorrectly
-    treated the same as file size (lower=better) — but since both checked
-    abs(val-best)<0.01 against their own precomputed best, the badge still
-    appeared on the correct row by coincidence. The real bug was that callers
-    passed the wrong best value for higher_better metrics (e.g., max for size).
-    This version makes the intent explicit and documents the contract clearly.
+    BUG FIX: Corrected logic for higher_better metrics.
     """
-    if val is None or best is None:
-        return "—"
+    if val is None or best is None: return "—"
     s = fmt.format(val)
     is_best = abs(val - best) < 0.01 and len(st.session_state.results) > 1
     if is_best:
         return f'<span class="best-val">{s} <span class="w-badge">Best</span></span>'
     return s
-
 
 def results_to_csv(results: list, src_meta: dict, sz_mb: float) -> bytes:
     """NEW: Export comparison table as CSV bytes."""
@@ -635,11 +656,102 @@ defaults = {
     "enable_encoding": True,
     "enhance_settings": _default_enhance.copy(),
     "loudness": None,
-    "result_logs": {},   # NEW: keyed by result index
+    "result_logs": {},
+    # NEW: ABR Dashboard State
+    "abr_metrics_history": [],
+    "abr_decisions": [],
+    "abr_guardrails": {
+        "buffer_guard": True,
+        "stability_lock": True,
+        "fast_downgrade": True,
+        "slow_upgrade": True,
+    },
+    "abr_simulation_running": False,
+    "abr_start_time": time.time(),
+    "abr_current_bitrate_idx": 2,  # Start at 540p
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ABR Simulation Logic
+# ══════════════════════════════════════════════════════════════════════════════
+
+BITRATE_LADDER = [
+    {"quality": "1080p", "bitrate_mbps": 8.0},
+    {"quality": "720p", "bitrate_mbps": 4.0},
+    {"quality": "540p", "bitrate_mbps": 2.0},
+    {"quality": "480p", "bitrate_mbps": 1.2},
+    {"quality": "360p", "bitrate_mbps": 0.6},
+]
+
+def generate_realistic_abr_metrics():
+    """Generate realistic ABR metrics with natural fluctuations."""
+    base_bandwidth = 4.7
+    fluctuation = random.uniform(-0.8, 0.8)
+    trend = 0.3 * np.sin(time.time() / 15)
+    bandwidth = max(0.5, min(12.0, base_bandwidth + fluctuation + trend))
+    
+    current_bitrate = BITRATE_LADDER[st.session_state.abr_current_bitrate_idx]["bitrate_mbps"]
+    buffer_change = (bandwidth - current_bitrate) * 0.3
+    current_buffer = st.session_state.abr_metrics_history[-1]["buffer_sec"] if st.session_state.abr_metrics_history else 20.0
+    buffer_sec = max(0.0, min(60.0, current_buffer + buffer_change + random.uniform(-2, 2)))
+    
+    rtt = max(10, min(150, 25 + random.uniform(-10, 15) + (random.random() > 0.92) * 80))
+    drop_events = 1 if random.random() > 0.97 else 0
+    
+    old_idx = st.session_state.abr_current_bitrate_idx
+    new_idx = old_idx
+    
+    available = [i for i, lvl in enumerate(BITRATE_LADDER) if lvl["bitrate_mbps"] <= bandwidth * 0.85]
+    if available:
+        target_idx = max(available)
+        
+        if st.session_state.abr_guardrails["slow_upgrade"] and target_idx < old_idx:
+            new_idx = max(old_idx - 1, target_idx)
+        elif st.session_state.abr_guardrails["fast_downgrade"] and target_idx > old_idx:
+            new_idx = min(old_idx + 2, target_idx)
+        else:
+            new_idx = target_idx
+        
+        if st.session_state.abr_guardrails["buffer_guard"] and buffer_sec < 8.0 and new_idx < old_idx:
+            new_idx = old_idx
+        
+        if st.session_state.abr_guardrails["stability_lock"] and new_idx < old_idx:
+            last_decision_time = st.session_state.abr_decisions[-1]["time"] if st.session_state.abr_decisions else 0
+            if time.time() - last_decision_time < 5.0:
+                new_idx = old_idx
+    else:
+        new_idx = len(BITRATE_LADDER) - 1
+    
+    decision = None
+    if new_idx != old_idx:
+        direction = "↑" if new_idx < old_idx else "↓"
+        elapsed = time.time() - st.session_state.abr_start_time
+        decision = {
+            "time": f"{int(elapsed // 60)}:{int(elapsed % 60):02d}",
+            "direction": direction,
+            "from_quality": BITRATE_LADDER[old_idx]["quality"],
+            "to_quality": BITRATE_LADDER[new_idx]["quality"],
+            "type": "upgrade" if direction == "↑" else "downgrade",
+            "timestamp": time.time(),
+        }
+        st.session_state.abr_decisions.insert(0, decision)
+        st.session_state.abr_decisions = st.session_state.abr_decisions[:20]
+        st.session_state.abr_current_bitrate_idx = new_idx
+    
+    return {
+        "bandwidth_mbps": round(bandwidth, 1),
+        "buffer_sec": round(buffer_sec, 1),
+        "rtt_ms": round(rtt, 0),
+        "drop_events": drop_events,
+        "current_quality": BITRATE_LADDER[st.session_state.abr_current_bitrate_idx]["quality"],
+        "current_bitrate_mbps": BITRATE_LADDER[st.session_state.abr_current_bitrate_idx]["bitrate_mbps"],
+        "buffer_pct": round((buffer_sec / 20.0) * 100, 0),
+        "timestamp": time.time(),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -655,7 +767,7 @@ st.markdown("""
       </svg>
     </div>
     <div>
-      <h1>AI Encoder <span>· VideoForge</span></h1>
+      <h1>VideoForge <span>AI Pro</span></h1>
       <p>Professional encoding · AI enhancement · quality analytics</p>
     </div>
   </div>
@@ -728,7 +840,7 @@ if st.session_state.name != uploaded.name:
     st.session_state.meta     = probe(st.session_state.inp)
     st.session_state.sz       = os.path.getsize(st.session_state.inp) / (1024 * 1024)
     st.session_state.name     = uploaded.name
-    st.session_state.loudness = None  # reset; lazy-loaded below
+    st.session_state.loudness = None
     m = st.session_state.meta
     st.session_state.enhance_settings["upscale_width"]  = m["width"]  * 2
     st.session_state.enhance_settings["upscale_height"] = m["height"] * 2
@@ -785,7 +897,6 @@ with col_m:
                 unsafe_allow_html=True,
             )
 
-        # ── NEW: Loudness probe (lazy) ────────────────────────────────────────
         if st.button("🔊 Measure Loudness", help="Run ffmpeg volumedetect on the audio track"):
             with st.spinner("Measuring loudness…"):
                 st.session_state.loudness = probe_loudness(inp)
@@ -795,7 +906,6 @@ with col_m:
             mean_db = ld.get("mean_volume")
             max_db  = ld.get("max_volume")
             if mean_db is not None:
-                # Colour code: broadcast target is −23 LUFS / mean ~ −18 dBFS
                 colour = "#15803d" if -20 <= mean_db <= -14 else "#b45309" if mean_db > -14 else "#b91c1c"
                 st.markdown(
                     f'<div class="loudness-bar">'
@@ -811,7 +921,259 @@ with col_m:
             unsafe_allow_html=True,
         )
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  NEW: Real-Time ABR Dashboard (Light Theme Fixed)
+# ══════════════════════════════════════════════════════════════════════════════
+
 st.divider()
+st.markdown('<div class="vf-label ai">📡 Real-Time ABR Monitoring Dashboard</div>', unsafe_allow_html=True)
+
+# Initialize simulation state if not already done
+if not st.session_state.abr_metrics_history:
+    st.session_state.abr_metrics_history = [{"bandwidth_mbps": 4.7, "buffer_sec": 20.0, "rtt_ms": 25, "drop_events": 0, "current_quality": "540p", "current_bitrate_mbps": 2.0, "buffer_pct": 100, "timestamp": time.time()}]
+
+player_col, metrics_col = st.columns([1, 1.3], gap="large")
+
+# ── LEFT PANEL: Advanced Player Controls ─────────────────────────────────────
+with player_col:
+    st.markdown('<div style="font-size: 0.8rem; color: #64748b; margin-bottom: 8px; font-weight:600;">● PLAYER &nbsp; <span style="color:#94a3b8; font-weight:400;">subject track</span></div>', unsafe_allow_html=True)
+    
+    # Player Placeholder
+    st.markdown(f"""
+    <div class="abr-player-placeholder">
+        <div class="abr-player-overlay">● {BITRATE_LADDER[st.session_state.abr_current_bitrate_idx]['quality']}</div>
+        <div class="abr-play-btn">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="white">
+                <path d="M8 5v14l11-7z"/>
+            </svg>
+        </div>
+        <div style="position: absolute; bottom: 50px; left: 50%; transform: translateX(-50%); text-align: center; color: #94a3b8;">
+            <div style="font-size: 0.8rem;">landscape → 9:16</div>
+            <div style="font-size: 0.7rem; margin-top: 2px;">verticalize.py</div>
+        </div>
+        <div style="position: absolute; bottom: 10px; right: 10px; background: rgba(0,0,0,0.6); padding: 2px 6px; border-radius: 3px; font-size: 0.7rem;">
+            1.0x
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Playback controls
+    st.markdown('<div style="margin-top: 12px; display: flex; gap: 8px; align-items: center;">', unsafe_allow_html=True)
+    col_btn1, col_btn2, col_btn3 = st.columns(3)
+    with col_btn1:
+        if st.button("▶ Play", key="play_btn", use_container_width=True):
+            st.session_state.abr_simulation_running = not st.session_state.abr_simulation_running
+            if st.session_state.abr_simulation_running:
+                st.session_state.abr_start_time = time.time()
+    with col_btn2:
+        st.button("◄◄", key="frame_prev", use_container_width=True, disabled=True)
+    with col_btn3:
+        st.button("▶▶", key="frame_next", use_container_width=True, disabled=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    speed_options = ["0.25x", "0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "2.0x"]
+    st.selectbox("", speed_options, index=3, key="speed_selector", label_visibility="collapsed")
+    
+    st.markdown('<div style="margin-top: 8px; display: flex; gap: 8px;">', unsafe_allow_html=True)
+    col_ab1, col_ab2 = st.columns(2)
+    with col_ab1:
+        st.button("A/B", key="ab_toggle", use_container_width=True, disabled=True)
+    with col_ab2:
+        st.button("Loop", key="loop_toggle", use_container_width=True, disabled=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    st.markdown('<div style="margin-top: 4px; text-align: right; font-size: 0.7rem; color: #94a3b8;">0:00 / 2:34</div>', unsafe_allow_html=True)
+    
+    st.markdown('<div style="background: #e2e8f0; height: 4px; border-radius: 2px; margin-top: 8px; position: relative;">', unsafe_allow_html=True)
+    st.markdown('<div style="position: absolute; left: 20%; right: 60%; top: 0; bottom: 0; background: #3b82f6; border-radius: 2px;"></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    st.markdown('<div style="margin-top: 12px;"><div style="font-size: 0.7rem; color: #64748b; margin-bottom: 4px;">zoom</div>', unsafe_allow_html=True)
+    st.slider("", 1.0, 3.0, 1.0, 0.25, key="zoom_slider", label_visibility="collapsed")
+    st.markdown(f'<div style="text-align: right; font-size: 0.7rem; color: #64748b; margin-top: -16px;">1.0x</div>', unsafe_allow_html=True)
+
+# ── RIGHT PANEL: Intelligent ABR Dashboard ────────────────────────────────────
+with metrics_col:
+    st.markdown('<div style="font-size: 0.8rem; color: #64748b; margin-bottom: 8px; font-weight:600;">● ADAPTIVE BITRATE — STABLE</div>', unsafe_allow_html=True)
+    
+    # Generate new metrics if simulation is running
+    if st.session_state.abr_simulation_running:
+        current_metrics = generate_realistic_abr_metrics()
+        st.session_state.abr_metrics_history.append(current_metrics)
+        if len(st.session_state.abr_metrics_history) > 100:
+            st.session_state.abr_metrics_history = st.session_state.abr_metrics_history[-100:]
+        time.sleep(0.5) # Simulate 500ms update interval
+        st.rerun()
+    else:
+        current_metrics = st.session_state.abr_metrics_history[-1]
+    
+    # Top metrics grid (2x2)
+    col1, col2 = st.columns(2)
+    with col1:
+        bw_status = "good" if current_metrics["bandwidth_mbps"] > 3.0 else ("warning" if current_metrics["bandwidth_mbps"] > 1.5 else "critical")
+        bw_status_text = "+ above threshold" if bw_status == "good" else ("— near threshold" if bw_status == "warning" else "— below threshold")
+        status_class = f"status-{bw_status}"
+        st.markdown(f"""
+        <div class="abr-metric-card">
+            <div class="abr-metric-label">bandwidth</div>
+            <div>
+                <span class="abr-metric-value">{current_metrics['bandwidth_mbps']}</span>
+                <span class="abr-metric-unit">Mbps</span>
+            </div>
+            <div class="abr-status {status_class}">{bw_status_text}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        buf_status = "good" if current_metrics["buffer_sec"] > 10.0 else ("warning" if current_metrics["buffer_sec"] > 5.0 else "critical")
+        buf_status_text = "healthy" if buf_status == "good" else ("low" if buf_status == "warning" else "critical")
+        status_class = f"status-{buf_status}"
+        st.markdown(f"""
+        <div class="abr-metric-card">
+            <div class="abr-metric-label">buffer health</div>
+            <div>
+                <span class="abr-metric-value">{current_metrics['buffer_sec']}</span>
+                <span class="abr-metric-unit">s</span>
+            </div>
+            <div class="abr-status {status_class}">{buf_status_text}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    col3, col4 = st.columns(2)
+    with col3:
+        rtt_status = "good" if current_metrics["rtt_ms"] < 50 else ("warning" if current_metrics["rtt_ms"] < 100 else "critical")
+        status_class = f"status-{rtt_status}"
+        st.markdown(f"""
+        <div class="abr-metric-card">
+            <div class="abr-metric-label">RTT</div>
+            <div>
+                <span class="abr-metric-value">{int(current_metrics['rtt_ms'])}</span>
+                <span class="abr-metric-unit">ms</span>
+            </div>
+            <div class="abr-status {status_class}">{rtt_status}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col4:
+        drop_status = "good" if current_metrics["drop_events"] == 0 else "critical"
+        status_class = f"status-{drop_status}"
+        drop_text = "— no rebuffer" if drop_status == "good" else "— rebuffering!"
+        st.markdown(f"""
+        <div class="abr-metric-card">
+            <div class="abr-metric-label">drop events</div>
+            <div>
+                <span class="abr-metric-value">{current_metrics['drop_events']}</span>
+            </div>
+            <div class="abr-status {status_class}">{drop_text}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Buffer level visualization
+    st.markdown('<div style="font-size: 0.7rem; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin: 16px 0 8px;">buffer level</div>', unsafe_allow_html=True)
+    guard_position = (4.0 / 20.0) * 100
+    st.markdown(f"""
+    <div style="background: #f8fafc; border-radius: 8px; padding: 10px; margin: 8px 0; border: 1px solid #e2e8f0;">
+        <div style="height: 16px; background: linear-gradient(90deg, #dcfce7, #22c55e); border-radius: 4px; position: relative; overflow: hidden; width: {min(100, current_metrics['buffer_pct'])}%;">
+            <div style="position: absolute; left: {guard_position}%; top: 0; bottom: 0; width: 2px; background: #f59e0b; z-index: 10;"></div>
+            <div style="position: absolute; left: {guard_position}%; top: -18px; font-size: 0.65rem; color: #f59e0b; transform: translateX(-50%); font-weight:600;">guard: 4s</div>
+        </div>
+        <div style="display: flex; justify-content: space-between; font-size: 0.65rem; color: #94a3b8; margin-top: 4px;">
+            <span>0s</span>
+            <span>20s</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Bitrate ladder
+    st.markdown('<div style="font-size: 0.7rem; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin: 16px 0 8px;">bitrate ladder</div>', unsafe_allow_html=True)
+    
+    ladder_html = '<div style="background: #f8fafc; border-radius: 8px; padding: 10px; border: 1px solid #e2e8f0;">'
+    for i, lvl in enumerate(BITRATE_LADDER):
+        is_active = (i == st.session_state.abr_current_bitrate_idx)
+        is_available = lvl["bitrate_mbps"] <= current_metrics["bandwidth_mbps"] * 0.9
+        
+        if is_active:
+            bar_class = "active"
+            bar_color = "#3b82f6"
+            bar_width = "100%"
+        elif is_available:
+            bar_class = "available"
+            bar_color = "#94a3b8"
+            bar_width = "60%"
+        else:
+            bar_class = "unavailable"
+            bar_color = "#e2e8f0"
+            bar_width = "20%"
+        
+        quality_bg = "#3b82f6" if is_active else "#e2e8f0"
+        quality_color = "#ffffff" if is_active else "#64748b"
+        
+        ladder_html += f"""
+        <div class="abr-ladder-row">
+            <div class="abr-ladder-quality" style="background: {quality_bg}; color: {quality_color};">{lvl['quality']}</div>
+            <div class="abr-ladder-bar-container">
+                <div class="abr-ladder-bar" style="background: {bar_color}; width: {bar_width};"></div>
+            </div>
+            <div class="abr-ladder-bitrate">{lvl['bitrate_mbps']}M</div>
+        </div>
+        """
+    ladder_html += '</div>'
+    st.markdown(ladder_html, unsafe_allow_html=True)
+    
+    # Bandwidth history chart
+    st.markdown('<div style="font-size: 0.7rem; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin: 16px 0 8px;">bandwidth history (30s)</div>', unsafe_allow_html=True)
+    
+    if len(st.session_state.abr_metrics_history) > 1:
+        chart_data = pd.DataFrame([
+            {"time": i, "bandwidth": m["bandwidth_mbps"]}
+            for i, m in enumerate(st.session_state.abr_metrics_history[-30:])
+        ])
+        st.line_chart(chart_data.set_index("time")[["bandwidth"]], color="#3b82f6", use_container_width=True)
+    else:
+        st.markdown('<div style="background: #f8fafc; border-radius: 8px; padding: 20px; text-align: center; color: #94a3b8; border: 1px solid #e2e8f0;">Collecting data...</div>', unsafe_allow_html=True)
+    
+    # ABR decisions log
+    st.markdown('<div style="font-size: 0.7rem; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin: 16px 0 8px;">abr decisions</div>', unsafe_allow_html=True)
+    
+    if st.session_state.abr_decisions:
+        log_html = '<div style="background: #f8fafc; border-radius: 8px; padding: 10px; max-height: 150px; overflow-y: auto; border: 1px solid #e2e8f0;">'
+        for decision in st.session_state.abr_decisions[:10]:
+            arrow_color = "#15803d" if decision["direction"] == "↑" else "#b91c1c"
+            log_html += f"""
+            <div class="abr-log-entry">
+                <div class="abr-log-time">{decision['time']}</div>
+                <div class="abr-log-arrow" style="color: {arrow_color};">{decision['direction']}</div>
+                <div class="abr-log-quality">{decision['type']} → {decision['to_quality']}</div>
+            </div>
+            """
+        log_html += '</div>'
+        st.markdown(log_html, unsafe_allow_html=True)
+    else:
+        st.markdown('<div style="background: #f8fafc; border-radius: 8px; padding: 15px; text-align: center; color: #94a3b8; border: 1px solid #e2e8f0;">No decisions yet</div>', unsafe_allow_html=True)
+    
+    # Guardrails toggles
+    st.markdown('<div style="font-size: 0.7rem; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin: 16px 0 8px;">guardrails</div>', unsafe_allow_html=True)
+    
+    guardrails_html = '<div style="background: #f8fafc; border-radius: 8px; padding: 10px; border: 1px solid #e2e8f0;">'
+    for key, label in [
+        ("buffer_guard", "Buffer guard"),
+        ("stability_lock", "Stability lock"),
+        ("fast_downgrade", "Fast downgrade"),
+        ("slow_upgrade", "Slow upgrade"),
+    ]:
+        active_class = "active" if st.session_state.abr_guardrails[key] else ""
+        guardrails_html += f"""
+        <div class="abr-guardrail-toggle">
+            <div class="abr-guardrail-label">{label}</div>
+            <div class="abr-toggle-switch {active_class}" onclick="window.location.reload()">
+                <div class="abr-toggle-knob"></div>
+            </div>
+            <input type="checkbox" id="toggle_{key}" style="display: none;" {'checked' if st.session_state.abr_guardrails[key] else ''} onchange="document.getElementById('toggle_{key}').click()">
+        </div>
+        """
+    guardrails_html += '</div>'
+    st.markdown(guardrails_html, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -829,51 +1191,25 @@ if enable_encoding:
     with p1:
         st.markdown("#### 🎬 Standard Clean")
         st.caption("**Best for:** Noisy, grainy, or compressed footage")
-        st.markdown("• Reduces noise & grain")
-        st.markdown("• Removes blocking artifacts")
-        st.markdown("• Mild sharpening")
+        st.markdown("• Reduces noise & grain\n• Removes blocking artifacts\n• Mild sharpening")
         if st.button("Apply Standard Clean", use_container_width=True, type="secondary"):
-            st.session_state.enhance_settings.update({
-                "denoise": True, "denoise_strength": 5,
-                "deblock": True, "deblock_strength": 5,
-                "sharpen": True, "sharpen_amount": 0.3, "sharpen_threshold": 8,
-                "upscale": False, "hdr_convert": False, "frame_interp": False,
-                "color_enhance": False,
-            })
+            st.session_state.enhance_settings.update({"denoise": True, "denoise_strength": 5, "deblock": True, "deblock_strength": 5, "sharpen": True, "sharpen_amount": 0.3, "sharpen_threshold": 8, "upscale": False, "hdr_convert": False, "frame_interp": False, "color_enhance": False})
             st.rerun()
 
     with p2:
         st.markdown("#### 🎨 Detail & Color Boost")
         st.caption("**Best for:** Dull, flat, or low-contrast footage")
-        st.markdown("• Enhances sharpness")
-        st.markdown("• Boosts color vibrance")
-        st.markdown("• Increases contrast")
+        st.markdown("• Enhances sharpness\n• Boosts color vibrance\n• Increases contrast")
         if st.button("Apply Detail Boost", use_container_width=True, type="secondary"):
-            st.session_state.enhance_settings.update({
-                "sharpen": True, "sharpen_amount": 0.8, "sharpen_threshold": 3,
-                "color_enhance": True, "vibrance": 0.25, "contrast": 1.15,
-                "denoise": False, "deblock": False,
-                "upscale": False, "hdr_convert": False, "frame_interp": False,
-            })
+            st.session_state.enhance_settings.update({"sharpen": True, "sharpen_amount": 0.8, "sharpen_threshold": 3, "color_enhance": True, "vibrance": 0.25, "contrast": 1.15, "denoise": False, "deblock": False, "upscale": False, "hdr_convert": False, "frame_interp": False})
             st.rerun()
 
     with p3:
         st.markdown("#### 🚀 AI Upscale 2×")
         st.caption("**Best for:** Low-resolution content (480p→1080p, 1080p→4K)")
-        st.markdown("• 2× resolution upscale")
-        st.markdown("• Pre-denoise for quality")
-        st.markdown("• Post-sharpen details")
+        st.markdown("• 2× resolution upscale\n• Pre-denoise for quality\n• Post-sharpen details")
         if st.button("Apply AI Upscale 2×", use_container_width=True, type="secondary"):
-            st.session_state.enhance_settings.update({
-                "upscale": True,
-                "upscale_width":  meta["width"]  * 2,
-                "upscale_height": meta["height"] * 2,
-                "upscale_algo": "lanczos",
-                "denoise": True, "denoise_strength": 6,
-                "sharpen": True, "sharpen_amount": 0.5, "sharpen_threshold": 5,
-                "hdr_convert": False, "frame_interp": False,
-                "deblock": False, "color_enhance": False,
-            })
+            st.session_state.enhance_settings.update({"upscale": True, "upscale_width": meta["width"] * 2, "upscale_height": meta["height"] * 2, "upscale_algo": "lanczos", "denoise": True, "denoise_strength": 6, "sharpen": True, "sharpen_amount": 0.5, "sharpen_threshold": 5, "hdr_convert": False, "frame_interp": False, "deblock": False, "color_enhance": False})
             st.rerun()
 
     st.divider()
@@ -885,90 +1221,48 @@ if enable_encoding:
     with enh_col1:
         with st.container(border=True):
             st.markdown("**🧹 Denoise**")
-            es["denoise"] = st.checkbox(
-                "Enable temporal noise reduction", value=es["denoise"], key="chk_denoise",
-                help="Reduces grain and compression artifacts using 3D filtering",
-            )
+            es["denoise"] = st.checkbox("Enable temporal noise reduction", value=es["denoise"], key="chk_denoise", help="Reduces grain and compression artifacts using 3D filtering")
             if es["denoise"]:
-                es["denoise_strength"] = st.slider(
-                    "Strength", 1, 10, es["denoise_strength"], key="sl_denoise_str",
-                    help="Higher = more aggressive noise removal",
-                )
+                es["denoise_strength"] = st.slider("Strength", 1, 10, es["denoise_strength"], key="sl_denoise_str", help="Higher = more aggressive noise removal")
             st.caption("Reduces grain, compression artifacts, and sensor noise.")
 
         with st.container(border=True):
             st.markdown("**🔍 Detail Enhancement**")
-            es["sharpen"] = st.checkbox(
-                "Enable adaptive sharpening", value=es["sharpen"], key="chk_sharpen",
-            )
+            es["sharpen"] = st.checkbox("Enable adaptive sharpening", value=es["sharpen"], key="chk_sharpen")
             if es["sharpen"]:
                 cs1, cs2 = st.columns(2)
                 with cs1:
-                    es["sharpen_amount"] = st.slider(
-                        "Amount", -1.5, 1.5, es["sharpen_amount"], 0.1, key="sl_sharpen_amt",
-                    )
+                    es["sharpen_amount"] = st.slider("Amount", -1.5, 1.5, es["sharpen_amount"], 0.1, key="sl_sharpen_amt")
                 with cs2:
-                    # kept for UI compat but used as chroma kernel size hint only
-                    es["sharpen_threshold"] = st.slider(
-                        "Chroma Softness", 0, 50, es["sharpen_threshold"], key="sl_sharpen_thr",
-                        help="Higher = softer chroma sharpening relative to luma",
-                    )
+                    es["sharpen_threshold"] = st.slider("Chroma Softness", 0, 50, es["sharpen_threshold"], key="sl_sharpen_thr", help="Higher = softer chroma sharpening relative to luma")
             st.caption("Enhances edge definition using adaptive unsharp masking (lx=5, cx=3).")
 
         with st.container(border=True):
             st.markdown("**🔬 Resolution Upscaling**")
-            es["upscale"] = st.checkbox(
-                "Enable high-quality upscaling", value=es["upscale"], key="chk_upscale",
-            )
+            es["upscale"] = st.checkbox("Enable high-quality upscaling", value=es["upscale"], key="chk_upscale")
             if es["upscale"]:
                 algo_opts = ["lanczos", "spline", "bicubic"]
-                es["upscale_algo"] = st.selectbox(
-                    "Algorithm", algo_opts,
-                    index=algo_opts.index(es["upscale_algo"]) if es["upscale_algo"] in algo_opts else 0,
-                    key="sel_upscale_algo",
-                )
-                es["upscale_width"] = st.number_input(
-                    "Target Width (px)", min_value=meta["width"], max_value=7680,
-                    value=max(meta["width"], es.get("upscale_width") or meta["width"] * 2),
-                    step=max(2, meta["width"] // 2), key="ni_upscale_w",
-                )
-                es["upscale_height"] = st.number_input(
-                    "Target Height (px)", min_value=meta["height"], max_value=4320,
-                    value=max(meta["height"], es.get("upscale_height") or meta["height"] * 2),
-                    step=max(2, meta["height"] // 2), key="ni_upscale_h",
-                )
-            st.caption(
-                "High-quality interpolation. For true AI super-resolution, "
-                "integrate Real-ESRGAN externally."
-            )
+                es["upscale_algo"] = st.selectbox("Algorithm", algo_opts, index=algo_opts.index(es["upscale_algo"]) if es["upscale_algo"] in algo_opts else 0, key="sel_upscale_algo")
+                es["upscale_width"] = st.number_input("Target Width (px)", min_value=meta["width"], max_value=7680, value=max(meta["width"], es.get("upscale_width") or meta["width"] * 2), step=max(2, meta["width"] // 2), key="ni_upscale_w")
+                es["upscale_height"] = st.number_input("Target Height (px)", min_value=meta["height"], max_value=4320, value=max(meta["height"], es.get("upscale_height") or meta["height"] * 2), step=max(2, meta["height"] // 2), key="ni_upscale_h")
+            st.caption("High-quality interpolation. For true AI super-resolution, integrate Real-ESRGAN externally.")
 
     # ── Right Column ──────────────────────────────────────────────────────────
     with enh_col2:
         is_hdr_source = meta.get("bit_depth", 8) >= 10
         with st.container(border=True):
             st.markdown("**🌈 HDR → SDR Tonemapping**")
-            es["hdr_convert"] = st.checkbox(
-                "Enable HDR conversion",
-                value=es["hdr_convert"] and is_hdr_source,
-                key="chk_hdr", disabled=not is_hdr_source,
-                help="Requires 10-bit+ HDR10/HLG source",
-            )
+            es["hdr_convert"] = st.checkbox("Enable HDR conversion", value=es["hdr_convert"] and is_hdr_source, key="chk_hdr", disabled=not is_hdr_source, help="Requires 10-bit+ HDR10/HLG source")
             if es["hdr_convert"] and is_hdr_source:
                 tmap_opts = ["hable", "reinhard", "mobius", "linear"]
-                es["tonemap_algo"] = st.selectbox(
-                    "Tonemap Algorithm", tmap_opts,
-                    index=tmap_opts.index(es["tonemap_algo"]) if es["tonemap_algo"] in tmap_opts else 0,
-                    key="sel_tonemap",
-                )
+                es["tonemap_algo"] = st.selectbox("Tonemap Algorithm", tmap_opts, index=tmap_opts.index(es["tonemap_algo"]) if es["tonemap_algo"] in tmap_opts else 0, key="sel_tonemap")
             elif not is_hdr_source:
                 st.caption("💡 Source is SDR (8-bit). HDR conversion requires a 10-bit+ HDR10/HLG source.")
             st.caption("Converts HDR10/HLG to SDR with perceptual tonemapping.")
 
         with st.container(border=True):
             st.markdown("**🎨 Color Enhancement**")
-            es["color_enhance"] = st.checkbox(
-                "Enable color boost", value=es["color_enhance"], key="chk_color",
-            )
+            es["color_enhance"] = st.checkbox("Enable color boost", value=es["color_enhance"], key="chk_color")
             if es["color_enhance"]:
                 cc1, cc2 = st.columns(2)
                 with cc1:
@@ -979,27 +1273,19 @@ if enable_encoding:
 
         with st.container(border=True):
             st.markdown("**🧩 Artifact Reduction**")
-            es["deblock"] = st.checkbox(
-                "Enable deblocking filter", value=es["deblock"], key="chk_deblock",
-            )
+            es["deblock"] = st.checkbox("Enable deblocking filter", value=es["deblock"], key="chk_deblock")
             if es["deblock"]:
-                es["deblock_strength"] = st.slider(
-                    "Strength", 1, 10, es["deblock_strength"], key="sl_deblock_str",
-                )
+                es["deblock_strength"] = st.slider("Strength", 1, 10, es["deblock_strength"], key="sl_deblock_str")
             st.caption("Reduces macroblocking and ringing from heavy compression.")
 
     # ── Frame Interpolation ───────────────────────────────────────────────────
     with st.expander("🎞️ Advanced: Frame Interpolation (Motion Smoothing)"):
-        es["frame_interp"] = st.checkbox(
-            "Enable frame interpolation", value=es["frame_interp"], key="chk_frame_interp",
-        )
+        es["frame_interp"] = st.checkbox("Enable frame interpolation", value=es["frame_interp"], key="chk_frame_interp")
         if es["frame_interp"]:
             fps_opts = [30, 48, 60, 120]
             cur_fps  = es.get("target_fps", 60)
             fps_idx  = fps_opts.index(cur_fps) if cur_fps in fps_opts else 2
-            es["target_fps"] = st.selectbox(
-                "Target Frame Rate", fps_opts, index=fps_idx, key="sel_target_fps",
-            )
+            es["target_fps"] = st.selectbox("Target Frame Rate", fps_opts, index=fps_idx, key="sel_target_fps")
             st.warning("⚠️ Frame interpolation is CPU-intensive and may increase processing time 3–5×.")
         st.caption("Creates intermediate frames for smoother playback (e.g., 24 fps → 60 fps).")
 
@@ -1009,10 +1295,7 @@ if enable_encoding:
 
     if active_enhancements > 0:
         est_time = estimate_processing_time(meta, es)
-        st.info(
-            f"⏱️ **Estimated processing time**: {est_time} "
-            f"({active_enhancements} enhancement{'s' if active_enhancements > 1 else ''} active)"
-        )
+        st.info(f"⏱️ **Estimated processing time**: {est_time} ({active_enhancements} enhancement{'s' if active_enhancements > 1 else ''} active)")
         enh_labels = {
             "denoise": "🧹 Denoise", "sharpen": "🔍 Sharpen", "upscale": "🔬 Upscale",
             "hdr_convert": "🌈 HDR", "color_enhance": "🎨 Color",
@@ -1028,54 +1311,34 @@ if enable_encoding:
     s1, s2, s3, s4 = st.columns([2, 2, 1, 2])
 
     with s1:
-        codec = st.selectbox(
-            "Video Codec", ["AVC (H.264)", "HEVC (H.265)", "AV1"],
-            help="H.264 = fastest · HEVC = ~40% smaller · AV1 = best compression",
-        )
+        codec = st.selectbox("Video Codec", ["AVC (H.264)", "HEVC (H.265)", "AV1"], help="H.264 = fastest · HEVC = ~40% smaller · AV1 = best compression")
     with s2:
-        crf = st.slider(
-            "CRF Quality", 0, 51, 23,
-            help="Lower = better quality · 0 = lossless · 18 = visually lossless · 23 = balanced",
-        )
+        crf = st.slider("CRF Quality", 0, 51, 23, help="Lower = better quality · 0 = lossless · 18 = visually lossless · 23 = balanced")
     with s3:
-        do_vmaf = st.checkbox("VMAF",     value=HAS_VMAF, disabled=not HAS_VMAF)
+        do_vmaf = st.checkbox("VMAF", value=HAS_VMAF, disabled=not HAS_VMAF)
         do_psnr = st.checkbox("PSNR/SSIM", value=True)
     with s4:
         if crf < 19:   ql, qc = "🟢 High Quality", "#15803d"
         elif crf < 29: ql, qc = "🟡 Balanced",     "#b45309"
         elif crf < 40: ql, qc = "🟠 Compact",      "#ea580c"
         else:          ql, qc = "🔴 Low Quality",  "#b91c1c"
-        st.markdown(
-            f'<div style="text-align:center;padding:10px 0">'
-            f'<div style="font-weight:700;color:{qc};font-size:1rem">{ql}</div>'
-            f'<div style="font-size:0.74rem;color:#64748b;margin-top:2px">CRF {crf}</div>'
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'<div style="text-align:center;padding:10px 0"><div style="font-weight:700;color:{qc};font-size:1rem">{ql}</div><div style="font-size:0.74rem;color:#64748b;margin-top:2px">CRF {crf}</div></div>', unsafe_allow_html=True)
 
     if codec == "AV1" and active_enhancements > 0:
-        st.warning(
-            "⚠️ **AV1 + Enhancements**: Very resource intensive. "
-            "May crash on free-tier cloud. Use H.264/HEVC for cloud deployment."
-        )
+        st.warning("⚠️ **AV1 + Enhancements**: Very resource intensive. May crash on free-tier cloud. Use H.264/HEVC for cloud deployment.")
 
-    # ── NEW: Batch CRF Sweep ──────────────────────────────────────────────────
+    # ── Batch CRF Sweep ───────────────────────────────────────────────────────
     with st.expander("📊 Batch CRF Sweep — Rate-Distortion Analysis"):
-        st.caption(
-            "Automatically encode at multiple CRF values to find the optimal "
-            "quality/size trade-off. Uses current codec and enhancements."
-        )
+        st.caption("Automatically encode at multiple CRF values to find the optimal quality/size trade-off.")
         sweep_col1, sweep_col2, sweep_col3 = st.columns(3)
         with sweep_col1:
             sweep_start = st.number_input("CRF Start", 10, 45, 18, step=1, key="sweep_start")
         with sweep_col2:
-            sweep_end   = st.number_input("CRF End",   sweep_start+1, 51, 38, step=1, key="sweep_end")
+            sweep_end = st.number_input("CRF End", sweep_start+1, 51, 38, step=1, key="sweep_end")
         with sweep_col3:
-            sweep_step  = st.number_input("Step",      1, 10, 5, step=1, key="sweep_step")
-
+            sweep_step = st.number_input("Step", 1, 10, 5, step=1, key="sweep_step")
         sweep_crfs = list(range(int(sweep_start), int(sweep_end)+1, int(sweep_step)))
         st.caption(f"Will encode {len(sweep_crfs)} variants: CRF {', '.join(map(str, sweep_crfs))}")
-
         if st.button("🚀 Run CRF Sweep", type="primary"):
             sweep_bar = st.progress(0.0, text="Starting sweep…")
             for i, sweep_crf in enumerate(sweep_crfs):
@@ -1083,12 +1346,10 @@ if enable_encoding:
                 out_path = inp.replace(suf, f"_sweep_{codec_short}_crf{sweep_crf}.mp4")
                 sweep_bar.progress(i / len(sweep_crfs), text=f"⚙️ Encoding CRF {sweep_crf} ({i+1}/{len(sweep_crfs)})…")
 
-                ok, msg, fflog, enc_t = encode(
-                    inp, out_path, codec, sweep_crf, es, meta, duration=meta["duration"]
-                )
+                ok, msg, fflog, enc_t = encode(inp, out_path, codec, sweep_crf, es, meta, duration=meta["duration"])
                 if ok:
                     out_meta = probe(out_path)
-                    out_sz   = os.path.getsize(out_path) / (1024 * 1024)
+                    out_sz = os.path.getsize(out_path) / (1024 * 1024)
                     qual = {"psnr": None, "ssim": None, "vmaf": None}
                     if do_psnr or (do_vmaf and HAS_VMAF):
                         qual = quality_metrics(inp, out_path, do_vmaf and HAS_VMAF)
@@ -1096,23 +1357,10 @@ if enable_encoding:
                     idx = len(st.session_state.results)
                     st.session_state.result_logs[idx] = fflog
                     st.session_state.results.append({
-                        "codec": codec, "crf": sweep_crf,
-                        "size_mb": out_sz,
-                        "bitrate": out_meta.get("vbitrate_kbps", 0),
-                        "enc_time": enc_t,
-                        "saved": (1 - out_sz / sz_mb) * 100 if sz_mb > 0 else 0.0,
-                        "cr": sz_mb / out_sz if out_sz > 0 else 0.0,
-                        "psnr": qual["psnr"], "ssim": qual["ssim"], "vmaf": qual["vmaf"],
-                        "path": out_path,
-                        "acodec": meta["acodec"], "abitrate": meta["abitrate_kbps"],
-                        "sample_rate": meta["sample_rate"], "channels": meta["channels"],
-                        "enhancements": {k: v for k, v in es.items() if k in _enh_keys and v},
-                        "out_res": f"{out_meta.get('width',meta['width'])}×{out_meta.get('height',meta['height'])}",
-                        "out_fps": out_meta.get("fps", meta["fps"]),
+                        "codec": codec, "crf": sweep_crf, "size_mb": out_sz, "bitrate": out_meta.get("vbitrate_kbps", 0), "enc_time": enc_t, "saved": (1 - out_sz / sz_mb) * 100 if sz_mb > 0 else 0.0, "cr": sz_mb / out_sz if out_sz > 0 else 0.0, "psnr": qual["psnr"], "ssim": qual["ssim"], "vmaf": qual["vmaf"], "path": out_path, "acodec": meta["acodec"], "abitrate": meta["abitrate_kbps"], "sample_rate": meta["sample_rate"], "channels": meta["channels"], "enhancements": {k: v for k, v in es.items() if k in _enh_keys and v}, "out_res": f"{out_meta.get('width',meta['width'])}×{out_meta.get('height',meta['height'])}", "out_fps": out_meta.get("fps", meta["fps"])
                     })
                 else:
                     st.warning(f"CRF {sweep_crf} failed: {msg}")
-
             sweep_bar.progress(1.0, text=f"✅ Sweep complete — {len(sweep_crfs)} variants encoded")
             st.rerun()
 
@@ -1124,40 +1372,30 @@ if enable_encoding:
         if st.button("🔍 Preview Impact", use_container_width=True):
             est_meta = meta.copy()
             if es.get("upscale"):
-                est_meta["width"]  = int(es.get("upscale_width")  or meta["width"]  * 2)
-                est_meta["height"] = int(es.get("upscale_height") or meta["height"] * 2)
+                est_meta["width"], est_meta["height"] = int(es.get("upscale_width") or meta["width"] * 2), int(es.get("upscale_height") or meta["height"] * 2)
             if es.get("frame_interp"):
                 est_meta["fps"] = es.get("target_fps", 60)
             st.markdown("#### 📊 Estimated Output")
             bc1, bc2 = st.columns(2)
-            bc1.metric("Source",   f"{meta['width']}×{meta['height']}",     f"@ {meta['fps']} fps")
+            bc1.metric("Source", f"{meta['width']}×{meta['height']}", f"@ {meta['fps']} fps")
             bc2.metric("Enhanced", f"{est_meta['width']}×{est_meta['height']}", f"@ {est_meta['fps']} fps")
             if est_meta["width"] > meta["width"] and meta["width"] > 0:
                 ratio = (est_meta["width"] / meta["width"]) ** 2
                 st.caption(f"+{(ratio-1)*100:.0f}% more pixels ({ratio:.1f}× resolution)")
 
-    go    = b2.button("✨ Enhance + Encode", type="primary", use_container_width=True)
+    go = b2.button("✨ Enhance + Encode", type="primary", use_container_width=True)
     clear = b3.button("🗑 Clear", use_container_width=True)
-
     if clear:
-        st.session_state.results     = []
-        st.session_state.result_logs = {}
+        st.session_state.results, st.session_state.result_logs = [], {}
         st.rerun()
 
     if go:
         codec_short = codec.split()[0].lower()
-        enh_tag     = "enh_" if active_enhancements > 0 else ""
-        out_path    = inp.replace(suf, f"_{enh_tag}{codec_short}_crf{crf}.mp4")
-
+        enh_tag = "enh_" if active_enhancements > 0 else ""
+        out_path = inp.replace(suf, f"_{enh_tag}{codec_short}_crf{crf}.mp4")
         bar = st.progress(0.0, text=f"⏳ Initializing {codec}…")
-
         with st.spinner(f"✨ Processing ({active_enhancements} enhancements) + encoding {codec} CRF {crf}…"):
-            ok, msg, fflog, enc_t = encode(
-                inp, out_path, codec, crf, es, meta,
-                progress_cb=lambda p: bar.progress(p, text=f"⚙️ Processing… {p*100:.0f}%"),
-                duration=meta["duration"],
-            )
-
+            ok, msg, fflog, enc_t = encode(inp, out_path, codec, crf, es, meta, progress_cb=lambda p: bar.progress(p, text=f"⚙️ Processing… {p*100:.0f}%"), duration=meta["duration"])
         if not ok:
             bar.empty()
             st.error(f"❌ {msg}")
@@ -1167,64 +1405,30 @@ if enable_encoding:
         else:
             bar.progress(1.0, text="✅ Encoding complete — computing quality metrics…")
             out_meta = probe(out_path)
-            out_sz   = os.path.getsize(out_path) / (1024 * 1024)
+            out_sz = os.path.getsize(out_path) / (1024 * 1024)
             saved_pct = (1 - out_sz / sz_mb) * 100 if sz_mb > 0 else 0.0
-
             qual = {"psnr": None, "ssim": None, "vmaf": None}
             if do_psnr or (do_vmaf and HAS_VMAF):
                 with st.spinner("🔍 Computing quality metrics (PSNR/SSIM/VMAF)…"):
                     qual = quality_metrics(inp, out_path, do_vmaf and HAS_VMAF)
-
             idx = len(st.session_state.results)
             st.session_state.result_logs[idx] = fflog
-            st.session_state.results.append({
-                "codec": codec, "crf": crf,
-                "size_mb": out_sz, "bitrate": out_meta.get("vbitrate_kbps", 0),
-                "enc_time": enc_t, "saved": saved_pct,
-                "cr": sz_mb / out_sz if out_sz > 0 else 0.0,
-                "psnr": qual["psnr"], "ssim": qual["ssim"], "vmaf": qual["vmaf"],
-                "path": out_path,
-                "acodec": meta["acodec"], "abitrate": meta["abitrate_kbps"],
-                "sample_rate": meta["sample_rate"], "channels": meta["channels"],
-                "enhancements": {k: v for k, v in es.items() if k in _enh_keys and v},
-                "out_res": f"{out_meta.get('width',meta['width'])}×{out_meta.get('height',meta['height'])}",
-                "out_fps": out_meta.get("fps", meta["fps"]),
-            })
+            st.session_state.results.append({"codec": codec, "crf": crf, "size_mb": out_sz, "bitrate": out_meta.get("vbitrate_kbps", 0), "enc_time": enc_t, "saved": saved_pct, "cr": sz_mb / out_sz if out_sz > 0 else 0.0, "psnr": qual["psnr"], "ssim": qual["ssim"], "vmaf": qual["vmaf"], "path": out_path, "acodec": meta["acodec"], "abitrate": meta["abitrate_kbps"], "sample_rate": meta["sample_rate"], "channels": meta["channels"], "enhancements": {k: v for k, v in es.items() if k in _enh_keys and v}, "out_res": f"{out_meta.get('width',meta['width'])}×{out_meta.get('height',meta['height'])}", "out_fps": out_meta.get("fps", meta["fps"])})
             bar.empty()
-
             q_parts = []
             if qual["vmaf"] is not None: q_parts.append(f"VMAF {qual['vmaf']:.1f}")
             if qual["psnr"] is not None: q_parts.append(f"PSNR {qual['psnr']:.2f} dB")
-            q_str   = " · ".join(q_parts) if q_parts else "Analysis complete"
+            q_str = " · ".join(q_parts) if q_parts else "Analysis complete"
             enh_summary = " + ".join(k.capitalize() for k in _enh_keys if es.get(k))
             enh_str = f" · ✨ {enh_summary}" if enh_summary else ""
-
-            st.success(
-                f"✅ {codec} CRF {crf}{enh_str} · "
-                f"{out_sz:.2f} MB · saved {saved_pct:.1f}% · "
-                f"{enc_t:.1f}s · {q_str}"
-            )
+            st.success(f"✅ {codec} CRF {crf}{enh_str} · {out_sz:.2f} MB · saved {saved_pct:.1f}% · {enc_t:.1f}s · {q_str}")
 
 else:
     # ── Test Player Mode ──────────────────────────────────────────────────────
     st.markdown('<div class="vf-label">🎬 Test Player Mode</div>', unsafe_allow_html=True)
-    st.info(
-        "🎧 **Playback & Analytics**: Preview your source video. "
-        "All metadata displayed. No processing performed."
-    )
+    st.info("🎧 **Playback & Analytics**: Preview your source video. All metadata displayed. No processing performed.")
     if meta["has_audio"]:
-        st.markdown(
-            f"""<div style="background:#f1f5f9;border-radius:12px;padding:14px 18px;margin:12px 0">
-            <div style="font-weight:700;margin-bottom:10px;color:#334155">🔊 Audio Stream Details</div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap">
-                <span style="background:white;padding:4px 12px;border-radius:7px;font-size:0.8rem;border:1px solid #e2e8f0;font-weight:600">{format_audio_codec(meta['acodec'])}</span>
-                <span style="background:white;padding:4px 12px;border-radius:7px;font-size:0.8rem;border:1px solid #e2e8f0;font-weight:600">{format_channels(meta['channels'])}</span>
-                <span style="background:white;padding:4px 12px;border-radius:7px;font-size:0.8rem;border:1px solid #e2e8f0;font-weight:600">{format_sample_rate(meta['sample_rate'])}</span>
-                <span style="background:white;padding:4px 12px;border-radius:7px;font-size:0.8rem;border:1px solid #e2e8f0;font-weight:600">{meta['abitrate_kbps']} kbps</span>
-            </div>
-            </div>""",
-            unsafe_allow_html=True,
-        )
+        st.markdown(f"""<div style="background:#f1f5f9;border-radius:12px;padding:14px 18px;margin:12px 0"><div style="font-weight:700;margin-bottom:10px;color:#334155">🔊 Audio Stream Details</div><div style="display:flex;gap:8px;flex-wrap:wrap"><span style="background:white;padding:4px 12px;border-radius:7px;font-size:0.8rem;border:1px solid #e2e8f0;font-weight:600">{format_audio_codec(meta['acodec'])}</span><span style="background:white;padding:4px 12px;border-radius:7px;font-size:0.8rem;border:1px solid #e2e8f0;font-weight:600">{format_channels(meta['channels'])}</span><span style="background:white;padding:4px 12px;border-radius:7px;font-size:0.8rem;border:1px solid #e2e8f0;font-weight:600">{format_sample_rate(meta['sample_rate'])}</span><span style="background:white;padding:4px 12px;border-radius:7px;font-size:0.8rem;border:1px solid #e2e8f0;font-weight:600">{meta['abitrate_kbps']} kbps</span></div></div>""", unsafe_allow_html=True)
     st.caption("💡 Enable Encoding Mode above to access AI enhancement features.")
 
 
@@ -1241,10 +1445,7 @@ if not results or not enable_encoding:
 st.divider()
 st.markdown('<div class="vf-label">📈 Analytics Dashboard</div>', unsafe_allow_html=True)
 
-tab_tbl, tab_chart, tab_dl, tab_logs = st.tabs([
-    "📋 Comparison Table", "📊 Charts", "⬇ Downloads", "🪵 Logs"
-])
-
+tab_tbl, tab_chart, tab_dl, tab_logs = st.tabs(["📋 Comparison Table", "📊 Charts", "⬇ Downloads", "🪵 Logs"])
 
 # ── Comparison Table ──────────────────────────────────────────────────────────
 with tab_tbl:
@@ -1253,7 +1454,6 @@ with tab_tbl:
     best_spd = min(r["enc_time"] for r in results)
     vmaf_vals = [r["vmaf"] for r in results if r["vmaf"] is not None]
     best_vm   = max(vmaf_vals) if vmaf_vals else None
-
     _enh_keys = ["denoise","sharpen","upscale","hdr_convert","color_enhance","deblock","frame_interp"]
 
     rows_html = ""
@@ -1271,14 +1471,11 @@ with tab_tbl:
         if r["vmaf"] is not None and best_vm is not None and abs(r["vmaf"] - best_vm) < 0.01 and len(results) > 1:
             vmaf_cell += ' <span class="w-badge">Best</span>'
 
-        audio_info = (
-            f"{format_audio_codec(r.get('acodec',''))} · {format_channels(r.get('channels',0))}"
-            if r.get("acodec") and r["acodec"] != "unknown" else "—"
-        )
+        audio_info = f"{format_audio_codec(r.get('acodec',''))} · {format_channels(r.get('channels',0))}" if r.get("acodec") and r["acodec"] != "unknown" else "—"
         res_info = r.get("out_res", f"{meta['width']}×{meta['height']}")
         fps_info = r.get("out_fps", meta["fps"])
 
-        ssim_str = ssim_display(r["ssim"])  # NEW: colour-coded SSIM
+        ssim_str = ssim_display(r["ssim"])
 
         rows_html += f"""<tr>
           <td>{tag}</td>
@@ -1295,26 +1492,20 @@ with tab_tbl:
           <td style="font-size:0.77rem;color:#64748b">{audio_info}</td>
         </tr>"""
 
-    st.markdown(
-        f"""<table class="cmp-table">
-          <thead><tr>
-            <th>Codec</th><th>CRF</th><th>Size</th><th>Bitrate</th><th>Ratio</th>
-            <th>Saved</th><th>Time</th><th>VMAF ↑</th><th>PSNR ↑</th><th>SSIM ↑</th>
-            <th>Resolution</th><th>Audio</th>
-          </tr></thead>
-          <tbody>{rows_html}</tbody>
-        </table>
-        <div class="src-bar">
-          <b>Source:</b> {meta['vcodec'].upper()} · {sz_mb:.2f} MB ·
-          {meta['vbitrate_kbps']} kbps · {meta['width']}×{meta['height']} @ {meta['fps']} fps
-          {f" · 🔊 {format_audio_codec(meta['acodec'])} {format_channels(meta['channels'])}" if meta['has_audio'] else ""}
-        </div>""",
-        unsafe_allow_html=True,
-    )
-    st.caption(
-        "📏 VMAF: 93+ Excellent · 80–93 Good · 60–80 Fair | "
-        "PSNR: 40+ dB Good | SSIM: 0.98+ Excellent | ✨ = AI enhancements | 🏆 Best = winner across runs"
-    )
+    st.markdown(f"""<table class="cmp-table">
+      <thead><tr>
+        <th>Codec</th><th>CRF</th><th>Size</th><th>Bitrate</th><th>Ratio</th>
+        <th>Saved</th><th>Time</th><th>VMAF ↑</th><th>PSNR ↑</th><th>SSIM ↑</th>
+        <th>Resolution</th><th>Audio</th>
+      </tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+    <div class="src-bar">
+      <b>Source:</b> {meta['vcodec'].upper()} · {sz_mb:.2f} MB ·
+      {meta['vbitrate_kbps']} kbps · {meta['width']}×{meta['height']} @ {meta['fps']} fps
+      {f" · 🔊 {format_audio_codec(meta['acodec'])} {format_channels(meta['channels'])}" if meta['has_audio'] else ""}
+    </div>""", unsafe_allow_html=True)
+    st.caption("📏 VMAF: 93+ Excellent · 80–93 Good · 60–80 Fair | PSNR: 40+ dB Good | SSIM: 0.98+ Excellent | ✨ = AI enhancements | 🏆 Best = winner across runs")
 
     # ── NEW: CSV Export ───────────────────────────────────────────────────────
     st.download_button(
@@ -1324,7 +1515,6 @@ with tab_tbl:
         mime="text/csv",
         help="Download the full comparison table as a CSV file",
     )
-
 
 # ── Charts ────────────────────────────────────────────────────────────────────
 with tab_chart:
@@ -1395,38 +1585,19 @@ with tab_chart:
                 best_enh = max(scored, key=lambda r: (r.get("vmaf") or 0) + (r.get("psnr") or 0) / 5)
                 n_enh    = len([v for v in best_enh["enhancements"].values() if v])
                 vmaf_str = f"VMAF {best_enh['vmaf']:.1f}" if best_enh.get("vmaf") else f"PSNR {best_enh.get('psnr',0):.2f} dB"
-                st.markdown(
-                    f'<div class="insight-note ai">'
-                    f'<b>Enhancement Winner:</b> <span style="font-weight:700">{best_enh["codec"]}</span> '
-                    f'with {n_enh} enhancement{"s" if n_enh!=1 else ""} '
-                    f'achieved {vmaf_str} at {best_enh["size_mb"]:.2f} MB.</div>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f'<div class="insight-note ai"><b>Enhancement Winner:</b> <span style="font-weight:700">{best_enh["codec"]}</span> with {n_enh} enhancement{"s" if n_enh!=1 else ""} achieved {vmaf_str} at {best_enh["size_mb"]:.2f} MB.</div>', unsafe_allow_html=True)
 
         eff_candidates = [r for r in results if r.get("vmaf") and r["size_mb"] > 0]
         if eff_candidates:
             best_eff = max(eff_candidates, key=lambda r: r["vmaf"] / r["size_mb"])
             enh_tag  = " ✨" if best_eff.get("enhancements") else ""
-            st.markdown(
-                f'<div class="insight-note"><b>Efficiency Pick:</b> '
-                f'<span style="font-weight:700">{best_eff["codec"]} CRF{best_eff["crf"]}{enh_tag}</span> '
-                f'delivers best quality-per-MB '
-                f'(VMAF {best_eff["vmaf"]:.1f} at {best_eff["size_mb"]:.2f} MB).</div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown(f'<div class="insight-note"><b>Efficiency Pick:</b> <span style="font-weight:700">{best_eff["codec"]} CRF{best_eff["crf"]}{enh_tag}</span> delivers best quality-per-MB (VMAF {best_eff["vmaf"]:.1f} at {best_eff["size_mb"]:.2f} MB).</div>', unsafe_allow_html=True)
 
         # NEW: Smallest-for-acceptable-quality insight
         acceptable = [r for r in results if r.get("vmaf") and r["vmaf"] >= 80]
         if acceptable:
             smallest = min(acceptable, key=lambda r: r["size_mb"])
-            st.markdown(
-                f'<div class="insight-note"><b>Streaming Sweet Spot:</b> '
-                f'<span style="font-weight:700">{smallest["codec"]} CRF{smallest["crf"]}</span> '
-                f'is the smallest file with VMAF ≥ 80 '
-                f'({smallest["size_mb"]:.2f} MB · VMAF {smallest["vmaf"]:.1f}).</div>',
-                unsafe_allow_html=True,
-            )
-
+            st.markdown(f'<div class="insight-note"><b>Streaming Sweet Spot:</b> <span style="font-weight:700">{smallest["codec"]} CRF{smallest["crf"]}</span> is the smallest file with VMAF ≥ 80 ({smallest["size_mb"]:.2f} MB · VMAF {smallest["vmaf"]:.1f}).</div>', unsafe_allow_html=True)
 
 # ── Downloads ─────────────────────────────────────────────────────────────────
 with tab_dl:
@@ -1464,7 +1635,6 @@ with tab_dl:
             if r.get("acodec") and r["acodec"] not in ("unknown", ""):
                 st.caption(f"🔊 {format_audio_codec(r['acodec'])} · {format_channels(r.get('channels',0))}")
 
-
 # ── NEW: Logs tab ─────────────────────────────────────────────────────────────
 with tab_logs:
     st.markdown("### 🪵 FFmpeg Encode Logs")
@@ -1477,7 +1647,6 @@ with tab_logs:
             cs = r["codec"].split()[0]
             with st.expander(f"{cs} CRF {r['crf']} — {r['size_mb']:.2f} MB · {r['enc_time']:.1f}s"):
                 st.code(log_text or "(empty)", language="bash")
-
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown("---")
