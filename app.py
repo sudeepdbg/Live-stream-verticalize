@@ -27,7 +27,7 @@ Changelog (bug-fixes + enhancements):
             HTML/JS component inside Streamlit.
 """
 
-import os, io, csv, json, subprocess, tempfile, time, re
+import os, io, csv, json, subprocess, tempfile, time, re, shutil, zipfile, uuid, signal
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -562,6 +562,325 @@ def results_to_csv(results: list, src_meta: dict, sz_mb: float) -> bytes:
             src_meta["vcodec"].upper(), f"{sz_mb:.3f}", src_meta["vbitrate_kbps"],
         ])
     return buf.getvalue().encode()
+
+
+# ── NEW: HLS / Restream helpers ───────────────────────────────────────────────
+MAX_UPLOAD_MB = 300
+
+def safe_token(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "stream")).strip("._") or "stream"
+
+def aspect_dimensions(aspect_label: str):
+    mapping = {
+        "Source / Passthrough": (None, None),
+        "16:9 Landscape (1920×1080)": (1920, 1080),
+        "9:16 Vertical (1080×1920)": (1080, 1920),
+        "1:1 Square (1080×1080)": (1080, 1080),
+        "4:5 Portrait (1080×1350)": (1080, 1350),
+        "3:4 Portrait (1080×1440)": (1080, 1440),
+        "9:16 Vertical Lite (720×1280)": (720, 1280),
+        "16:9 Landscape Lite (1280×720)": (1280, 720),
+    }
+    return mapping.get(aspect_label, (None, None))
+
+def build_aspect_filter(aspect_label: str) -> str:
+    width, height = aspect_dimensions(aspect_label)
+    if not width or not height:
+        return "setsar=1"
+    return (
+        f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+    )
+
+def ensure_clean_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+    for name in os.listdir(path):
+        fp = os.path.join(path, name)
+        try:
+            if os.path.isdir(fp):
+                shutil.rmtree(fp, ignore_errors=True)
+            else:
+                os.unlink(fp)
+        except Exception:
+            pass
+
+def hls_output_paths(base_dir: str, prefix: str = "stream"):
+    os.makedirs(base_dir, exist_ok=True)
+    manifest = os.path.join(base_dir, f"{prefix}.m3u8")
+    segment_pattern = os.path.join(base_dir, f"{prefix}_%05d.ts")
+    return manifest, segment_pattern
+
+def zip_dir_bytes(dir_path: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(dir_path):
+            for file_name in files:
+                fp = os.path.join(root, file_name)
+                arc = os.path.relpath(fp, dir_path)
+                zf.write(fp, arc)
+    buf.seek(0)
+    return buf.getvalue()
+
+def build_hls_ffmpeg_cmd(
+    input_source: str,
+    manifest_path: str,
+    segment_pattern: str,
+    aspect_label: str = "Source / Passthrough",
+    video_bitrate: str = "4500k",
+    audio_bitrate: str = "128k",
+    preset: str = "veryfast",
+    fps: int | None = None,
+    live: bool = False,
+    segment_seconds: int = 4,
+    list_size: int = 6,
+):
+    vf = build_aspect_filter(aspect_label)
+    cmd = ["ffmpeg", "-y"]
+    if live:
+        cmd += ["-fflags", "nobuffer", "-flags", "low_delay", "-thread_queue_size", "1024"]
+    cmd += ["-i", input_source]
+    if vf:
+        cmd += ["-vf", vf]
+    if fps:
+        cmd += ["-r", str(fps)]
+
+    # Conservative HLS defaults for broad playback compatibility
+    cmd += [
+        "-c:v", "libx264",
+        "-preset", preset,
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
+        "-level:v", "4.1",
+        "-b:v", video_bitrate,
+        "-maxrate", video_bitrate,
+        "-bufsize", str(max(int(re.sub(r'[^0-9]', '', video_bitrate) or '4500') * 2, 2000)) + 'k',
+        "-g", str(max(int((fps or 24) * 2), 48)),
+        "-keyint_min", str(max(int((fps or 24) * 2), 48)),
+        "-sc_threshold", "0",
+        "-c:a", "aac",
+        "-b:a", audio_bitrate,
+        "-ar", "48000",
+        "-ac", "2",
+    ]
+
+    if live:
+        cmd += [
+            "-f", "hls",
+            "-hls_time", str(segment_seconds),
+            "-hls_list_size", str(list_size),
+            "-hls_flags", "delete_segments+append_list+independent_segments+program_date_time",
+            "-hls_segment_filename", segment_pattern,
+            manifest_path,
+        ]
+    else:
+        cmd += [
+            "-f", "hls",
+            "-hls_time", str(segment_seconds),
+            "-hls_playlist_type", "vod",
+            "-hls_list_size", "0",
+            "-hls_flags", "independent_segments",
+            "-hls_segment_filename", segment_pattern,
+            manifest_path,
+        ]
+    return cmd
+
+def stop_live_job(job: dict | None):
+    if not job:
+        return
+    proc = job.get("proc")
+    if not proc:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+    except Exception:
+        pass
+
+def render_restream_hls_panel():
+    st.markdown('<div class="vf-label">📡 Restream / HLS Output</div>', unsafe_allow_html=True)
+    st.info(
+        "This adds a second workflow alongside the existing encoder: "
+        "(1) VOD upload → HLS package, and (2) live ingest (RTMP/SRT/etc.) → rolling HLS. "
+        "For real live ingest, use a self-hosted VM/container; Streamlit Community Cloud is not ideal for long-running FFmpeg jobs."
+    )
+
+    mode = st.radio(
+        "Source type",
+        ["Upload file → HLS (VOD)", "Live ingest → HLS (RTMP / SRT / UDP / HTTP)"],
+        horizontal=True,
+        key="restream_source_mode",
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        aspect = st.selectbox(
+            "Output layout",
+            [
+                "Source / Passthrough",
+                "9:16 Vertical (1080×1920)",
+                "16:9 Landscape (1920×1080)",
+                "1:1 Square (1080×1080)",
+                "4:5 Portrait (1080×1350)",
+                "3:4 Portrait (1080×1440)",
+                "9:16 Vertical Lite (720×1280)",
+                "16:9 Landscape Lite (1280×720)",
+            ],
+            key="restream_aspect",
+        )
+    with c2:
+        v_bitrate = st.selectbox("Video bitrate", ["2500k", "3500k", "4500k", "6000k", "8000k"], index=2, key="restream_vbitrate")
+    with c3:
+        a_bitrate = st.selectbox("Audio bitrate", ["96k", "128k", "160k", "192k"], index=1, key="restream_abitrate")
+    with c4:
+        target_fps = st.selectbox("Output FPS", ["Source", 24, 25, 30, 50, 60], index=0, key="restream_fps")
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        segment_seconds = st.slider("HLS segment (s)", 2, 10, 4, key="restream_segment_seconds")
+    with d2:
+        live_playlist = st.slider("Live playlist size", 3, 20, 6, key="restream_playlist_size")
+    with d3:
+        preset = st.selectbox("x264 preset", ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"], index=2, key="restream_x264_preset")
+
+    target_fps_value = None if target_fps == "Source" else int(target_fps)
+
+    st.caption("For browser/device compatibility, this HLS flow uses H.264 + AAC. If you need a bitrate ladder / master playlist, that can be added as a next step.")
+    st.code("""[server]\nmaxUploadSize = 300""", language="toml")
+
+    if mode == "Upload file → HLS (VOD)":
+        upl = st.file_uploader(
+            f"Upload source video (recommended max {MAX_UPLOAD_MB} MB)",
+            type=["avi", "mp4", "mkv", "mov", "webm", "flv", "ts", "m4v", "mxf"],
+            key="restream_upload",
+        )
+        if upl and getattr(upl, 'size', 0) > MAX_UPLOAD_MB * 1024 * 1024:
+            st.error(f"File is {upl.size / (1024*1024):.1f} MB. Increase config or keep it ≤ {MAX_UPLOAD_MB} MB.")
+            return
+
+        if upl and st.session_state.get("restream_upload_name") != f"{upl.name}:{getattr(upl, 'size', 0)}":
+            suffix = os.path.splitext(upl.name)[-1].lower()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(upl.read())
+                st.session_state.restream_input_path = tmp.name
+            st.session_state.restream_upload_name = f"{upl.name}:{getattr(upl, 'size', 0)}"
+            st.session_state.restream_meta = probe(st.session_state.restream_input_path)
+
+        src_path = st.session_state.get("restream_input_path")
+        if src_path and os.path.exists(src_path):
+            meta = st.session_state.get("restream_meta") or probe(src_path)
+            st.caption(
+                f"Source: {meta.get('width',0)}×{meta.get('height',0)} @ {meta.get('fps',0)} fps · "
+                f"{meta.get('duration',0):.1f}s · {meta.get('vcodec','unknown').upper()}"
+            )
+            if st.button("🎬 Build HLS package", type="primary", key="build_hls_package"):
+                out_dir = tempfile.mkdtemp(prefix="videoforge_hls_")
+                ensure_clean_dir(out_dir)
+                manifest, seg_pattern = hls_output_paths(out_dir, safe_token(Path(upl.name).stem if upl else 'upload'))
+                cmd = build_hls_ffmpeg_cmd(
+                    input_source=src_path,
+                    manifest_path=manifest,
+                    segment_pattern=seg_pattern,
+                    aspect_label=aspect,
+                    video_bitrate=v_bitrate,
+                    audio_bitrate=a_bitrate,
+                    preset=preset,
+                    fps=target_fps_value,
+                    live=False,
+                    segment_seconds=segment_seconds,
+                    list_size=live_playlist,
+                )
+                with st.spinner("Packaging HLS…"):
+                    proc = subprocess.run(cmd, capture_output=True, text=True)
+                if proc.returncode != 0:
+                    st.error("HLS packaging failed.")
+                    with st.expander("FFmpeg log"):
+                        st.code(proc.stderr or proc.stdout or '(empty)', language='bash')
+                else:
+                    st.session_state.restream_output_dir = out_dir
+                    st.session_state.restream_manifest = manifest
+                    st.session_state.restream_zip = zip_dir_bytes(out_dir)
+                    st.success("HLS package created.")
+
+        if st.session_state.get("restream_manifest") and st.session_state.get("restream_zip"):
+            st.success(f"Manifest: {st.session_state.restream_manifest}")
+            st.download_button(
+                "⬇ Download HLS bundle (.zip)",
+                data=st.session_state.restream_zip,
+                file_name="hls_output_bundle.zip",
+                mime="application/zip",
+                key="download_hls_bundle",
+            )
+
+    else:
+        ingest_url = st.text_input(
+            "Ingest URL",
+            placeholder="rtmp://host/app/streamKey  or  srt://host:port?mode=caller&latency=120",
+            key="restream_ingest_url",
+        )
+        st.caption("Examples: RTMP, SRT, UDP multicast/unicast, HTTP TS, or even local network MPEG-TS inputs if FFmpeg can read them.")
+
+        job = st.session_state.get("restream_job")
+        active = bool(job and job.get("proc") and job["proc"].poll() is None)
+
+        start_col, stop_col = st.columns(2)
+        with start_col:
+            if st.button("▶ Start live restream", type="primary", disabled=not ingest_url or active, key="start_live_restream"):
+                out_dir = tempfile.mkdtemp(prefix="videoforge_live_hls_")
+                manifest, seg_pattern = hls_output_paths(out_dir, "live")
+                cmd = build_hls_ffmpeg_cmd(
+                    input_source=ingest_url.strip(),
+                    manifest_path=manifest,
+                    segment_pattern=seg_pattern,
+                    aspect_label=aspect,
+                    video_bitrate=v_bitrate,
+                    audio_bitrate=a_bitrate,
+                    preset=preset,
+                    fps=target_fps_value,
+                    live=True,
+                    segment_seconds=segment_seconds,
+                    list_size=live_playlist,
+                )
+                log_path = os.path.join(out_dir, 'ffmpeg_live.log')
+                log_fp = open(log_path, 'w', encoding='utf-8')
+                proc = subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT, text=True)
+                st.session_state.restream_job = {
+                    'proc': proc,
+                    'output_dir': out_dir,
+                    'manifest': manifest,
+                    'log_path': log_path,
+                    'ingest_url': ingest_url.strip(),
+                }
+                st.success("Live restream started.")
+        with stop_col:
+            if st.button("⏹ Stop live restream", disabled=not active, key="stop_live_restream"):
+                stop_live_job(job)
+                st.success("Live restream stopped.")
+
+        job = st.session_state.get("restream_job")
+        if job:
+            proc = job.get('proc')
+            running = proc is not None and proc.poll() is None
+            st.markdown(f"**Status:** {'🟢 Running' if running else '⚪ Stopped'}")
+            st.caption(f"Manifest path: {job.get('manifest','—')}")
+            if os.path.exists(job.get('log_path','')):
+                with st.expander("Live FFmpeg log"):
+                    try:
+                        with open(job['log_path'], 'r', encoding='utf-8', errors='ignore') as fp:
+                            tail = fp.read()[-12000:]
+                        st.code(tail or '(empty)', language='bash')
+                    except Exception as exc:
+                        st.caption(str(exc))
+
+    st.markdown("---")
+    st.markdown(
+        "**Integration recommendation:** yes, this flow can sit in the same app as your existing encoder. "
+        "Keep the current quality-analysis workflow for offline testing, and add this HLS workflow for delivery/preview. "
+        "For production live restream at scale, move the actual FFmpeg process to a backend worker/container and let Streamlit act as control UI only."
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1247,9 +1566,17 @@ _default_enhance = {
 defaults = {
     "results": [], "inp": None, "meta": None, "sz": 0.0, "name": "",
     "enable_encoding": True,
+    "workflow_mode": "Encoder",
     "enhance_settings": _default_enhance.copy(),
     "loudness": None,
     "result_logs": {},
+    "restream_job": None,
+    "restream_input_path": None,
+    "restream_output_dir": None,
+    "restream_manifest": None,
+    "restream_zip": None,
+    "restream_meta": None,
+    "restream_upload_name": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -1297,11 +1624,27 @@ HAS_VMAF = vmaf_ok()
 #  Mode Toggle
 # ══════════════════════════════════════════════════════════════════════════════
 
-enable_encoding = st.toggle(
-    "⚙️ Enable Encoding Mode",
-    value=st.session_state.enable_encoding,
-    help="Toggle between encoder mode (with AI enhancements) and test player mode (analytics only).",
+workflow_mode = st.radio(
+    "Workflow",
+    ["Encoder", "Test Player", "Restream → HLS"],
+    horizontal=True,
+    index=["Encoder", "Test Player", "Restream → HLS"].index(st.session_state.workflow_mode) if st.session_state.workflow_mode in ["Encoder", "Test Player", "Restream → HLS"] else 0,
+    key="workflow_mode_radio",
 )
+st.session_state.workflow_mode = workflow_mode
+
+if workflow_mode == "Restream → HLS":
+    st.markdown("""
+    <div class="mode-toggle">
+      <span class="toggle-label">🎛️ Workflow:</span>
+      <span class="mode-active">📡 Restream → HLS</span>
+      <span class="toggle-desc">Upload-to-HLS packaging or live ingest (RTMP/SRT/etc.) into HLS output</span>
+    </div>
+    """, unsafe_allow_html=True)
+    render_restream_hls_panel()
+    st.stop()
+
+enable_encoding = workflow_mode == "Encoder"
 st.session_state.enable_encoding = enable_encoding
 
 mode_label = "⚙️ Encoder" if enable_encoding else "🎬 Test Player"
@@ -1312,7 +1655,7 @@ mode_desc  = (
 )
 st.markdown(f"""
 <div class="mode-toggle">
-  <span class="toggle-label">🎛️ Mode:</span>
+  <span class="toggle-label">🎛️ Workflow:</span>
   <span class="mode-active">{mode_label}</span>
   <span class="toggle-desc">{mode_desc}</span>
 </div>
@@ -1332,6 +1675,11 @@ uploaded = st.file_uploader(
 
 if not uploaded:
     st.info("👆 Upload a video to begin" + (" analysis & enhancement" if enable_encoding else " analysis"))
+    st.stop()
+
+if getattr(uploaded, "size", 0) > MAX_UPLOAD_MB * 1024 * 1024:
+    st.error(f"This file is {uploaded.size / (1024 * 1024):.1f} MB. Current UI target is ≤ {MAX_UPLOAD_MB} MB.")
+    st.caption("To enforce this in Streamlit, set [server] maxUploadSize = 300 in .streamlit/config.toml.")
     st.stop()
 
 suf = os.path.splitext(uploaded.name)[-1].lower()
