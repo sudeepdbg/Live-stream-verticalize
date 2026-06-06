@@ -48,7 +48,7 @@ DEFAULT_ENHANCE = {
 }
 
 DEFAULTS = {
-    "workflow_mode": "Encoder",
+    "workflow_mode": "Restream → HLS",
     "inp": None,
     "name": "",
     "meta": None,
@@ -66,7 +66,7 @@ DEFAULTS = {
     "restream_ladder": [],
     "restream_job": None,
     "restream_manifest_url": None,
-    "restream_server_info": None,
+    "restream_public_asset_url": None,
 }
 for key, value in DEFAULTS.items():
     if key not in st.session_state:
@@ -80,13 +80,13 @@ def render_header():
           <div style='display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;'>
             <div>
               <div class='vf-title'>VideoForge Studio</div>
-              <div class='vf-subtitle'>Professional encoding · restream/live HLS packaging · progressive HLS preview · in-app HLS.js playback · playback analytics</div>
+              <div class='vf-subtitle'>Streamlit UI triggers worker/FFmpeg job → HLS written to public/static origin → UI receives public master.m3u8 → embedded HLS.js playback + player analytics</div>
             </div>
             <div>
-              <span class='vf-chip'>Immediate local HTTP serving</span>
-              <span class='vf-chip'>2-rung ABR: 360p / 540p</span>
-              <span class='vf-chip'>HLS.js auto-play</span>
-              <span class='vf-chip'>Live player metrics</span>
+              <span class='vf-chip'>Public/static origin</span>
+              <span class='vf-chip'>ABR capped to 360p / 540p</span>
+              <span class='vf-chip'>Embedded HLS.js</span>
+              <span class='vf-chip'>Player event analytics</span>
             </div>
           </div>
         </div>
@@ -126,75 +126,72 @@ def render_abr_ladder_table(ladder: list[dict]):
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
-def render_manifest_playback(manifest_url: str | None, title: str, embed_player: bool = True):
+def render_manifest_playback(manifest_url: str | None, title: str):
     st.markdown("<div class='vf-card'>", unsafe_allow_html=True)
-    st.markdown("**▶ HLS Playback Endpoint**")
+    st.markdown("**▶ Public HLS Playback Endpoint**")
     if not manifest_url:
-        st.caption("HLS endpoint will appear here as soon as the preview job starts.")
+        st.caption("Public master.m3u8 URL will appear here after the job starts.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
     st.code(manifest_url)
-    st.caption("Player points to master.m3u8 immediately. Playback starts automatically after the first 1–2 segments are written by FFmpeg.")
-    if embed_player:
-        components.html(backend.build_hlsjs_player_html(manifest_url, title=title, autoplay=True, muted=True, low_latency=True), height=980, scrolling=True)
+    st.caption("Embedded player uses the public master.m3u8 URL instead of localhost, so browser reachability is no longer tied to the runtime host.")
+    components.html(backend.build_hlsjs_player_html(manifest_url, title=title, autoplay=True, muted=True, low_latency=True), height=970, scrolling=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_live_log(job: dict | None):
+def render_job_status(job: dict | None):
     if not job:
         return
     proc = job.get("proc")
     running = proc is not None and proc.poll() is None
-    st.markdown(f"**Status:** {'🟢 Running / writing segments' if running else '⚪ Finished / stopped'}")
-    st.caption(f"Master manifest: {job.get('master_manifest', '—')}")
-    st.caption(f"Playback URL: {job.get('manifest_url', '—')}")
+    st.markdown(f"**Status:** {'🟢 Running / writing HLS to origin' if running else '⚪ Finished / stopped'}")
+    st.caption(f"Master manifest file: {job.get('master_manifest', '—')}")
+    st.caption(f"Public playback URL: {job.get('manifest_url', '—')}")
     if os.path.exists(job.get("log_path", "")):
         with st.expander("FFmpeg log"):
             with open(job["log_path"], "r", encoding="utf-8", errors="ignore") as fp:
                 st.code(fp.read()[-12000:] or "(empty)", language="bash")
 
 
-def reset_results():
-    st.session_state.results = []
-    st.session_state.result_logs = {}
-
-
-def encoder_page():
-    st.subheader("⚙️ Encoder")
-    st.info("Encoder flow unchanged. Restream workflow below now uses progressive HLS preview.")
-
-
-def test_player_page():
-    st.subheader("🎬 Test Player")
-    playback_url = st.text_input("HLS playback URL", placeholder="http://127.0.0.1:8000/master.m3u8 or CDN URL")
-    if playback_url:
-        render_manifest_playback(playback_url, title="External HLS playback")
-    else:
-        st.info("Enter a master manifest URL to test playback.")
-
-
 def restream_page():
     st.subheader("📡 Restream → HLS")
-    st.info("Updated flow: upload → copy source → start local HTTP endpoint immediately → FFmpeg writes HLS in background → HLS.js points to master.m3u8 immediately → playback starts after first 1–2 segments → analytics update from real player events.")
-    mode = st.radio("Source type", ["Upload file → progressive HLS preview", "Live ingest → HLS"], horizontal=True)
+    st.info("Requested flow implemented: user upload → Streamlit triggers worker/FFmpeg → manifest + segments are written to a public/static origin → UI gets the public master.m3u8 URL → embedded HLS.js plays that URL → analytics panel reads real player events.")
+
+    st.markdown("### 1) Public/static origin configuration")
+    default_origin_dir = os.getenv("PUBLIC_HLS_ORIGIN_DIR", "./public_hls")
+    default_origin_url = os.getenv("PUBLIC_HLS_ORIGIN_BASE_URL", "")
+    o1, o2 = st.columns([2, 3])
+    origin_dir = o1.text_input("Local/static origin directory", value=default_origin_dir, help="Directory on disk that is already exposed by your web server / CDN / static file origin.")
+    origin_url = o2.text_input("Public origin base URL", value=default_origin_url, placeholder="https://cdn.example.com/hls", help="Public URL mapped to the same directory above.")
+
+    try:
+        origin_cfg = backend.resolve_origin_config(origin_dir, origin_url) if origin_dir and origin_url else None
+        if origin_cfg:
+            st.success("Origin configuration looks valid. New jobs will write into that origin path and return a public URL.")
+        else:
+            st.warning("Provide both origin directory and public base URL before starting a job.")
+    except Exception as exc:
+        origin_cfg = None
+        st.error(str(exc))
+
+    st.markdown("### 2) Transcode / packaging settings")
     c1, c2, c3, c4 = st.columns(4)
     aspect = c1.selectbox("Output layout", list(backend.ASPECT_PRESETS.keys()), index=list(backend.ASPECT_PRESETS.keys()).index("16:9 Landscape"))
     target_fps = c2.selectbox("Output FPS", ["Source", 24, 25, 30, 50, 60], index=0)
     segment_seconds = c3.slider("HLS segment (s)", 1, 6, 2)
-    live_playlist = c4.slider("Live playlist size", 2, 10, 4)
-    d1, d2, d3 = st.columns(3)
-    preset = d1.selectbox("x264 preset", ["ultrafast", "superfast", "veryfast", "faster", "fast"], index=1)
-    abr_enabled = d2.checkbox("Enable 2-rung ABR ladder", value=True, help="Capped to 360p and 540p for faster start-up.")
-    ladder_preview = backend.build_abr_ladder(aspect_label=aspect)
-    d3.metric("Variants", len(ladder_preview) if abr_enabled else 1)
+    preset = c4.selectbox("x264 preset", ["ultrafast", "superfast", "veryfast", "faster", "fast"], index=1)
+    abr_enabled = st.checkbox("Enable ABR ladder", value=True, help="Capped to 360p and 540p for faster startup and lower origin load.")
+    preview_ladder = backend.build_abr_ladder(aspect_label=aspect)
     with st.expander("Preview ladder", expanded=True):
-        render_abr_ladder_table(ladder_preview if abr_enabled else [])
+        render_abr_ladder_table(preview_ladder if abr_enabled else [])
     fps_value = None if target_fps == "Source" else int(target_fps)
 
-    if mode == "Upload file → progressive HLS preview":
+    mode = st.radio("Job mode", ["Upload file → public HLS", "Live ingest → public HLS"], horizontal=True)
+
+    if mode == "Upload file → public HLS":
         upl = st.file_uploader(f"Upload source video (recommended max {backend.MAX_UPLOAD_MB} MB)", type=["avi", "mp4", "mkv", "mov", "webm", "flv", "ts", "m4v", "mxf"], key="restream_upload")
         if not upl:
-            st.caption("Upload a file to start progressive HLS preview.")
+            st.caption("Upload a file to start a public-origin HLS job.")
             return
         if getattr(upl, "size", 0) > backend.MAX_UPLOAD_MB * 1024 * 1024:
             st.error(f"File is {upl.size / (1024 * 1024):.1f} MB. Keep it ≤ {backend.MAX_UPLOAD_MB} MB.")
@@ -211,17 +208,17 @@ def restream_page():
         st.caption(f"Source: {meta['width']}×{meta['height']} @ {meta['fps']} fps · {meta['duration']:.1f}s · {meta['vcodec'].upper()}")
 
         current_job = st.session_state.get("restream_job")
-        job_active = bool(current_job and current_job.get("proc") and current_job["proc"].poll() is None)
-        start_clicked = st.button("🎬 Start progressive HLS preview", type="primary", disabled=job_active)
-        if start_clicked:
-            result = backend.start_vod_preview_job(input_source=src_path, asset_name=upl.name, aspect_label=aspect, preset=preset, fps=fps_value, segment_seconds=segment_seconds, abr_enabled=abr_enabled, src_meta=meta)
-            st.session_state.restream_output_dir = result.out_dir
+        active = bool(current_job and current_job.get("proc") and current_job["proc"].poll() is None)
+        if st.button("🎬 Start public-origin HLS job", type="primary", disabled=not origin_cfg or active):
+            result = backend.start_vod_public_preview_job(input_source=src_path, asset_name=upl.name, aspect_label=aspect, preset=preset, fps=fps_value, segment_seconds=segment_seconds, abr_enabled=abr_enabled, origin=origin_cfg, src_meta=meta)
+            st.session_state.restream_output_dir = result.output_dir
             st.session_state.restream_manifest = result.master_manifest
-            st.session_state.restream_ladder = result.ladder
             st.session_state.restream_manifest_url = result.manifest_url
-            st.session_state.restream_server_info = result.server_info
+            st.session_state.restream_public_asset_url = result.public_asset_url
+            st.session_state.restream_ladder = result.ladder
             st.session_state.restream_job = result.job
-            st.success("HTTP endpoint started immediately. FFmpeg is now writing HLS segments in background.")
+            st.session_state.restream_zip = None
+            st.success("Worker/FFmpeg job started. HLS is being written into the configured public/static origin.")
 
         current_job = st.session_state.get("restream_job")
         job_done = bool(current_job and current_job.get("proc") and current_job["proc"].poll() is not None)
@@ -232,56 +229,58 @@ def restream_page():
         left, right = st.columns([2, 3], gap="large")
         with left:
             render_source_info(meta, os.path.getsize(src_path) / (1024 * 1024))
-            render_live_log(current_job)
-            if st.session_state.restream_ladder:
+            render_job_status(current_job)
+            if st.session_state.get("restream_public_asset_url"):
+                st.caption(f"Public asset path: {st.session_state.restream_public_asset_url}")
+            if st.session_state.get("restream_ladder"):
                 st.markdown("#### Active ladder")
                 render_abr_ladder_table(st.session_state.restream_ladder)
-            if st.session_state.restream_zip:
-                st.download_button("⬇ Download HLS bundle (.zip)", data=st.session_state.restream_zip, file_name="hls_progressive_preview_bundle.zip", mime="application/zip")
-            st.caption("Flow now starts serving instantly. The only wait is for the first 1–2 segments to be created.")
+            if st.session_state.get("restream_zip"):
+                st.download_button("⬇ Download output bundle (.zip)", data=st.session_state.restream_zip, file_name="public_origin_hls_bundle.zip", mime="application/zip")
         with right:
-            render_manifest_playback(st.session_state.get("restream_manifest_url"), title=f"{aspect} progressive playback", embed_player=True)
+            render_manifest_playback(st.session_state.get("restream_manifest_url"), title=f"{aspect} public-origin playback")
     else:
         ingest_url = st.text_input("Ingest URL", placeholder="rtmp://host/app/streamKey or srt://host:port?mode=caller&latency=120")
-        job = st.session_state.get("restream_job")
-        active = bool(job and job.get("proc") and job["proc"].poll() is None)
+        current_job = st.session_state.get("restream_job")
+        active = bool(current_job and current_job.get("proc") and current_job["proc"].poll() is None)
         start_col, stop_col = st.columns(2)
         with start_col:
-            if st.button("▶ Start live restream", type="primary", disabled=not ingest_url or active):
-                job, ladder = backend.start_live_hls_job(input_source=ingest_url.strip(), aspect_label=aspect, preset=preset, fps=fps_value, segment_seconds=segment_seconds, list_size=live_playlist, abr_enabled=abr_enabled)
+            if st.button("▶ Start live public-origin HLS", type="primary", disabled=not ingest_url or not origin_cfg or active):
+                job, ladder, public_asset_url = backend.start_live_hls_job(input_source=ingest_url.strip(), aspect_label=aspect, preset=preset, fps=fps_value, segment_seconds=segment_seconds, abr_enabled=abr_enabled, origin=origin_cfg)
                 st.session_state.restream_job = job
                 st.session_state.restream_ladder = ladder
                 st.session_state.restream_manifest_url = job.get("manifest_url")
-                st.success("Live restream started. Player can attach immediately and will begin once first segments exist.")
+                st.session_state.restream_public_asset_url = public_asset_url
+                st.session_state.restream_zip = None
+                st.success("Live worker/FFmpeg job started. HLS is being written into the configured public/static origin.")
         with stop_col:
-            if st.button("⏹ Stop live restream", disabled=not active):
-                backend.stop_live_job(job)
-                st.success("Live restream stopped.")
+            if st.button("⏹ Stop live job", disabled=not active):
+                backend.stop_live_job(current_job)
+                st.success("Live job stopped.")
         left, right = st.columns([2, 3], gap="large")
         with left:
-            render_live_log(st.session_state.get("restream_job"))
+            render_job_status(st.session_state.get("restream_job"))
+            if st.session_state.get("restream_public_asset_url"):
+                st.caption(f"Public asset path: {st.session_state.restream_public_asset_url}")
             if st.session_state.get("restream_ladder"):
                 st.markdown("#### Active ladder")
                 render_abr_ladder_table(st.session_state.restream_ladder)
         with right:
-            render_manifest_playback(st.session_state.get("restream_manifest_url"), title=f"{aspect} live playback", embed_player=True)
+            render_manifest_playback(st.session_state.get("restream_manifest_url"), title=f"{aspect} live public-origin playback")
 
     st.divider()
-    st.markdown("### Updated flow now implemented")
+    st.markdown("### Flow implemented in code")
     st.markdown(
         "- User uploads video.\n"
-        "- App copies source file.\n"
-        "- App starts local HTTP endpoint immediately.\n"
-        "- FFmpeg starts writing HLS playlist + segments in background.\n"
-        "- Embedded HLS.js points to `master.m3u8` immediately.\n"
-        "- Playback starts after the first 1–2 segments are available.\n"
-        "- Analytics panel updates from actual player events."
+        "- Streamlit UI triggers worker/FFmpeg job.\n"
+        "- Worker writes manifest + segments into the configured public/static origin directory.\n"
+        "- UI receives the public `master.m3u8` URL derived from the configured public base URL.\n"
+        "- Embedded HLS.js plays that public URL.\n"
+        "- Analytics panel tracks real player events (attach, parse, switch, buffer, drops, latency)."
     )
-    st.markdown("### Notes")
+    st.markdown("### Deployment note")
     st.markdown(
-        "- Ladder is now capped to **360p and 540p** for faster startup.\n"
-        "- This is a progressive HLS preview path for quick validation, not full LL-HLS.\n"
-        "- For production, move FFmpeg to a worker/container and publish the manifest to an origin/CDN."
+        "You must map the **local/static origin directory** to a **real public URL** using your web server, object storage website hosting, CDN, or reverse proxy. Example: local path `/var/www/hls` ↔ public URL `https://cdn.example.com/hls`."
     )
 
 
@@ -290,16 +289,17 @@ def main():
     if not backend.ffmpeg_ok():
         st.error("FFmpeg / ffprobe not found. Add ffmpeg to your runtime and redeploy.")
         st.stop()
-    workflow = st.radio("Workflow", ["Encoder", "Test Player", "Restream → HLS"], horizontal=True)
-    st.session_state.workflow_mode = workflow
-    if workflow == "Encoder":
-        encoder_page()
-    elif workflow == "Test Player":
-        test_player_page()
-    else:
+    workflow = st.radio("Workflow", ["Restream → HLS", "Test Player"], horizontal=True)
+    if workflow == "Restream → HLS":
         restream_page()
+    else:
+        test_player = st.text_input("Public master.m3u8 URL", placeholder="https://cdn.example.com/hls/asset/master.m3u8")
+        if test_player:
+            render_manifest_playback(test_player, title="External public URL playback")
+        else:
+            st.info("Paste a public master.m3u8 URL to test playback.")
     st.markdown("---")
-    st.caption("VideoForge Studio · progressive HLS preview with immediate local HTTP endpoint · capped 2-rung ladder · live HLS.js analytics")
+    st.caption("VideoForge Studio · public-origin HLS workflow · worker/FFmpeg job writes to static origin · UI plays public master.m3u8 URL")
 
 
 if __name__ == "__main__":
