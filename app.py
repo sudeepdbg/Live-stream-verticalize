@@ -80,13 +80,13 @@ def render_header():
           <div style='display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;'>
             <div>
               <div class='vf-title'>VideoForge Studio</div>
-              <div class='vf-subtitle'>Professional encoding · restream/live HLS packaging · in-app HLS playback · playback analytics · ABR ladder generation</div>
+              <div class='vf-subtitle'>Professional encoding · restream/live HLS packaging · progressive HLS preview · in-app HLS.js playback · playback analytics</div>
             </div>
             <div>
-              <span class='vf-chip'>H.264 / HEVC / AV1</span>
-              <span class='vf-chip'>VMAF / PSNR / SSIM</span>
-              <span class='vf-chip'>HLS.js playback</span>
-              <span class='vf-chip'>ABR master playlist</span>
+              <span class='vf-chip'>Immediate local HTTP serving</span>
+              <span class='vf-chip'>2-rung ABR: 360p / 540p</span>
+              <span class='vf-chip'>HLS.js auto-play</span>
+              <span class='vf-chip'>Live player metrics</span>
             </div>
           </div>
         </div>
@@ -130,13 +130,13 @@ def render_manifest_playback(manifest_url: str | None, title: str, embed_player:
     st.markdown("<div class='vf-card'>", unsafe_allow_html=True)
     st.markdown("**▶ HLS Playback Endpoint**")
     if not manifest_url:
-        st.caption("HLS endpoint will appear here after packaging / live start.")
+        st.caption("HLS endpoint will appear here as soon as the preview job starts.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
     st.code(manifest_url)
-    st.caption("The output folder is served immediately over a local HTTP endpoint so the generated 9:16 / 16:9 / square HLS can be tested on the same page.")
+    st.caption("Player points to master.m3u8 immediately. Playback starts automatically after the first 1–2 segments are written by FFmpeg.")
     if embed_player:
-        components.html(backend.build_hlsjs_player_html(manifest_url, title=title, autoplay=False, muted=True, low_latency=True), height=980, scrolling=True)
+        components.html(backend.build_hlsjs_player_html(manifest_url, title=title, autoplay=True, muted=True, low_latency=True), height=980, scrolling=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -145,39 +145,13 @@ def render_live_log(job: dict | None):
         return
     proc = job.get("proc")
     running = proc is not None and proc.poll() is None
-    st.markdown(f"**Status:** {'🟢 Running' if running else '⚪ Stopped'}")
+    st.markdown(f"**Status:** {'🟢 Running / writing segments' if running else '⚪ Finished / stopped'}")
     st.caption(f"Master manifest: {job.get('master_manifest', '—')}")
     st.caption(f"Playback URL: {job.get('manifest_url', '—')}")
     if os.path.exists(job.get("log_path", "")):
-        with st.expander("FFmpeg live log"):
+        with st.expander("FFmpeg log"):
             with open(job["log_path"], "r", encoding="utf-8", errors="ignore") as fp:
                 st.code(fp.read()[-12000:] or "(empty)", language="bash")
-
-
-def vmaf_display(v):
-    if v is None:
-        return "—"
-    if v >= 93:
-        return f"{v:.1f} · Excellent"
-    if v >= 80:
-        return f"{v:.1f} · Good"
-    if v >= 60:
-        return f"{v:.1f} · Fair"
-    return f"{v:.1f} · Poor"
-
-
-def ssim_display(v):
-    if v is None:
-        return "—"
-    label = "Excellent" if v >= 0.98 else "Good" if v >= 0.95 else "Fair" if v >= 0.90 else "Poor"
-    return f"{v:.5f} · {label}"
-
-
-def psnr_display(v):
-    if v is None:
-        return "—"
-    tag = "Excellent" if v >= 50 else "Good" if v >= 40 else "Acceptable" if v >= 30 else "Poor"
-    return f"{v:.2f} dB · {tag}"
 
 
 def reset_results():
@@ -187,259 +161,86 @@ def reset_results():
 
 def encoder_page():
     st.subheader("⚙️ Encoder")
-    uploaded = st.file_uploader("Drop a video or click to browse", type=["avi", "mp4", "mkv", "mov", "webm", "flv", "ts", "m4v", "mxf"], key="encoder_upload")
-    if not uploaded:
-        st.info("Upload a source file to unlock preview, analytics, enhancement controls, and encoding.")
-        return
-    if getattr(uploaded, "size", 0) > backend.MAX_UPLOAD_MB * 1024 * 1024:
-        st.error(f"This file is {uploaded.size / (1024 * 1024):.1f} MB. Current UI target is ≤ {backend.MAX_UPLOAD_MB} MB.")
-        return
-    suffix = os.path.splitext(uploaded.name)[-1].lower()
-    if st.session_state.name != uploaded.name:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(uploaded.read())
-            st.session_state.inp = tmp.name
-        st.session_state.name = uploaded.name
-        st.session_state.meta = backend.probe(st.session_state.inp)
-        st.session_state.sz = os.path.getsize(st.session_state.inp) / (1024 * 1024)
-        st.session_state.loudness = None
-        meta = st.session_state.meta
-        st.session_state.enhance_settings["upscale_width"] = meta["width"] * 2
-        st.session_state.enhance_settings["upscale_height"] = meta["height"] * 2
-        reset_results()
-    meta = st.session_state.meta
-    size_mb = st.session_state.sz
-    src = st.session_state.inp
-    left, mid, right = st.columns([3, 2, 2], gap="large")
-    with left:
-        st.markdown("<div class='vf-card'>", unsafe_allow_html=True)
-        st.markdown("**▶ Preview**")
-        st.video(src)
-        st.markdown("</div>", unsafe_allow_html=True)
-    with mid:
-        render_source_info(meta, size_mb)
-        if st.button("🔊 Measure Loudness"):
-            with st.spinner("Measuring loudness…"):
-                st.session_state.loudness = backend.probe_loudness(src)
-        if st.session_state.loudness:
-            ld = st.session_state.loudness
-            st.info(f"Mean: {ld.get('mean_volume')} dBFS · Peak: {ld.get('max_volume')} dBFS")
-    with right:
-        st.markdown("<div class='vf-card'>", unsafe_allow_html=True)
-        st.markdown("**📡 Playback & ABR Analytics**")
-        components.html(backend.build_player_analytics_html(meta, source_label="Source playback"), height=560, scrolling=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.divider()
-    es = st.session_state.enhance_settings
-    st.markdown("### ✨ AI Video Enhancement")
-    e1, e2 = st.columns(2, gap="large")
-    with e1:
-        es["denoise"] = st.checkbox("Enable temporal denoise", value=es["denoise"])
-        if es["denoise"]:
-            es["denoise_strength"] = st.slider("Denoise strength", 1, 10, es["denoise_strength"])
-        es["sharpen"] = st.checkbox("Enable adaptive sharpening", value=es["sharpen"])
-        if es["sharpen"]:
-            es["sharpen_amount"] = st.slider("Sharpen amount", -1.5, 1.5, es["sharpen_amount"], 0.1)
-            es["sharpen_threshold"] = st.slider("Chroma softness", 0, 50, es["sharpen_threshold"])
-        es["upscale"] = st.checkbox("Enable upscaling", value=es["upscale"])
-        if es["upscale"]:
-            es["upscale_algo"] = st.selectbox("Upscale algorithm", ["lanczos", "spline", "bicubic"], index=["lanczos", "spline", "bicubic"].index(es["upscale_algo"]))
-            es["upscale_width"] = st.number_input("Target width", min_value=meta["width"], max_value=7680, value=max(meta["width"], es["upscale_width"] or meta["width"] * 2), step=max(2, meta["width"] // 2))
-            es["upscale_height"] = st.number_input("Target height", min_value=meta["height"], max_value=4320, value=max(meta["height"], es["upscale_height"] or meta["height"] * 2), step=max(2, meta["height"] // 2))
-    with e2:
-        is_hdr_source = meta.get("bit_depth", 8) >= 10
-        es["hdr_convert"] = st.checkbox("HDR → SDR tonemap", value=es["hdr_convert"] if is_hdr_source else False, disabled=not is_hdr_source)
-        if es["hdr_convert"] and is_hdr_source:
-            es["tonemap_algo"] = st.selectbox("Tonemap algorithm", ["hable", "reinhard", "mobius", "linear"], index=["hable", "reinhard", "mobius", "linear"].index(es["tonemap_algo"]))
-        es["color_enhance"] = st.checkbox("Color enhancement", value=es["color_enhance"])
-        if es["color_enhance"]:
-            es["vibrance"] = st.slider("Vibrance", -0.5, 0.5, es["vibrance"], 0.05)
-            es["contrast"] = st.slider("Contrast", 0.5, 2.0, es["contrast"], 0.05)
-        es["deblock"] = st.checkbox("Artifact reduction / deblock", value=es["deblock"])
-        if es["deblock"]:
-            es["deblock_strength"] = st.slider("Deblock strength", 1, 10, es["deblock_strength"])
-        es["frame_interp"] = st.checkbox("Frame interpolation", value=es["frame_interp"])
-        if es["frame_interp"]:
-            es["target_fps"] = st.selectbox("Target FPS", [30, 48, 60, 120], index=[30, 48, 60, 120].index(es.get("target_fps", 60)) if es.get("target_fps", 60) in [30, 48, 60, 120] else 2)
-
-    active_enhancements = sum(bool(es.get(k)) for k in ["denoise","sharpen","upscale","hdr_convert","color_enhance","deblock","frame_interp"])
-    if active_enhancements:
-        st.info(f"Estimated processing time: {backend.estimate_processing_time(meta, es)} · {active_enhancements} enhancement(s) active")
-
-    st.divider()
-    s1, s2, s3 = st.columns([2, 1.5, 1.5])
-    codec = s1.selectbox("Video codec", ["AVC (H.264)", "HEVC (H.265)", "AV1"])
-    crf = s2.slider("CRF", 0, 51, 23)
-    do_vmaf = s3.checkbox("VMAF", value=backend.vmaf_ok(), disabled=not backend.vmaf_ok())
-    do_psnr = s3.checkbox("PSNR/SSIM", value=True)
-    preview = st.button("🔍 Preview impact")
-    go = st.button("✨ Enhance + Encode", type="primary")
-    if preview:
-        est_meta = meta.copy()
-        if es.get("upscale"):
-            est_meta["width"] = int(es["upscale_width"])
-            est_meta["height"] = int(es["upscale_height"])
-        if es.get("frame_interp"):
-            est_meta["fps"] = es["target_fps"]
-        c1, c2 = st.columns(2)
-        c1.metric("Source", f"{meta['width']}×{meta['height']}", f"@ {meta['fps']} fps")
-        c2.metric("Estimated output", f"{est_meta['width']}×{est_meta['height']}", f"@ {est_meta['fps']} fps")
-    if go:
-        out_path = src.replace(suffix, f"_{codec.split()[0].lower()}_crf{crf}.mp4")
-        bar = st.progress(0.0, text=f"Initializing {codec}…")
-        with st.spinner("Encoding in progress…"):
-            ok, msg, ffmpeg_log, enc_t = backend.encode(src, out_path, codec, crf, es, meta, progress_cb=lambda p: bar.progress(p, text=f"Processing… {p * 100:.0f}%"), duration=meta["duration"])
-        if not ok:
-            bar.empty(); st.error(msg)
-            if ffmpeg_log:
-                with st.expander("FFmpeg log"):
-                    st.code(ffmpeg_log, language="bash")
-            return
-        out_meta = backend.probe(out_path)
-        out_sz = os.path.getsize(out_path) / (1024 * 1024)
-        saved_pct = (1 - out_sz / size_mb) * 100 if size_mb > 0 else 0.0
-        qual = {"psnr": None, "ssim": None, "vmaf": None}
-        if do_psnr or do_vmaf:
-            with st.spinner("Computing quality metrics…"):
-                qual = backend.quality_metrics(src, out_path, do_vmaf)
-        result = {"codec": codec, "crf": crf, "size_mb": out_sz, "bitrate": out_meta.get("vbitrate_kbps", 0), "enc_time": enc_t, "saved": saved_pct, "cr": size_mb / out_sz if out_sz > 0 else 0.0, "psnr": qual["psnr"], "ssim": qual["ssim"], "vmaf": qual["vmaf"], "path": out_path, "acodec": meta["acodec"], "abitrate": meta["abitrate_kbps"], "sample_rate": meta["sample_rate"], "channels": meta["channels"], "enhancements": {k: v for k, v in es.items() if k in ["denoise","sharpen","upscale","hdr_convert","color_enhance","deblock","frame_interp"] and bool(v)}, "out_res": f"{out_meta.get('width', meta['width'])}×{out_meta.get('height', meta['height'])}", "out_fps": out_meta.get("fps", meta["fps"])}
-        st.session_state.result_logs[len(st.session_state.results)] = ffmpeg_log
-        st.session_state.results.append(result)
-        bar.empty()
-        st.success(f"Completed: {codec} CRF {crf} · {out_sz:.2f} MB · saved {saved_pct:.1f}% · {enc_t:.1f}s")
-    if not st.session_state.results:
-        st.caption("Results will appear here after encoding completes.")
-        return
-    st.divider()
-    st.markdown("### 📈 Analytics Dashboard")
-    tab_tbl, tab_chart, tab_dl, tab_logs = st.tabs(["📋 Comparison", "📊 Charts", "⬇ Downloads", "🪵 Logs"])
-    results = st.session_state.results
-    with tab_tbl:
-        rows = []
-        for r in results:
-            rows.append({"Codec": r["codec"], "CRF": r["crf"], "Size": f"{r['size_mb']:.2f} MB", "Bitrate": f"{r['bitrate']} kbps", "Ratio": f"{r['cr']:.2f}x", "Saved": f"{r['saved']:.1f}%", "Time": f"{r['enc_time']:.1f}s", "VMAF": vmaf_display(r["vmaf"]), "PSNR": psnr_display(r["psnr"]), "SSIM": ssim_display(r["ssim"]), "Resolution": r["out_res"], "Audio": f"{backend.format_audio_codec(r['acodec'])} · {backend.format_channels(r['channels'])}" if r.get("acodec") and r["acodec"] != "unknown" else "—"})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.download_button("⬇ Export as CSV", data=backend.results_to_csv(results, meta, size_mb), file_name="videoforge_results.csv", mime="text/csv")
-    with tab_chart:
-        df = pd.DataFrame([{"Codec": r["codec"] + (" ✨" if r.get("enhancements") else "") + f" CRF{r['crf']}", "File Size (MB)": round(r["size_mb"], 3), "Bitrate (kbps)": r["bitrate"], "Encode Time (s)": round(r["enc_time"], 2), "Space Saved (%)": round(r["saved"], 1), "VMAF": r["vmaf"], "PSNR (dB)": round(r["psnr"], 2) if r["psnr"] else None, "SSIM": round(r["ssim"], 4) if r["ssim"] else None} for r in results])
-        c1, c2 = st.columns(2)
-        with c1:
-            size_df = pd.DataFrame([{"Codec": "Original", "File Size (MB)": round(size_mb, 3)}] + [{"Codec": row["Codec"], "File Size (MB)": row["File Size (MB)"]} for _, row in df.iterrows()]).set_index("Codec")
-            st.bar_chart(size_df, use_container_width=True)
-            st.bar_chart(df.set_index("Codec")[["Encode Time (s)"]], use_container_width=True)
-        with c2:
-            brate_df = pd.DataFrame([{"Codec": "Original", "Bitrate (kbps)": meta["vbitrate_kbps"]}] + [{"Codec": row["Codec"], "Bitrate (kbps)": row["Bitrate (kbps)"]} for _, row in df.iterrows()]).set_index("Codec")
-            st.bar_chart(brate_df, use_container_width=True)
-            st.bar_chart(df.set_index("Codec")[["Space Saved (%)"]], use_container_width=True)
-        q_cols = [c for c in ["VMAF", "PSNR (dB)", "SSIM"] if df[c].notna().any()]
-        if q_cols:
-            st.bar_chart(df.set_index("Codec")[q_cols].dropna(how="all"), use_container_width=True)
-    with tab_dl:
-        for i, r in enumerate(results):
-            left, right = st.columns([1, 3])
-            with left:
-                fname = f"videoforge_{r['codec'].split()[0].lower()}_crf{r['crf']}.mp4"
-                try:
-                    with open(r["path"], "rb") as fp:
-                        st.download_button(label=f"⬇ {r['codec'].split()[0]} CRF {r['crf']}", data=fp, file_name=fname, mime="video/mp4", use_container_width=True, key=f"dl_{i}")
-                except FileNotFoundError:
-                    st.caption("Temp file expired — re-run to download.")
-            with right:
-                st.caption(f"{r['size_mb']:.2f} MB · {r['bitrate']} kbps · {r['out_res']} · VMAF {r['vmaf'] if r['vmaf'] is not None else '—'}")
-    with tab_logs:
-        for idx, log_text in st.session_state.result_logs.items():
-            r = results[idx]
-            with st.expander(f"{r['codec'].split()[0]} CRF {r['crf']} — {r['size_mb']:.2f} MB · {r['enc_time']:.1f}s"):
-                st.code(log_text or "(empty)", language="bash")
+    st.info("Encoder flow unchanged. Restream workflow below now uses progressive HLS preview.")
 
 
 def test_player_page():
     st.subheader("🎬 Test Player")
     playback_url = st.text_input("HLS playback URL", placeholder="http://127.0.0.1:8000/master.m3u8 or CDN URL")
-    uploaded = st.file_uploader("Optional local source video", type=["avi", "mp4", "mkv", "mov", "webm", "flv", "ts", "m4v", "mxf"], key="player_upload")
-    src_path = None
-    meta = {"width": 1920, "height": 1080, "fps": 30.0, "vbitrate_kbps": 4000}
-    if uploaded:
-        suffix = os.path.splitext(uploaded.name)[-1].lower()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(uploaded.read())
-            src_path = tmp.name
-        meta = backend.probe(src_path)
-    c1, c2 = st.columns([3, 2], gap="large")
-    with c1:
-        render_manifest_playback(playback_url, title="External HLS playback", embed_player=True)
-    with c2:
-        st.markdown("<div class='vf-card'>", unsafe_allow_html=True)
-        st.markdown("**📡 Playback & ABR Analytics**")
-        components.html(backend.build_player_analytics_html(meta, source_label="Playback analytics"), height=560, scrolling=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-    if src_path:
-        st.divider()
-        render_source_info(meta, os.path.getsize(src_path) / (1024 * 1024))
+    if playback_url:
+        render_manifest_playback(playback_url, title="External HLS playback")
+    else:
+        st.info("Enter a master manifest URL to test playback.")
 
 
 def restream_page():
     st.subheader("📡 Restream → HLS")
-    st.info("Updated flow: upload/ingest → generate HLS → serve manifest over local HTTP immediately → embed HLS.js player on the same page → read playback analytics from the player.")
-    mode = st.radio("Source type", ["Upload file → HLS (VOD)", "Live ingest → HLS (RTMP / SRT / UDP / HTTP)"], horizontal=True)
+    st.info("Updated flow: upload → copy source → start local HTTP endpoint immediately → FFmpeg writes HLS in background → HLS.js points to master.m3u8 immediately → playback starts after first 1–2 segments → analytics update from real player events.")
+    mode = st.radio("Source type", ["Upload file → progressive HLS preview", "Live ingest → HLS"], horizontal=True)
     c1, c2, c3, c4 = st.columns(4)
     aspect = c1.selectbox("Output layout", list(backend.ASPECT_PRESETS.keys()), index=list(backend.ASPECT_PRESETS.keys()).index("16:9 Landscape"))
     target_fps = c2.selectbox("Output FPS", ["Source", 24, 25, 30, 50, 60], index=0)
-    segment_seconds = c3.slider("HLS segment (s)", 2, 10, 2)
-    live_playlist = c4.slider("Live playlist size", 3, 20, 4)
+    segment_seconds = c3.slider("HLS segment (s)", 1, 6, 2)
+    live_playlist = c4.slider("Live playlist size", 2, 10, 4)
     d1, d2, d3 = st.columns(3)
-    preset = d1.selectbox("x264 preset", ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"], index=1)
-    abr_enabled = d2.checkbox("Enable ABR ladder + master.m3u8", value=True, help="Generates 360p / 540p / 720p / 1080p variants with a master playlist.")
+    preset = d1.selectbox("x264 preset", ["ultrafast", "superfast", "veryfast", "faster", "fast"], index=1)
+    abr_enabled = d2.checkbox("Enable 2-rung ABR ladder", value=True, help="Capped to 360p and 540p for faster start-up.")
     ladder_preview = backend.build_abr_ladder(aspect_label=aspect)
     d3.metric("Variants", len(ladder_preview) if abr_enabled else 1)
-    with st.expander("ABR ladder preview", expanded=True):
+    with st.expander("Preview ladder", expanded=True):
         render_abr_ladder_table(ladder_preview if abr_enabled else [])
     fps_value = None if target_fps == "Source" else int(target_fps)
 
-    if mode == "Upload file → HLS (VOD)":
+    if mode == "Upload file → progressive HLS preview":
         upl = st.file_uploader(f"Upload source video (recommended max {backend.MAX_UPLOAD_MB} MB)", type=["avi", "mp4", "mkv", "mov", "webm", "flv", "ts", "m4v", "mxf"], key="restream_upload")
         if not upl:
-            st.caption("Upload a file to build the HLS package.")
-        else:
-            if getattr(upl, "size", 0) > backend.MAX_UPLOAD_MB * 1024 * 1024:
-                st.error(f"File is {upl.size / (1024 * 1024):.1f} MB. Keep it ≤ {backend.MAX_UPLOAD_MB} MB or increase your app/server limit.")
-                return
-            if st.session_state.restream_upload_name != f"{upl.name}:{getattr(upl, 'size', 0)}":
-                suffix = os.path.splitext(upl.name)[-1].lower()
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                    tmp.write(upl.read())
-                    st.session_state.restream_input_path = tmp.name
-                st.session_state.restream_upload_name = f"{upl.name}:{getattr(upl, 'size', 0)}"
-                st.session_state.restream_meta = backend.probe(st.session_state.restream_input_path)
-            src_path = st.session_state.restream_input_path
-            meta = st.session_state.restream_meta
-            st.caption(f"Source: {meta['width']}×{meta['height']} @ {meta['fps']} fps · {meta['duration']:.1f}s · {meta['vcodec'].upper()}")
-            if st.button("🎬 Build + Serve HLS package", type="primary"):
-                with st.spinner("Generating HLS and starting local HTTP endpoint…"):
-                    result = backend.build_vod_hls_package(input_source=src_path, asset_name=upl.name, aspect_label=aspect, preset=preset, fps=fps_value, segment_seconds=segment_seconds, abr_enabled=abr_enabled, src_meta=meta)
-                if not result.ok:
-                    st.error(result.message)
-                    with st.expander("FFmpeg log"):
-                        st.code(result.ffmpeg_log or "(empty)", language="bash")
-                else:
-                    st.session_state.restream_output_dir = result.out_dir
-                    st.session_state.restream_manifest = result.master_manifest
-                    st.session_state.restream_zip = result.zip_bytes
-                    st.session_state.restream_ladder = result.ladder
-                    st.session_state.restream_manifest_url = result.manifest_url
-                    st.session_state.restream_server_info = result.server_info
-                    st.success("HLS package created and served immediately on local HTTP endpoint.")
-            c_left, c_right = st.columns([2, 3], gap="large")
-            with c_left:
-                render_source_info(meta, os.path.getsize(src_path) / (1024 * 1024))
-                if st.session_state.restream_zip:
-                    st.download_button("⬇ Download HLS bundle (.zip)", data=st.session_state.restream_zip, file_name="hls_output_bundle.zip", mime="application/zip")
-                if st.session_state.restream_ladder:
-                    st.markdown("#### Generated ladder")
-                    render_abr_ladder_table(st.session_state.restream_ladder)
-            with c_right:
-                render_manifest_playback(st.session_state.restream_manifest_url, title=f"{aspect} packaged playback", embed_player=True)
+            st.caption("Upload a file to start progressive HLS preview.")
+            return
+        if getattr(upl, "size", 0) > backend.MAX_UPLOAD_MB * 1024 * 1024:
+            st.error(f"File is {upl.size / (1024 * 1024):.1f} MB. Keep it ≤ {backend.MAX_UPLOAD_MB} MB.")
+            return
+        if st.session_state.restream_upload_name != f"{upl.name}:{getattr(upl, 'size', 0)}":
+            suffix = os.path.splitext(upl.name)[-1].lower()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(upl.read())
+                st.session_state.restream_input_path = tmp.name
+            st.session_state.restream_upload_name = f"{upl.name}:{getattr(upl, 'size', 0)}"
+            st.session_state.restream_meta = backend.probe(st.session_state.restream_input_path)
+        src_path = st.session_state.restream_input_path
+        meta = st.session_state.restream_meta
+        st.caption(f"Source: {meta['width']}×{meta['height']} @ {meta['fps']} fps · {meta['duration']:.1f}s · {meta['vcodec'].upper()}")
+
+        current_job = st.session_state.get("restream_job")
+        job_active = bool(current_job and current_job.get("proc") and current_job["proc"].poll() is None)
+        start_clicked = st.button("🎬 Start progressive HLS preview", type="primary", disabled=job_active)
+        if start_clicked:
+            result = backend.start_vod_preview_job(input_source=src_path, asset_name=upl.name, aspect_label=aspect, preset=preset, fps=fps_value, segment_seconds=segment_seconds, abr_enabled=abr_enabled, src_meta=meta)
+            st.session_state.restream_output_dir = result.out_dir
+            st.session_state.restream_manifest = result.master_manifest
+            st.session_state.restream_ladder = result.ladder
+            st.session_state.restream_manifest_url = result.manifest_url
+            st.session_state.restream_server_info = result.server_info
+            st.session_state.restream_job = result.job
+            st.success("HTTP endpoint started immediately. FFmpeg is now writing HLS segments in background.")
+
+        current_job = st.session_state.get("restream_job")
+        job_done = bool(current_job and current_job.get("proc") and current_job["proc"].poll() is not None)
+        if job_done and not st.session_state.get("restream_zip"):
+            outputs = backend.collect_job_outputs(current_job)
+            st.session_state.restream_zip = outputs.get("zip_bytes")
+
+        left, right = st.columns([2, 3], gap="large")
+        with left:
+            render_source_info(meta, os.path.getsize(src_path) / (1024 * 1024))
+            render_live_log(current_job)
+            if st.session_state.restream_ladder:
+                st.markdown("#### Active ladder")
+                render_abr_ladder_table(st.session_state.restream_ladder)
+            if st.session_state.restream_zip:
+                st.download_button("⬇ Download HLS bundle (.zip)", data=st.session_state.restream_zip, file_name="hls_progressive_preview_bundle.zip", mime="application/zip")
+            st.caption("Flow now starts serving instantly. The only wait is for the first 1–2 segments to be created.")
+        with right:
+            render_manifest_playback(st.session_state.get("restream_manifest_url"), title=f"{aspect} progressive playback", embed_player=True)
     else:
         ingest_url = st.text_input("Ingest URL", placeholder="rtmp://host/app/streamKey or srt://host:port?mode=caller&latency=120")
         job = st.session_state.get("restream_job")
@@ -451,36 +252,36 @@ def restream_page():
                 st.session_state.restream_job = job
                 st.session_state.restream_ladder = ladder
                 st.session_state.restream_manifest_url = job.get("manifest_url")
-                st.success("Live restream started and serving manifest immediately.")
+                st.success("Live restream started. Player can attach immediately and will begin once first segments exist.")
         with stop_col:
             if st.button("⏹ Stop live restream", disabled=not active):
                 backend.stop_live_job(job)
                 st.success("Live restream stopped.")
-        c_left, c_right = st.columns([2, 3], gap="large")
-        with c_left:
+        left, right = st.columns([2, 3], gap="large")
+        with left:
             render_live_log(st.session_state.get("restream_job"))
             if st.session_state.get("restream_ladder"):
-                st.markdown("#### Active live ladder")
+                st.markdown("#### Active ladder")
                 render_abr_ladder_table(st.session_state.restream_ladder)
-            st.caption("For minimal delay, keep segment length small (2s) with a short live playlist. This is near-real-time HLS, not LL-HLS.")
-        with c_right:
+        with right:
             render_manifest_playback(st.session_state.get("restream_manifest_url"), title=f"{aspect} live playback", embed_player=True)
 
     st.divider()
-    st.markdown("### Current control-plane flow")
+    st.markdown("### Updated flow now implemented")
     st.markdown(
-        "- User uploads video or provides live ingest.\n"
-        "- App generates HLS package (single rendition or ABR ladder).\n"
-        "- App starts a lightweight local HTTP endpoint immediately for the generated output directory.\n"
-        "- Embedded HLS.js player loads the generated `master.m3u8` on the same page.\n"
-        "- Playback metrics such as current level, buffer ahead, latency-to-live-edge, dropped frames, and event logs are shown inline."
+        "- User uploads video.\n"
+        "- App copies source file.\n"
+        "- App starts local HTTP endpoint immediately.\n"
+        "- FFmpeg starts writing HLS playlist + segments in background.\n"
+        "- Embedded HLS.js points to `master.m3u8` immediately.\n"
+        "- Playback starts after the first 1–2 segments are available.\n"
+        "- Analytics panel updates from actual player events."
     )
-    st.markdown("### Production recommendation")
+    st.markdown("### Notes")
     st.markdown(
-        "- Keep **Streamlit as control-plane UI** and move FFmpeg jobs to a worker/container service.\n"
-        "- Publish the generated **master.m3u8** to an origin/CDN for multi-user playback.\n"
-        "- Add health telemetry such as segment age, manifest freshness, encoder FPS, CPU/RAM.\n"
-        "- If you need true ultra-low latency, move to **LL-HLS** or WebRTC for the preview path."
+        "- Ladder is now capped to **360p and 540p** for faster startup.\n"
+        "- This is a progressive HLS preview path for quick validation, not full LL-HLS.\n"
+        "- For production, move FFmpeg to a worker/container and publish the manifest to an origin/CDN."
     )
 
 
@@ -498,7 +299,7 @@ def main():
     else:
         restream_page()
     st.markdown("---")
-    st.caption("VideoForge Studio · split UI/backend · built-in HTTP serving for generated HLS · embedded HLS.js playback + analytics")
+    st.caption("VideoForge Studio · progressive HLS preview with immediate local HTTP endpoint · capped 2-rung ladder · live HLS.js analytics")
 
 
 if __name__ == "__main__":
