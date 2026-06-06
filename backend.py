@@ -1,9 +1,8 @@
+
 from __future__ import annotations
 
-import base64
 import io
 import json
-import mimetypes
 import os
 import re
 import shutil
@@ -19,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 MAX_UPLOAD_MB = 300
-DEFAULT_SEGMENT_SECONDS = 4  # slightly larger segments to reduce GitHub file/update volume
+DEFAULT_SEGMENT_SECONDS = 4  # fewer segments → fewer files and more stable prototype publishing
 ABR_RUNGS = (360, 540)
 
 ASPECT_PRESETS = {
@@ -46,6 +45,7 @@ class GitHubConfig:
     folder_prefix: str = "public/hls"
     default_branch: str = "main"
     deploy_hook_url: str | None = None
+    wait_timeout_seconds: int = 150
 
 @dataclass
 class PublishResult:
@@ -59,6 +59,7 @@ class PublishResult:
     ffmpeg_log: str
     github_log: str
     deploy_hook_log: str
+    readiness_log: str
     ladder: list[dict]
 
 # -----------------------------
@@ -275,9 +276,9 @@ def run_ffmpeg(cmd: list[str], timeout: Optional[int] = None) -> tuple[bool, str
         return False, str(exc), ""
 
 # -----------------------------
-# GitHub publication layer
+# GitHub atomic publication layer
 # -----------------------------
-def github_config_from_inputs(owner: str, repo: str, token: str, target_branch: str, pages_base_url: str, folder_prefix: str, default_branch: str, deploy_hook_url: str) -> GitHubConfig:
+def github_config_from_inputs(owner: str, repo: str, token: str, target_branch: str, pages_base_url: str, folder_prefix: str, default_branch: str, deploy_hook_url: str, wait_timeout_seconds: int) -> GitHubConfig:
     if not owner:
         raise ValueError("GitHub owner is required.")
     if not repo:
@@ -297,6 +298,7 @@ def github_config_from_inputs(owner: str, repo: str, token: str, target_branch: 
         folder_prefix=safe_token(folder_prefix or 'public/hls').strip('/'),
         default_branch=(default_branch or 'main').strip(),
         deploy_hook_url=(deploy_hook_url or '').strip() or None,
+        wait_timeout_seconds=max(30, int(wait_timeout_seconds or 150)),
     )
 
 
@@ -307,7 +309,7 @@ def _github_request(cfg: GitHubConfig, method: str, path: str, payload: Optional
         'Authorization': f'Bearer {cfg.token}',
         'Accept': 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'VideoForge-Streamlit-Publisher',
+        'User-Agent': 'VideoForge-Atomic-GitHub-Publisher',
     }
     if payload is not None:
         data = json.dumps(payload).encode('utf-8')
@@ -321,7 +323,6 @@ def _github_request(cfg: GitHubConfig, method: str, path: str, payload: Optional
             return resp.status, parsed, dict(resp.headers)
     except urllib.error.HTTPError as e:
         raw = e.read()
-        parsed = None
         try:
             parsed = json.loads(raw.decode('utf-8'))
         except Exception:
@@ -329,59 +330,78 @@ def _github_request(cfg: GitHubConfig, method: str, path: str, payload: Optional
         return e.code, parsed, dict(e.headers)
 
 
+def get_ref(cfg: GitHubConfig, branch: str) -> dict:
+    status, payload, _ = _github_request(cfg, 'GET', f"/repos/{cfg.owner}/{cfg.repo}/git/ref/heads/{urllib.parse.quote(branch, safe='')}")
+    if status != 200 or not isinstance(payload, dict):
+        raise RuntimeError(f"Failed to read ref for branch {branch}: {payload}")
+    return payload
+
+
 def branch_exists(cfg: GitHubConfig, branch: str) -> bool:
     status, _, _ = _github_request(cfg, 'GET', f"/repos/{cfg.owner}/{cfg.repo}/git/ref/heads/{urllib.parse.quote(branch, safe='')}")
     return status == 200
 
 
-def get_branch_head_sha(cfg: GitHubConfig, branch: str) -> str:
-    status, payload, _ = _github_request(cfg, 'GET', f"/repos/{cfg.owner}/{cfg.repo}/git/ref/heads/{urllib.parse.quote(branch, safe='')}")
+def get_commit(cfg: GitHubConfig, sha: str) -> dict:
+    status, payload, _ = _github_request(cfg, 'GET', f"/repos/{cfg.owner}/{cfg.repo}/git/commits/{sha}")
     if status != 200 or not isinstance(payload, dict):
-        raise RuntimeError(f"Failed to read branch ref for {branch}: {payload}")
-    return payload['object']['sha']
+        raise RuntimeError(f"Failed to read commit {sha}: {payload}")
+    return payload
 
 
 def create_branch_from_default(cfg: GitHubConfig, branch: str) -> str:
-    base_sha = get_branch_head_sha(cfg, cfg.default_branch)
+    base_ref = get_ref(cfg, cfg.default_branch)
+    base_sha = base_ref['object']['sha']
     payload = {'ref': f'refs/heads/{branch}', 'sha': base_sha}
     status, data, _ = _github_request(cfg, 'POST', f"/repos/{cfg.owner}/{cfg.repo}/git/refs", payload)
-    if status not in (201, 200):
+    if status not in (200, 201):
         raise RuntimeError(f"Failed to create branch {branch}: {data}")
     return base_sha
 
 
-def ensure_branch(cfg: GitHubConfig) -> None:
+def ensure_branch(cfg: GitHubConfig) -> str:
     if branch_exists(cfg, cfg.target_branch):
-        return
-    create_branch_from_default(cfg, cfg.target_branch)
+        ref = get_ref(cfg, cfg.target_branch)
+        return ref['object']['sha']
+    return create_branch_from_default(cfg, cfg.target_branch)
 
 
-def get_file_sha_if_exists(cfg: GitHubConfig, repo_path: str) -> str | None:
-    encoded_path = '/'.join(urllib.parse.quote(part, safe='') for part in repo_path.split('/'))
-    status, payload, _ = _github_request(cfg, 'GET', f"/repos/{cfg.owner}/{cfg.repo}/contents/{encoded_path}?ref={urllib.parse.quote(cfg.target_branch, safe='')}")
-    if status == 200 and isinstance(payload, dict) and payload.get('sha'):
-        return payload['sha']
-    return None
+def create_blob(cfg: GitHubConfig, content_bytes: bytes) -> str:
+    payload = {'content': base64.b64encode(content_bytes).decode('ascii'), 'encoding': 'base64'}
+    status, data, _ = _github_request(cfg, 'POST', f"/repos/{cfg.owner}/{cfg.repo}/git/blobs", payload)
+    if status not in (200, 201) or not isinstance(data, dict) or not data.get('sha'):
+        raise RuntimeError(f"Failed to create blob: {data}")
+    return data['sha']
 
 
-def upsert_file_contents(cfg: GitHubConfig, repo_path: str, content_bytes: bytes, commit_message: str) -> str:
-    encoded_path = '/'.join(urllib.parse.quote(part, safe='') for part in repo_path.split('/'))
-    existing_sha = get_file_sha_if_exists(cfg, repo_path)
-    payload = {
-        'message': commit_message,
-        'content': base64.b64encode(content_bytes).decode('ascii'),
-        'branch': cfg.target_branch,
-    }
-    if existing_sha:
-        payload['sha'] = existing_sha
-    status, data, _ = _github_request(cfg, 'PUT', f"/repos/{cfg.owner}/{cfg.repo}/contents/{encoded_path}", payload)
+def create_tree(cfg: GitHubConfig, base_tree_sha: str, entries: list[dict]) -> str:
+    payload = {'base_tree': base_tree_sha, 'tree': entries}
+    status, data, _ = _github_request(cfg, 'POST', f"/repos/{cfg.owner}/{cfg.repo}/git/trees", payload)
+    if status not in (200, 201) or not isinstance(data, dict) or not data.get('sha'):
+        raise RuntimeError(f"Failed to create tree: {data}")
+    return data['sha']
+
+
+def create_commit(cfg: GitHubConfig, message: str, tree_sha: str, parent_sha: str) -> str:
+    payload = {'message': message, 'tree': tree_sha, 'parents': [parent_sha]}
+    status, data, _ = _github_request(cfg, 'POST', f"/repos/{cfg.owner}/{cfg.repo}/git/commits", payload)
+    if status not in (200, 201) or not isinstance(data, dict) or not data.get('sha'):
+        raise RuntimeError(f"Failed to create commit: {data}")
+    return data['sha']
+
+
+def update_ref(cfg: GitHubConfig, branch: str, commit_sha: str) -> None:
+    payload = {'sha': commit_sha, 'force': True}
+    status, data, _ = _github_request(cfg, 'PATCH', f"/repos/{cfg.owner}/{cfg.repo}/git/refs/heads/{urllib.parse.quote(branch, safe='')}", payload)
     if status not in (200, 201):
-        raise RuntimeError(f"Failed to write {repo_path}: {data}")
-    return data.get('content', {}).get('sha', '') if isinstance(data, dict) else ''
+        raise RuntimeError(f"Failed to update ref for {branch}: {data}")
 
 
-def publish_directory_to_github(cfg: GitHubConfig, local_dir: str, repo_path_prefix: str) -> str:
-    ensure_branch(cfg)
+def publish_directory_to_github_atomic(cfg: GitHubConfig, local_dir: str, repo_path_prefix: str, commit_message: str) -> str:
+    head_sha = ensure_branch(cfg)
+    parent_commit = get_commit(cfg, head_sha)
+    base_tree_sha = parent_commit['tree']['sha']
+    entries = []
     logs = []
     for root, _, files in os.walk(local_dir):
         files.sort()
@@ -391,23 +411,47 @@ def publish_directory_to_github(cfg: GitHubConfig, local_dir: str, repo_path_pre
             repo_path = f"{repo_path_prefix}/{rel_path}" if repo_path_prefix else rel_path
             with open(local_path, 'rb') as fh:
                 content = fh.read()
-            sha = upsert_file_contents(cfg, repo_path, content, f"Update HLS asset {repo_path}")
-            logs.append(f"upserted {repo_path} sha={sha[:10] if sha else 'n/a'}")
+            blob_sha = create_blob(cfg, content)
+            entries.append({'path': repo_path, 'mode': '100644', 'type': 'blob', 'sha': blob_sha})
+            logs.append(f"prepared {repo_path} blob={blob_sha[:10]}")
+    new_tree_sha = create_tree(cfg, base_tree_sha, entries)
+    logs.append(f"created tree {new_tree_sha}")
+    new_commit_sha = create_commit(cfg, commit_message, new_tree_sha, head_sha)
+    logs.append(f"created commit {new_commit_sha}")
+    update_ref(cfg, cfg.target_branch, new_commit_sha)
+    logs.append(f"updated branch {cfg.target_branch} -> {new_commit_sha}")
     return '\n'.join(logs)
 
 
 def trigger_deploy_hook(cfg: GitHubConfig) -> str:
     if not cfg.deploy_hook_url:
         return 'No deploy hook configured; relying on Cloudflare Pages automatic git deployment.'
-    req = urllib.request.Request(cfg.deploy_hook_url, data=b'', method='POST', headers={'User-Agent': 'VideoForge-Streamlit-Publisher'})
+    req = urllib.request.Request(cfg.deploy_hook_url, data=b'', method='POST', headers={'User-Agent': 'VideoForge-Atomic-GitHub-Publisher'})
     with urllib.request.urlopen(req, timeout=30) as resp:
         body = resp.read().decode('utf-8', errors='ignore')
         return f"Deploy hook POST returned HTTP {resp.status}. Response: {body[:1000]}"
 
 
 def build_public_manifest_url(cfg: GitHubConfig, repo_path_prefix: str) -> str:
-    # Pages publishes repo contents as-is relative to site root.
     return f"{cfg.pages_base_url}/{repo_path_prefix}/master.m3u8"
+
+
+def wait_for_manifest(manifest_url: str, timeout_seconds: int = 150, poll_interval_seconds: int = 5) -> tuple[bool, str]:
+    started = time.time()
+    attempts = []
+    while time.time() - started < timeout_seconds:
+        try:
+            req = urllib.request.Request(manifest_url, headers={'User-Agent': 'VideoForge-Manifest-Checker'})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = resp.read(4096).decode('utf-8', errors='ignore')
+                if resp.status == 200 and '#EXTM3U' in body:
+                    attempts.append(f"HTTP 200 and playlist marker found at {int(time.time()-started)}s")
+                    return True, '\n'.join(attempts)
+                attempts.append(f"HTTP {resp.status} without m3u8 marker at {int(time.time()-started)}s")
+        except Exception as exc:
+            attempts.append(f"retry at {int(time.time()-started)}s -> {exc}")
+        time.sleep(poll_interval_seconds)
+    return False, '\n'.join(attempts)
 
 # -----------------------------
 # Player HTML helpers
@@ -478,25 +522,26 @@ def build_hlsjs_player_html(manifest_url: str, title: str = 'HLS playback', auto
 # -----------------------------
 # End-to-end publish flow
 # -----------------------------
-def package_and_publish_via_github(input_source: str, asset_name: str, aspect_label: str, preset: str, fps: Optional[int], segment_seconds: int, cfg: GitHubConfig, src_meta: Optional[dict] = None) -> PublishResult:
-    out_dir = tempfile.mkdtemp(prefix='videoforge_pages_git_hls_')
+def package_and_publish_via_github_atomic(input_source: str, asset_name: str, aspect_label: str, preset: str, fps: Optional[int], segment_seconds: int, cfg: GitHubConfig, src_meta: Optional[dict] = None) -> PublishResult:
+    out_dir = tempfile.mkdtemp(prefix='videoforge_pages_git_atomic_hls_')
     ensure_clean_dir(out_dir)
     cmd, ladder, manifest_path = build_multi_variant_vod_hls_cmd(input_source, out_dir, aspect_label, preset, fps, segment_seconds, src_meta)
     ff_ok, ff_msg, ff_log = run_ffmpeg(cmd)
     if not ff_ok:
-        return PublishResult(False, ff_msg, out_dir, manifest_path, None, None, None, ff_log, '', '', ladder)
+        return PublishResult(False, ff_msg, out_dir, manifest_path, None, None, None, ff_log, '', '', '', ladder)
 
     object_prefix = f"{cfg.folder_prefix}/{safe_token(Path(asset_name).stem)}_{int(time.time())}"
     github_log = ''
     deploy_hook_log = ''
+    readiness_log = ''
     try:
-        github_log = publish_directory_to_github(cfg, out_dir, object_prefix)
-        if cfg.deploy_hook_url:
-            deploy_hook_log = trigger_deploy_hook(cfg)
-        else:
-            deploy_hook_log = 'No deploy hook configured; relying on Cloudflare Pages automatic git deployment.'
+        github_log = publish_directory_to_github_atomic(cfg, out_dir, object_prefix, f"Publish HLS asset {safe_token(Path(asset_name).stem)}")
+        deploy_hook_log = trigger_deploy_hook(cfg)
         manifest_url = build_public_manifest_url(cfg, object_prefix)
+        ready, readiness_log = wait_for_manifest(manifest_url, cfg.wait_timeout_seconds, 5)
         zbytes = zip_dir_bytes(out_dir)
-        return PublishResult(True, 'GitHub publication succeeded', out_dir, manifest_path, manifest_url, object_prefix, zbytes, ff_log, github_log, deploy_hook_log, ladder)
+        if ready:
+            return PublishResult(True, 'Atomic GitHub publication succeeded and manifest is reachable', out_dir, manifest_path, manifest_url, object_prefix, zbytes, ff_log, github_log, deploy_hook_log, readiness_log, ladder)
+        return PublishResult(False, 'Atomic GitHub publication succeeded, but manifest was not reachable before timeout', out_dir, manifest_path, manifest_url, object_prefix, zbytes, ff_log, github_log, deploy_hook_log, readiness_log, ladder)
     except Exception as exc:
-        return PublishResult(False, f'GitHub publication failed: {exc}', out_dir, manifest_path, None, object_prefix, None, ff_log, github_log or str(exc), deploy_hook_log, ladder)
+        return PublishResult(False, f'Atomic GitHub publication failed: {exc}', out_dir, manifest_path, None, object_prefix, None, ff_log, github_log or str(exc), deploy_hook_log, readiness_log, ladder)
