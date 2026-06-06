@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import os
@@ -9,7 +8,7 @@ import streamlit.components.v1 as components
 
 import backend
 
-st.set_page_config(page_title='TikTok Live Verticalizer', page_icon='📱', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='TikTok Live Verticalizer → Cloudflare Stream', page_icon='📱', layout='wide', initial_sidebar_state='expanded')
 
 st.markdown("""
 <style>
@@ -20,29 +19,26 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-if 'input_path' not in st.session_state:
-    st.session_state.input_path = None
-if 'meta' not in st.session_state:
-    st.session_state.meta = None
-if 'reframed_path' not in st.session_state:
-    st.session_state.reframed_path = None
-if 'live_job' not in st.session_state:
-    st.session_state.live_job = None
-if 'status_text' not in st.session_state:
-    st.session_state.status_text = ''
+for key, value in {
+    'input_path': None,
+    'meta': None,
+    'reframed_path': None,
+    'live_session': None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 st.markdown("""
 <div class='hero'>
   <div style='display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;'>
     <div>
-      <div style='font-size:1.85rem; font-weight:800; margin-bottom:4px;'>TikTok Live Verticalizer</div>
-      <div style='font-size:.98rem; color:#cbd5e1;'>Smart reframe MVP + live sliding HLS packaging + LIVE player UX. This version is built to demonstrate the vertical live-stream problem statement, not VOD packaging.</div>
+      <div style='font-size:1.85rem; font-weight:800; margin-bottom:4px;'>TikTok Live Verticalizer → Cloudflare Stream</div>
+      <div style='font-size:.98rem; color:#cbd5e1;'>Fixed version: vertical smart reframe, output pushed to Cloudflare Stream Live input, public Cloudflare playback URL, LIVE UX preserved.</div>
     </div>
     <div>
-      <span class='chip'>Subject/action tracking</span>
-      <span class='chip'>Crop-to-fill 9:16</span>
-      <span class='chip'>Smoothing + lead-room</span>
-      <span class='chip'>Live playlist</span>
+      <span class='chip'>Vertical smart reframe</span>
+      <span class='chip'>Push to Cloudflare live input</span>
+      <span class='chip'>Public Cloudflare playback URL</span>
       <span class='chip'>LIVE badge + Go live</span>
     </div>
   </div>
@@ -53,24 +49,44 @@ if not backend.ffmpeg_ok():
     st.error('FFmpeg / ffprobe not found. Add ffmpeg to your runtime and redeploy.')
     st.stop()
 
-st.subheader('A) Smart reframe mode (true TikTok-style vertical fill)')
-left, right = st.columns([2, 1], gap='large')
-with left:
-    upl = st.file_uploader(f'Upload source video (recommended max {backend.MAX_UPLOAD_MB} MB)', type=['avi', 'mp4', 'mkv', 'mov', 'webm', 'flv', 'ts', 'm4v', 'mxf'])
-    if upl:
-        if getattr(upl, 'size', 0) > backend.MAX_UPLOAD_MB * 1024 * 1024:
-            st.error(f'File is {upl.size / (1024*1024):.1f} MB. Keep it ≤ {backend.MAX_UPLOAD_MB} MB.')
-            st.stop()
-        suffix = os.path.splitext(upl.name)[-1].lower()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(upl.read())
-            st.session_state.input_path = tmp.name
-        st.session_state.meta = backend.probe(st.session_state.input_path)
-with right:
-    smooth_strength = st.slider('Smoothing strength', 0.50, 0.98, 0.88, 0.01, help='Higher = steadier crop window, lower = more reactive movement.')
-    lead_room = st.slider('Lead-room', 0.0, 0.50, 0.18, 0.01, help='Bias crop slightly in the direction of motion, like short-form vertical apps.')
+st.subheader('1) Cloudflare Stream Live settings')
+left_cf, right_cf = st.columns(2)
+with left_cf:
+    account_id = st.text_input('Cloudflare account ID', value=os.getenv('CLOUDFLARE_ACCOUNT_ID', ''))
+    api_token = st.text_input('Cloudflare Stream API token', value=os.getenv('CLOUDFLARE_STREAM_API_TOKEN', ''), type='password')
+with right_cf:
+    customer_code = st.text_input('Cloudflare Stream customer code', value=os.getenv('CLOUDFLARE_STREAM_CUSTOMER_CODE', ''), help='Needed to construct the public HLS playback URL: https://customer-<CODE>.cloudflarestream.com/<UID>/manifest/video.m3u8')
+    prefer_low_latency = st.checkbox('Prefer LL-HLS where available', value=True)
+
+cf_cfg = None
+if account_id and api_token and customer_code:
+    try:
+        cf_cfg = backend.cfstream_config_from_inputs(account_id, api_token, customer_code, prefer_low_latency)
+        st.success('Cloudflare Stream configuration looks valid.')
+    except Exception as exc:
+        st.error(str(exc))
+else:
+    st.warning('Fill in Account ID, Stream API token, and customer code.')
+
+st.subheader('2) Smart reframe settings')
+upl = st.file_uploader(f'Upload source video (recommended max {backend.MAX_UPLOAD_MB} MB)', type=['avi', 'mp4', 'mkv', 'mov', 'webm', 'flv', 'ts', 'm4v', 'mxf'])
+reframe_left, reframe_right = st.columns([2, 1], gap='large')
+with reframe_right:
+    smooth_strength = st.slider('Smoothing strength', 0.50, 0.98, 0.88, 0.01)
+    lead_room = st.slider('Lead-room', 0.0, 0.50, 0.18, 0.01)
     target_w = st.selectbox('Vertical output width', [360, 540, 720], index=1)
     target_h = int(round(target_w * 16 / 9))
+    loop_input = st.checkbox('Loop uploaded clip as pseudo-live source', value=True, help='Useful to demonstrate live behavior from a short clip. For real ingest, replace uploaded file with RTMP/SRT camera feed later.')
+
+if upl:
+    if getattr(upl, 'size', 0) > backend.MAX_UPLOAD_MB * 1024 * 1024:
+        st.error(f'File is {upl.size / (1024*1024):.1f} MB. Keep it ≤ {backend.MAX_UPLOAD_MB} MB.')
+        st.stop()
+    suffix = os.path.splitext(upl.name)[-1].lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(upl.read())
+        st.session_state.input_path = tmp.name
+    st.session_state.meta = backend.probe(st.session_state.input_path)
 
 if st.session_state.meta:
     meta = st.session_state.meta
@@ -80,7 +96,7 @@ if st.session_state.meta:
     c.metric('Duration', f"{meta['duration']:.1f}s")
 
 progress_bar = st.progress(0.0, text='Waiting')
-if st.button('1️⃣ Analyse + create TikTok-style reframed vertical master') and st.session_state.input_path:
+if st.button('Analyse + create vertical smart-reframed master', disabled=not bool(st.session_state.input_path)):
     out_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
     def _cb(pct, msg):
         progress_bar.progress(min(max(float(pct),0.0),1.0), text=msg)
@@ -96,63 +112,56 @@ if st.button('1️⃣ Analyse + create TikTok-style reframed vertical master') a
     if ok:
         st.session_state.reframed_path = out_path
         progress_bar.progress(1.0, text='Smart reframe complete')
-        st.success('TikTok-style vertical master created.')
+        st.success('Vertical smart-reframed master created.')
     else:
         st.error(msg)
 
 if st.session_state.reframed_path and os.path.exists(st.session_state.reframed_path):
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown('**Reframed vertical master ready**')
+    st.markdown('**Vertical smart-reframed master preview**')
     st.video(st.session_state.reframed_path)
-    st.caption('This preview is the dynamically cropped 9:16 master, not a fit-and-pad canvas.')
     st.markdown('</div>', unsafe_allow_html=True)
 
-st.divider()
-st.subheader('B) Live mode packaging (real live window, not VOD)')
-l1, l2, l3 = st.columns(3)
-segment_seconds = l1.slider('Live segment seconds', 1, 6, backend.DEFAULT_SEGMENT_SECONDS)
-live_list_size = l2.slider('Sliding playlist size', 2, 10, backend.DEFAULT_LIVE_LIST_SIZE)
-loop_input = l3.checkbox('Loop uploaded clip as pseudo-live source', value=True, help='Useful to demonstrate live behavior from a short clip. For real live ingest, replace with RTMP/SRT input in the backend pipeline.')
-
-if st.button('2️⃣ Start true live vertical HLS origin', disabled=not bool(st.session_state.reframed_path)):
-    if st.session_state.live_job:
-        backend.stop_live_job(st.session_state.live_job)
-    job = backend.start_live_job_from_reframed_file(
-        st.session_state.reframed_path,
-        asset_name='tiktok_live_demo',
-        segment_seconds=segment_seconds,
-        live_list_size=live_list_size,
+st.subheader('3) Push to Cloudflare Stream Live input')
+if st.button('Start Cloudflare live push', disabled=not (cf_cfg and st.session_state.reframed_path)):
+    if st.session_state.live_session:
+        backend.stop_cloudflare_live_push(cf_cfg, st.session_state.live_session)
+    session = backend.start_cloudflare_live_push(
+        cfg=cf_cfg,
+        reframed_mp4=st.session_state.reframed_path,
+        asset_name=upl.name if upl else 'vertical_live_demo',
         fps=int(round(st.session_state.meta.get('fps') or 30)) if st.session_state.meta else 30,
         loop_input=loop_input,
     )
-    st.session_state.live_job = job
-    st.success('Live HLS origin started. This uses a sliding playlist and deletes old segments.')
+    st.session_state.live_session = session
+    st.success('Cloudflare live input created and FFmpeg push started.')
 
-if st.button('⏹ Stop live origin', disabled=not bool(st.session_state.live_job)):
-    backend.stop_live_job(st.session_state.live_job)
-    st.session_state.live_job = None
-    st.info('Live origin stopped.')
+if st.button('Stop Cloudflare live push', disabled=not bool(st.session_state.live_session)):
+    backend.stop_cloudflare_live_push(cf_cfg, st.session_state.live_session)
+    st.session_state.live_session = None
+    st.info('Cloudflare live push stopped and input disabled.')
 
-if st.session_state.live_job:
-    job = st.session_state.live_job
+if st.session_state.live_session:
+    session = st.session_state.live_session
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown('**Live origin status**')
-    st.code(job.manifest_url)
-    with st.expander('FFmpeg live log'):
-        if os.path.exists(job.log_path):
-            with open(job.log_path, 'r', encoding='utf-8', errors='ignore') as fp:
+    st.markdown('**Cloudflare Stream live session**')
+    st.caption(f'Live input UID: {session.uid}')
+    st.code(session.hls_url)
+    st.caption('This is the public Cloudflare playback URL (HLS manifest).')
+    with st.expander('FFmpeg push log'):
+        if os.path.exists(session.log_path):
+            with open(session.log_path, 'r', encoding='utf-8', errors='ignore') as fp:
                 st.code(fp.read()[-12000:] or '(empty)', language='bash')
     st.markdown('</div>', unsafe_allow_html=True)
 
-    st.divider()
-    st.subheader('C) Live player UX')
-    components.html(backend.build_live_player_html(job.manifest_url, title='TikTok-style vertical live preview', autoplay=True, muted=True), height=980, scrolling=True)
+    st.subheader('4) Public Cloudflare playback with LIVE UX preserved')
+    components.html(backend.build_cloudflare_live_player_html(session.hls_url, title='TikTok-style vertical live on Cloudflare', autoplay=True, muted=True), height=980, scrolling=True)
 
 st.divider()
-st.markdown('### What this version changes compared with the old one')
+st.markdown('### Notes')
 st.markdown(
-    '- **Smart reframe**: subject/action tracking using faces + saliency + motion, then crop-to-fill 9:16 with smoothing and lead-room.\n'
-    '- **Live packaging**: no VOD playlist type, short sliding playlist, old segment deletion, and a continuously updated live manifest.\n'
-    '- **Live player UX**: LIVE badge, Go live button, and live-window metrics instead of clip-style playback behavior.\n'
-    '- **Important**: this is a practical local/VM MVP. For production low-latency scale, swap the local origin for a real live media origin / CDN or managed service.'
+    '- This fixes the localhost playback problem by pushing the vertical stream to **Cloudflare Stream Live** instead of serving `127.0.0.1` to the browser.\n'
+    '- The player uses the **public Cloudflare HLS URL**.\n'
+    '- The uploaded clip can be looped as a pseudo-live source for demonstration.\n'
+    '- For real live contribution, replace the uploaded file input with a true camera/live source and keep the Cloudflare live input + player flow.'
 )
