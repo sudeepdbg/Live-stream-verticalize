@@ -2,8 +2,9 @@ streamlit>=1.35.0
 pandas>=2.0.0
 
 # Optional enhancements
-numpy>=1.24.0
 plotly>=5.0.0
+opencv-python-headless>=4.9.0
+numpy>=1.26.0
 
 # Optional AI features (uncomment if needed)
 # realesrgan-pytorch>=0.3.0
