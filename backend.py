@@ -1,18 +1,16 @@
-
 from __future__ import annotations
 
 import json
 import os
 import re
 import shutil
-import socket
 import subprocess
 import tempfile
-import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
-from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional, Callable
 
@@ -21,27 +19,11 @@ import numpy as np
 
 DEFAULT_TARGET_W = 540
 DEFAULT_TARGET_H = 960
-DEFAULT_SEGMENT_SECONDS = 2
-DEFAULT_LIVE_LIST_SIZE = 4
-DEFAULT_TRANSITION_SEC = 0.35
 MAX_UPLOAD_MB = 400
 
-ASPECT_PRESETS = [
-    "9:16 Vertical (TikTok Live)",
-]
-
-_HTTP_SERVERS: dict[str, dict] = {}
-
-@dataclass
-class LiveJob:
-    proc: subprocess.Popen
-    out_dir: str
-    manifest_path: str
-    manifest_url: str
-    server_info: dict
-    log_path: str
-    reframed_path: str | None
-
+# -----------------------------
+# Generic helpers
+# -----------------------------
 
 def ffmpeg_ok() -> bool:
     try:
@@ -52,56 +34,9 @@ def ffmpeg_ok() -> bool:
         return False
 
 
-def ensure_clean_dir(path: str | os.PathLike[str]) -> None:
-    p = str(path)
-    os.makedirs(p, exist_ok=True)
-    for name in os.listdir(p):
-        fp = os.path.join(p, name)
-        try:
-            if os.path.isdir(fp):
-                shutil.rmtree(fp, ignore_errors=True)
-            else:
-                os.unlink(fp)
-        except Exception:
-            pass
-
-
 def safe_token(value: str) -> str:
     value = value or "stream"
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-") or "stream"
-
-
-def _find_free_port(host: str = "127.0.0.1") -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((host, 0))
-        return s.getsockname()[1]
-
-
-def start_static_file_server(directory: str, host: str = "127.0.0.1", port: Optional[int] = None) -> dict:
-    key = os.path.abspath(directory)
-    existing = _HTTP_SERVERS.get(key)
-    if existing:
-        return existing
-    port = port or _find_free_port(host)
-    handler = partial(SimpleHTTPRequestHandler, directory=directory)
-    httpd = ThreadingHTTPServer((host, port), handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    info = {"directory": key, "host": host, "port": port, "base_url": f"http://{host}:{port}", "server": httpd, "thread": thread}
-    _HTTP_SERVERS[key] = info
-    return info
-
-
-def stop_static_file_server(directory: str) -> None:
-    key = os.path.abspath(directory)
-    info = _HTTP_SERVERS.pop(key, None)
-    if not info:
-        return
-    try:
-        info["server"].shutdown()
-        info["server"].server_close()
-    except Exception:
-        pass
 
 
 def probe(path: str) -> dict:
@@ -147,8 +82,20 @@ def probe(path: str) -> dict:
     return res
 
 
+def format_audio_codec(codec: str) -> str:
+    mapping = {"aac": "AAC", "mp3": "MP3", "opus": "Opus", "vorbis": "Vorbis", "ac3": "AC-3", "eac3": "E-AC-3", "flac": "FLAC", "pcm_s16le": "PCM 16-bit", "alac": "ALAC"}
+    return mapping.get(codec, (codec or "unknown").upper())
+
+
+def format_sample_rate(sr: int) -> str:
+    return f"{sr // 1000} kHz" if sr >= 1000 else f"{sr} Hz"
+
+
+def format_channels(ch: int) -> str:
+    return {1: "Mono", 2: "Stereo", 6: "5.1", 8: "7.1"}.get(ch, f"{ch} ch")
+
+
 def _tiktok_crop_box(src_w: int, src_h: int) -> tuple[int, int]:
-    # crop window with 9:16 aspect ratio that fits inside source
     if src_w / src_h >= 9/16:
         crop_h = src_h
         crop_w = int(round(src_h * 9 / 16))
@@ -168,6 +115,9 @@ def _bbox_center(box):
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
+# -----------------------------
+# Smart reframe engine
+# -----------------------------
 
 def smart_reframe_vertical(
     input_path: str,
@@ -200,7 +150,6 @@ def smart_reframe_vertical(
         cap.release()
         return False, "Could not create output video writer"
 
-    # detectors
     face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     saliency = None
     try:
@@ -220,10 +169,8 @@ def smart_reframe_vertical(
         if not ok:
             break
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
         candidates = []
 
-        # face candidates (highest priority)
         try:
             faces = face_detector.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=4, minSize=(40, 40))
         except Exception:
@@ -231,7 +178,6 @@ def smart_reframe_vertical(
         for (x, y, w, h) in faces:
             candidates.append((0.65, (x, y, w, h)))
 
-        # saliency candidate
         if saliency is not None:
             try:
                 success, sal_map = saliency.computeSaliency(frame)
@@ -247,7 +193,6 @@ def smart_reframe_vertical(
             except Exception:
                 pass
 
-        # motion candidate
         if prev_gray is not None:
             diff = cv2.absdiff(gray, prev_gray)
             diff = cv2.GaussianBlur(diff, (9, 9), 0)
@@ -259,10 +204,8 @@ def smart_reframe_vertical(
                 x, y, w, h = cv2.boundingRect(c)
                 if w * h > 0.01 * src_w * src_h:
                     candidates.append((0.35, (x, y, w, h)))
-
         prev_gray = gray
 
-        # combine candidates into target center
         if candidates:
             weight_sum = 0.0
             cx_sum = 0.0
@@ -278,20 +221,17 @@ def smart_reframe_vertical(
             target_cx = smoothed_cx
             target_cy = smoothed_cy
 
-        # lead-room logic based on recent movement
         vel_x = target_cx - prev_target_cx
         vel_y = target_cy - prev_target_cy
         target_cx += vel_x * lead_room
-        target_cy += vel_y * lead_room * 0.35  # less aggressive vertically
+        target_cy += vel_y * lead_room * 0.35
         prev_target_cx = target_cx
         prev_target_cy = target_cy
 
-        # smoothing
         alpha = 1.0 - float(smooth_strength)
         smoothed_cx = (1 - alpha) * smoothed_cx + alpha * target_cx
         smoothed_cy = (1 - alpha) * smoothed_cy + alpha * target_cy
 
-        # build crop box
         x0 = int(round(smoothed_cx - crop_w / 2))
         y0 = int(round(smoothed_cy - crop_h / 2))
         x0 = int(_clamp(x0, 0, max_x))
@@ -309,7 +249,6 @@ def smart_reframe_vertical(
     cap.release()
     writer.release()
 
-    # pass-through / re-encode audio into final mp4 with original audio track if present
     muxed = output_path.replace('.mp4', '_muxed.mp4')
     cmd = [
         'ffmpeg', '-y', '-i', output_path, '-i', input_path,
@@ -320,91 +259,163 @@ def smart_reframe_vertical(
         shutil.move(muxed, output_path)
     return True, 'Done'
 
+# -----------------------------
+# Cloudflare Stream Live integration
+# -----------------------------
 
-def build_live_hls_command(
-    input_path: str,
-    out_dir: str,
-    fps: Optional[int] = None,
-    segment_seconds: int = DEFAULT_SEGMENT_SECONDS,
-    live_list_size: int = DEFAULT_LIVE_LIST_SIZE,
-    loop_input: bool = True,
-    target_w: int = DEFAULT_TARGET_W,
-    target_h: int = DEFAULT_TARGET_H,
-) -> tuple[list[str], str]:
-    os.makedirs(out_dir, exist_ok=True)
-    manifest = os.path.join(out_dir, 'live.m3u8')
-    segment_pattern = os.path.join(out_dir, 'live_%05d.ts')
+@dataclass
+class CFStreamConfig:
+    account_id: str
+    api_token: str
+    customer_code: str
+    prefer_low_latency: bool = True
+
+@dataclass
+class CFStreamLiveSession:
+    uid: str
+    rtmps_url: str
+    stream_key: str
+    hls_url: str
+    dash_url: str
+    ffmpeg_cmd: list[str]
+    proc: Optional[subprocess.Popen]
+    log_path: str
+    status: str
+
+
+def cfstream_config_from_inputs(account_id: str, api_token: str, customer_code: str, prefer_low_latency: bool = True) -> CFStreamConfig:
+    if not account_id:
+        raise ValueError('Cloudflare account ID is required.')
+    if not api_token:
+        raise ValueError('Cloudflare API token is required.')
+    if not customer_code:
+        raise ValueError('Cloudflare customer code is required for public playback URLs.')
+    return CFStreamConfig(account_id=account_id.strip(), api_token=api_token.strip(), customer_code=customer_code.strip(), prefer_low_latency=bool(prefer_low_latency))
+
+
+def _cf_api_request(cfg: CFStreamConfig, method: str, path: str, payload: Optional[dict] = None) -> tuple[int, dict]:
+    url = f'https://api.cloudflare.com/client/v4{path}'
+    data = None
+    headers = {
+        'Authorization': f'Bearer {cfg.api_token}',
+        'Content-Type': 'application/json',
+        'User-Agent': 'TikTok-Live-Verticalizer',
+    }
+    if payload is not None:
+        data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = resp.read().decode('utf-8')
+            parsed = json.loads(body) if body else {}
+            return resp.status, parsed
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='ignore')
+        try:
+            parsed = json.loads(body) if body else {}
+        except Exception:
+            parsed = {'success': False, 'errors': [{'message': body}]}
+        return e.code, parsed
+
+
+def create_live_input(cfg: CFStreamConfig, name: str, recording_mode: str = 'automatic') -> dict:
+    payload = {
+        'meta': {'name': name},
+        'recording': {'mode': recording_mode, 'timeoutSeconds': 0},
+        'preferLowLatency': bool(cfg.prefer_low_latency),
+        'enabled': True,
+    }
+    status, parsed = _cf_api_request(cfg, 'POST', f'/accounts/{cfg.account_id}/stream/live_inputs', payload)
+    if status not in (200, 201) or not parsed.get('success'):
+        raise RuntimeError(f'Create live input failed: {parsed}')
+    return parsed['result']
+
+
+def get_live_input(cfg: CFStreamConfig, uid: str) -> dict:
+    status, parsed = _cf_api_request(cfg, 'GET', f'/accounts/{cfg.account_id}/stream/live_inputs/{uid}')
+    if status != 200 or not parsed.get('success'):
+        raise RuntimeError(f'Get live input failed: {parsed}')
+    return parsed['result']
+
+
+def disable_live_input(cfg: CFStreamConfig, uid: str) -> None:
+    payload = {'enabled': False}
+    _cf_api_request(cfg, 'PUT', f'/accounts/{cfg.account_id}/stream/live_inputs/{uid}', payload)
+
+
+def build_public_playback_urls(cfg: CFStreamConfig, uid: str) -> tuple[str, str]:
+    base = f'https://customer-{cfg.customer_code}.cloudflarestream.com/{uid}'
+    hls = f'{base}/manifest/video.m3u8'
+    if cfg.prefer_low_latency:
+        hls += '?protocol=llhls'
+    dash = f'{base}/manifest/video.mpd'
+    return hls, dash
+
+
+def build_rtmps_push_command(reframed_mp4: str, rtmps_url: str, stream_key: str, fps: Optional[int] = None, loop_input: bool = True) -> list[str]:
+    target = rtmps_url.rstrip('/') + '/' + stream_key
     cmd = ['ffmpeg', '-y']
     if loop_input:
         cmd += ['-stream_loop', '-1']
-    cmd += ['-re', '-i', input_path]
-    if fps:
-        cmd += ['-r', str(fps)]
+    cmd += ['-re', '-i', reframed_mp4]
     gop = max((fps or 30) * 2, 48)
     cmd += [
-        '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
         '-b:v', '1400k', '-maxrate', '1498k', '-bufsize', '2100k',
         '-g', str(gop), '-keyint_min', str(gop), '-sc_threshold', '0',
         '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
-        '-f', 'hls',
-        '-hls_time', str(segment_seconds),
-        '-hls_list_size', str(live_list_size),
-        '-hls_flags', 'delete_segments+append_list+independent_segments+program_date_time',
-        '-hls_segment_filename', segment_pattern,
-        manifest,
+        '-f', 'flv', target,
     ]
-    return cmd, manifest
+    return cmd
 
 
-def start_live_job_from_reframed_file(
-    reframed_path: str,
-    asset_name: str,
-    segment_seconds: int = DEFAULT_SEGMENT_SECONDS,
-    live_list_size: int = DEFAULT_LIVE_LIST_SIZE,
-    fps: Optional[int] = None,
-    loop_input: bool = True,
-) -> LiveJob:
-    out_dir = tempfile.mkdtemp(prefix='videoforge_live_hls_origin_')
-    ensure_clean_dir(out_dir)
-    server = start_static_file_server(out_dir)
-    cmd, manifest = build_live_hls_command(
-        reframed_path, out_dir, fps=fps, segment_seconds=segment_seconds,
-        live_list_size=live_list_size, loop_input=loop_input
-    )
-    log_path = os.path.join(out_dir, 'ffmpeg_live.log')
+def start_cloudflare_live_push(cfg: CFStreamConfig, reframed_mp4: str, asset_name: str, fps: Optional[int] = None, loop_input: bool = True) -> CFStreamLiveSession:
+    live_input = create_live_input(cfg, name=safe_token(Path(asset_name).stem))
+    uid = live_input['uid']
+    rtmps_url = live_input['rtmps']['url']
+    stream_key = live_input['rtmps']['streamKey']
+    hls_url, dash_url = build_public_playback_urls(cfg, uid)
+    cmd = build_rtmps_push_command(reframed_mp4, rtmps_url, stream_key, fps=fps, loop_input=loop_input)
+    log_path = tempfile.NamedTemporaryFile(delete=False, suffix='.log').name
     log_fp = open(log_path, 'w', encoding='utf-8')
     proc = subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT, text=True)
-    manifest_url = f"{server['base_url']}/{os.path.basename(manifest)}"
-    return LiveJob(proc=proc, out_dir=out_dir, manifest_path=manifest, manifest_url=manifest_url, server_info=server, log_path=log_path, reframed_path=reframed_path)
+    return CFStreamLiveSession(uid=uid, rtmps_url=rtmps_url, stream_key=stream_key, hls_url=hls_url, dash_url=dash_url, ffmpeg_cmd=cmd, proc=proc, log_path=log_path, status='starting')
 
 
-def stop_live_job(job: Optional[LiveJob]) -> None:
-    if not job:
+def stop_cloudflare_live_push(cfg: CFStreamConfig, session: Optional[CFStreamLiveSession]) -> None:
+    if not session:
         return
     try:
-        if job.proc and job.proc.poll() is None:
-            job.proc.terminate()
+        if session.proc and session.proc.poll() is None:
+            session.proc.terminate()
             try:
-                job.proc.wait(timeout=5)
+                session.proc.wait(timeout=5)
             except Exception:
-                job.proc.kill()
+                session.proc.kill()
+    except Exception:
+        pass
+    try:
+        disable_live_input(cfg, session.uid)
     except Exception:
         pass
 
+# -----------------------------
+# Embedded player with LIVE UX preserved
+# -----------------------------
 
-def build_live_player_html(manifest_url: str, title: str = 'TikTok-style vertical live', autoplay: bool = True, muted: bool = True) -> str:
+def build_cloudflare_live_player_html(hls_url: str, title: str = 'TikTok-style vertical live on Cloudflare', autoplay: bool = True, muted: bool = True) -> str:
     autoplay_str = 'true' if autoplay else 'false'
     muted_attr = 'muted' if muted else ''
     return f"""
 <div style='font-family:Inter,Segoe UI,Arial,sans-serif;background:#0f172a;color:#e2e8f0;border:1px solid #e5e7eb;border-radius:16px;padding:16px;'>
   <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;'>
     <div>
-      <div style='font-size:12px;color:#93c5fd;text-transform:uppercase;letter-spacing:.08em;'>Live vertical player</div>
+      <div style='font-size:12px;color:#93c5fd;text-transform:uppercase;letter-spacing:.08em;'>Cloudflare Stream Live</div>
       <div style='font-size:20px;font-weight:700;'>{title}</div>
-      <div style='font-size:12px;color:#94a3b8;word-break:break-all;'>{manifest_url}</div>
+      <div style='font-size:12px;color:#94a3b8;word-break:break-all;'>{hls_url}</div>
     </div>
     <div style='display:flex; gap:8px; align-items:center;'>
-      <div id='liveBadge' style='padding:6px 10px; border-radius:999px; background:#7f1d1d; color:#fee2e2; font-weight:700;'>LIVE</div>
+      <div style='padding:6px 10px; border-radius:999px; background:#7f1d1d; color:#fee2e2; font-weight:700;'>LIVE</div>
       <button id='goLiveBtn' style='padding:8px 12px; border-radius:10px; border:none; background:#1d4ed8; color:#eff6ff; cursor:pointer;'>Go live</button>
     </div>
   </div>
@@ -425,7 +436,7 @@ def build_live_player_html(manifest_url: str, title: str = 'TikTok-style vertica
 <script src='https://cdn.jsdelivr.net/npm/hls.js@latest'></script>
 <script>
 (function() {{
-  const manifestUrl = {json.dumps(manifest_url)};
+  const manifestUrl = {json.dumps(hls_url)};
   const video = document.getElementById('video');
   const elState = document.getElementById('state');
   const elLatency = document.getElementById('latency');
@@ -448,9 +459,7 @@ def build_live_player_html(manifest_url: str, title: str = 'TikTok-style vertica
       }}
     }}
     elBuffer.textContent = bufferAhead.toFixed(1) + ' s';
-    if (hls && typeof hls.latency === 'number') {{
-      elLatency.textContent = hls.latency.toFixed(1) + ' s';
-    }}
+    if (hls && typeof hls.latency === 'number') elLatency.textContent = hls.latency.toFixed(1) + ' s';
   }}
   function goLive(hls) {{
     if (hls && typeof hls.liveSyncPosition === 'number' && !Number.isNaN(hls.liveSyncPosition)) {{
