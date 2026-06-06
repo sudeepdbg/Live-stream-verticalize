@@ -7,11 +7,15 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
+import threading
 import time
 import zipfile
 from dataclasses import dataclass
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -41,6 +45,8 @@ CODEC_PRESETS = {
     "HEVC (H.265)": ("libx265", ["-preset", "fast"]),
     "AV1": ("libaom-av1", ["-b:v", "0", "-cpu-used", "8", "-tile-columns", "2", "-threads", "4", "-usage", "realtime"]),
 }
+
+_HTTP_SERVERS: dict[str, dict] = {}
 
 
 def ffmpeg_ok() -> bool:
@@ -97,6 +103,45 @@ def _to_even(v: int) -> int:
 
 def _gop_for_fps(fps: Optional[int]) -> int:
     return max((fps or DEFAULT_GOP_FPS) * 2, 48)
+
+
+def _find_free_port(host: str = "127.0.0.1") -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+
+
+def start_static_file_server(directory: str, host: str = "127.0.0.1", port: Optional[int] = None) -> dict:
+    key = os.path.abspath(directory)
+    existing = _HTTP_SERVERS.get(key)
+    if existing:
+        return existing
+    port = port or _find_free_port(host)
+    handler = partial(SimpleHTTPRequestHandler, directory=directory)
+    httpd = ThreadingHTTPServer((host, port), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    server_info = {"directory": key, "host": host, "port": port, "base_url": f"http://{host}:{port}", "server": httpd, "thread": thread}
+    _HTTP_SERVERS[key] = server_info
+    return server_info
+
+
+def stop_static_file_server(directory: str) -> None:
+    key = os.path.abspath(directory)
+    info = _HTTP_SERVERS.pop(key, None)
+    if not info:
+        return
+    try:
+        info["server"].shutdown()
+        info["server"].server_close()
+    except Exception:
+        pass
+
+
+def serve_manifest_url(directory: str, manifest_path: str) -> str:
+    server = start_static_file_server(directory)
+    manifest_name = os.path.basename(manifest_path)
+    return f"{server['base_url']}/{manifest_name}"
 
 
 def probe(path: str) -> dict:
@@ -217,7 +262,7 @@ def build_player_analytics_html(meta: dict, source_label: str = "Source") -> str
       <div style='font-size:20px; font-weight:700;'>__SOURCE__</div>
       <div style='font-size:12px; color:#94a3b8;'>__WIDTH__×__HEIGHT__ · __FPS__ fps · source bitrate ~__BITRATE__ kbps</div>
     </div>
-    <div style='padding:6px 10px; border-radius:999px; background:#14532d; color:#dcfce7; font-size:12px;'>ABR stable</div>
+    <div style='padding:6px 10px; border-radius:999px; background:#14532d; color:#dcfce7; font-size:12px;'>ABR simulator</div>
   </div>
   <div style='display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-bottom:14px;'>
     <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>Bandwidth</div><div id='bw' style='font-size:22px; font-weight:700;'>4.9 Mbps</div></div>
@@ -276,6 +321,143 @@ setInterval(function() {
     html = html.replace("__ACTIVE__", active)
     html = html.replace("__LADDER__", json.dumps([{"label": x[0], "bps": x[1]} for x in ladder]))
     return html
+
+
+def build_hlsjs_player_html(manifest_url: str, title: str = "HLS playback", autoplay: bool = False, muted: bool = True, low_latency: bool = True) -> str:
+    autoplay_str = "true" if autoplay else "false"
+    muted_str = "true" if muted else "false"
+    low_latency_str = "true" if low_latency else "false"
+    return f"""
+<div style='font-family: Inter, Segoe UI, Arial, sans-serif; border:1px solid #e5e7eb; border-radius:16px; padding:16px; background:#0f172a; color:#e2e8f0;'>
+  <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;'>
+    <div>
+      <div style='font-size:12px; color:#93c5fd; text-transform:uppercase; letter-spacing:.08em;'>In-app HLS Playback</div>
+      <div style='font-size:20px; font-weight:700;'>{title}</div>
+      <div style='font-size:12px; color:#94a3b8; word-break:break-all;'>{manifest_url}</div>
+    </div>
+    <div style='padding:6px 10px; border-radius:999px; background:#172554; color:#dbeafe; font-size:12px;'>served immediately over local HTTP</div>
+  </div>
+  <video id='video' controls playsinline style='width:100%; max-height:560px; background:#000; border-radius:12px;' {'muted' if muted else ''}></video>
+  <div style='display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-top:14px;'>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>State</div><div id='state' style='font-size:22px; font-weight:700;'>initialising</div></div>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>Current level</div><div id='level' style='font-size:22px; font-weight:700;'>-</div></div>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>Buffer ahead</div><div id='buffer' style='font-size:22px; font-weight:700;'>0.0 s</div></div>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>Dropped frames</div><div id='drops' style='font-size:22px; font-weight:700;'>0</div></div>
+  </div>
+  <div style='display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin-top:10px;'>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>Latency to live edge</div><div id='latency' style='font-size:20px; font-weight:700;'>0.0 s</div></div>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>Playback rate</div><div id='rate' style='font-size:20px; font-weight:700;'>1.00×</div></div>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>Stream events</div><div id='events' style='font-size:20px; font-weight:700;'>0</div></div>
+  </div>
+  <div style='background:#111827; border-radius:12px; padding:12px; margin-top:14px;'>
+    <div style='font-size:13px; font-weight:600; margin-bottom:8px;'>Player event log</div>
+    <div id='log' style='font-size:12px; line-height:1.6; color:#cbd5e1; max-height:160px; overflow:auto;'>Booting HLS.js…</div>
+  </div>
+</div>
+<script src='https://cdn.jsdelivr.net/npm/hls.js@latest'></script>
+<script>
+(function() {{
+  const manifestUrl = {json.dumps(manifest_url)};
+  const video = document.getElementById('video');
+  const elState = document.getElementById('state');
+  const elLevel = document.getElementById('level');
+  const elBuffer = document.getElementById('buffer');
+  const elDrops = document.getElementById('drops');
+  const elLatency = document.getElementById('latency');
+  const elRate = document.getElementById('rate');
+  const elEvents = document.getElementById('events');
+  const elLog = document.getElementById('log');
+  let eventCount = 0;
+  function pushLog(msg) {{
+    eventCount += 1;
+    elEvents.textContent = String(eventCount);
+    const now = new Date().toLocaleTimeString();
+    elLog.innerHTML = '[' + now + '] ' + msg + '<br/>' + elLog.innerHTML.split('<br/>').slice(0,10).join('<br/>');
+  }}
+  function updateMetrics() {{
+    let bufferAhead = 0;
+    if (video.buffered && video.buffered.length) {{
+      for (let i = 0; i < video.buffered.length; i++) {{
+        if (video.buffered.start(i) <= video.currentTime && video.currentTime <= video.buffered.end(i)) {{
+          bufferAhead = video.buffered.end(i) - video.currentTime;
+          break;
+        }}
+      }}
+    }}
+    elBuffer.textContent = bufferAhead.toFixed(1) + ' s';
+    elRate.textContent = video.playbackRate.toFixed(2) + '×';
+    try {{
+      const quality = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
+      if (quality && typeof quality.droppedVideoFrames === 'number') {{
+        elDrops.textContent = String(quality.droppedVideoFrames);
+      }}
+    }} catch (e) {{}}
+    if (window.hls && typeof window.hls.latency === 'number') {{
+      elLatency.textContent = window.hls.latency.toFixed(1) + ' s';
+    }}
+  }}
+
+  if (Hls.isSupported()) {{
+    const hls = new Hls({{
+      lowLatencyMode: {low_latency_str},
+      backBufferLength: 90,
+      liveSyncDurationCount: 2,
+      liveMaxLatencyDurationCount: 4,
+      maxLiveSyncPlaybackRate: 1.2,
+      enableWorker: true,
+    }});
+    window.hls = hls;
+    hls.loadSource(manifestUrl);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MEDIA_ATTACHED, function() {{
+      elState.textContent = 'media attached';
+      pushLog('Media attached');
+      if ({autoplay_str}) video.play().catch(() => {{}});
+    }});
+    hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {{
+      elState.textContent = 'manifest parsed';
+      pushLog('Manifest parsed with ' + data.levels.length + ' levels');
+      if ({autoplay_str}) video.play().catch(() => {{}});
+    }});
+    hls.on(Hls.Events.LEVEL_SWITCHED, function(event, data) {{
+      const level = hls.levels[data.level];
+      const label = level ? ((level.height || '?') + 'p @ ' + Math.round((level.bitrate || 0)/1000) + ' kbps') : String(data.level);
+      elLevel.textContent = label;
+      pushLog('Level switched to ' + label);
+    }});
+    hls.on(Hls.Events.FRAG_BUFFERED, function() {{
+      elState.textContent = video.paused ? 'buffered / paused' : 'playing';
+      updateMetrics();
+    }});
+    hls.on(Hls.Events.ERROR, function(event, data) {{
+      pushLog('HLS error: ' + data.type + ' | ' + data.details);
+      elState.textContent = data.fatal ? 'fatal error' : 'recoverable error';
+      if (data.fatal) {{
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+        else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+      }}
+    }});
+  }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+    video.src = manifestUrl;
+    elState.textContent = 'native HLS';
+    pushLog('Using native HLS playback');
+    if ({autoplay_str}) video.play().catch(() => {{}});
+  }} else {{
+    elState.textContent = 'unsupported';
+    pushLog('This browser does not support HLS playback');
+  }}
+
+  ['play','pause','waiting','playing','seeking','stalled','ended','loadedmetadata'].forEach(function(evt) {{
+    video.addEventListener(evt, function() {{
+      elState.textContent = evt;
+      pushLog('Video event: ' + evt);
+      updateMetrics();
+    }});
+  }});
+  setInterval(updateMetrics, 1000);
+}})();
+</script>
+"""
 
 
 def build_enhance_filters(settings: dict, src_meta: dict) -> list[str]:
@@ -507,6 +689,8 @@ class BuildHlsResult:
     zip_bytes: bytes | None
     ffmpeg_log: str
     ladder: list[dict]
+    manifest_url: str | None = None
+    server_info: dict | None = None
 
 
 def build_vod_hls_package(input_source: str, asset_name: str, aspect_label: str, preset: str, fps: Optional[int], segment_seconds: int, abr_enabled: bool, src_meta: Optional[dict] = None) -> BuildHlsResult:
@@ -522,7 +706,12 @@ def build_vod_hls_package(input_source: str, asset_name: str, aspect_label: str,
         ladder = []
     ok, msg, ffmpeg_log = run_ffmpeg(cmd)
     zbytes = zip_dir_bytes(out_dir) if ok else None
-    return BuildHlsResult(ok=ok, message=msg, out_dir=out_dir, master_manifest=master_manifest, zip_bytes=zbytes, ffmpeg_log=ffmpeg_log, ladder=ladder)
+    manifest_url = None
+    server_info = None
+    if ok:
+        server_info = start_static_file_server(out_dir)
+        manifest_url = f"{server_info['base_url']}/{os.path.basename(master_manifest)}"
+    return BuildHlsResult(ok=ok, message=msg, out_dir=out_dir, master_manifest=master_manifest, zip_bytes=zbytes, ffmpeg_log=ffmpeg_log, ladder=ladder, manifest_url=manifest_url, server_info=server_info)
 
 
 def start_live_hls_job(input_source: str, aspect_label: str, preset: str, fps: Optional[int], segment_seconds: int, list_size: int, abr_enabled: bool, src_meta: Optional[dict] = None) -> tuple[dict, list[dict]]:
@@ -537,5 +726,7 @@ def start_live_hls_job(input_source: str, aspect_label: str, preset: str, fps: O
         ladder = []
     log_path = os.path.join(out_dir, "ffmpeg_live.log")
     log_fp = open(log_path, "w", encoding="utf-8")
+    server_info = start_static_file_server(out_dir)
     proc = subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT, text=True)
-    return {"proc": proc, "out_dir": out_dir, "master_manifest": master_manifest, "log_path": log_path, "input_source": input_source, "abr_enabled": abr_enabled}, ladder
+    manifest_url = f"{server_info['base_url']}/{os.path.basename(master_manifest)}"
+    return {"proc": proc, "out_dir": out_dir, "master_manifest": master_manifest, "manifest_url": manifest_url, "server_info": server_info, "log_path": log_path, "input_source": input_source, "abr_enabled": abr_enabled}, ladder
