@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import os
@@ -36,13 +37,13 @@ st.markdown("""
   <div style='display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;'>
     <div>
       <div class='vf-title'>VideoForge Studio</div>
-      <div class='vf-subtitle'>Streamlit + GitHub publication layer + Cloudflare Pages Git integration. Streamlit generates HLS, publishes files into a GitHub repo path via the GitHub API, and Cloudflare Pages auto-deploys the repo to a public HLS URL.</div>
+      <div class='vf-subtitle'>New final version: Streamlit + GitHub atomic publication + Cloudflare Pages. The app generates HLS, writes the full HLS package into GitHub as ONE commit, optionally calls a Deploy Hook, then waits for the manifest URL to become reachable.</div>
     </div>
     <div>
+      <span class='vf-chip'>Atomic single commit</span>
       <span class='vf-chip'>No Wrangler</span>
-      <span class='vf-chip'>Cloudflare Pages Git integration</span>
-      <span class='vf-chip'>GitHub Contents API</span>
-      <span class='vf-chip'>HLS.js embedded player</span>
+      <span class='vf-chip'>Optional Deploy Hook</span>
+      <span class='vf-chip'>Manifest readiness check</span>
     </div>
   </div>
 </div>
@@ -52,8 +53,8 @@ if not backend.ffmpeg_ok():
     st.error('FFmpeg / ffprobe not found. Add ffmpeg to your runtime and redeploy.')
     st.stop()
 
-st.subheader('📡 Upload file → GitHub repo path → Cloudflare Pages → HLS.js playback')
-st.info('This version works inside Streamlit Cloud because it uses pure Python HTTPS calls to the GitHub API. Cloudflare Pages must already be connected to the same repository via Git integration.')
+st.subheader('📡 Upload file → Atomic GitHub publish → Cloudflare Pages → HLS.js playback')
+st.info('This version solves the previous partial-deploy issue by publishing the entire HLS package into GitHub as a SINGLE commit instead of many file-by-file commits.')
 
 st.markdown('### 1) GitHub + Cloudflare Pages settings')
 g1, g2 = st.columns(2)
@@ -67,11 +68,12 @@ with g2:
     default_branch = st.text_input('Default branch (for branch creation fallback)', value=os.getenv('GITHUB_DEFAULT_BRANCH', 'main'))
     folder_prefix = st.text_input('Repository folder prefix', value=os.getenv('GITHUB_FOLDER_PREFIX', 'public/hls'))
     deploy_hook_url = st.text_input('Optional Cloudflare Deploy Hook URL', value=os.getenv('CF_PAGES_DEPLOY_HOOK', ''), placeholder='https://api.cloudflare.com/client/v4/pages/webhooks/deploy_hooks/...')
+wait_timeout = st.slider('Manifest wait timeout (seconds)', 30, 300, int(os.getenv('MANIFEST_WAIT_TIMEOUT', '150')), 10)
 
 gh_cfg = None
 if owner and repo and token and target_branch and pages_base_url:
     try:
-        gh_cfg = backend.github_config_from_inputs(owner, repo, token, target_branch, pages_base_url, folder_prefix, default_branch, deploy_hook_url)
+        gh_cfg = backend.github_config_from_inputs(owner, repo, token, target_branch, pages_base_url, folder_prefix, default_branch, deploy_hook_url, wait_timeout)
         st.success('GitHub + Pages configuration looks valid.')
     except Exception as exc:
         st.error(str(exc))
@@ -102,7 +104,7 @@ if uploaded:
         st.session_state.meta = backend.probe(st.session_state.input_path)
         st.session_state.result = None
 else:
-    st.caption('Upload a file to generate HLS and publish it into GitHub for Cloudflare Pages to serve.')
+    st.caption('Upload a file to generate HLS and publish it atomically into GitHub for Cloudflare Pages to serve.')
     st.stop()
 
 meta = st.session_state.meta
@@ -111,10 +113,10 @@ size_mb = os.path.getsize(src_path) / (1024 * 1024)
 st.caption(f"Source: {meta['width']}×{meta['height']} @ {meta['fps']} fps · {meta['duration']:.1f}s · {meta['vcodec'].upper()}")
 
 disabled = (gh_cfg is None)
-if st.button('🎬 Generate HLS + Publish via GitHub', type='primary', disabled=disabled):
-    with st.spinner('FFmpeg is generating HLS and the app is publishing the files into GitHub...'):
+if st.button('🎬 Generate HLS + Atomic Publish via GitHub', type='primary', disabled=disabled):
+    with st.spinner('FFmpeg is generating HLS. Then the app will publish the full package into GitHub as one commit and wait for the manifest to become reachable...'):
         fps_value = None if target_fps == 'Source' else int(target_fps)
-        st.session_state.result = backend.package_and_publish_via_github(src_path, uploaded.name, aspect, preset, fps_value, segment_seconds, gh_cfg, meta)
+        st.session_state.result = backend.package_and_publish_via_github_atomic(src_path, uploaded.name, aspect, preset, fps_value, segment_seconds, gh_cfg, meta)
 
 result = st.session_state.result
 left, right = st.columns([2, 3], gap='large')
@@ -141,17 +143,21 @@ with left:
     st.markdown('**🧾 Publish status**')
     st.metric('FFmpeg available', 'Yes' if backend.ffmpeg_ok() else 'No')
     if result:
-        st.metric('GitHub publish status', 'Success' if result.ok else 'Failed')
+        st.metric('Atomic publish status', 'Success' if result.ok else 'Needs attention')
         if result.repo_path_prefix:
             st.caption(f"Repository path: {result.repo_path_prefix}")
+        if result.manifest_url:
+            st.caption(f"Manifest URL: {result.manifest_url}")
         with st.expander('FFmpeg log'):
             st.code(result.ffmpeg_log or '(empty)', language='bash')
-        with st.expander('GitHub publish log'):
+        with st.expander('GitHub atomic publish log'):
             st.code(result.github_log or '(empty)', language='bash')
         with st.expander('Cloudflare Deploy Hook log'):
             st.code(result.deploy_hook_log or '(empty)', language='bash')
+        with st.expander('Manifest readiness log'):
+            st.code(result.readiness_log or '(empty)', language='bash')
         if result.zip_bytes:
-            st.download_button('⬇ Download generated HLS bundle (.zip)', data=result.zip_bytes, file_name='github_pages_hls_bundle.zip', mime='application/zip')
+            st.download_button('⬇ Download generated HLS bundle (.zip)', data=result.zip_bytes, file_name='github_pages_hls_bundle_atomic.zip', mime='application/zip')
         if result.ladder:
             st.markdown('### Active ladder')
             st.dataframe(pd.DataFrame([{ 'Variant': x['name'], 'Resolution': f"{x['width']}×{x['height']}", 'Video bitrate': x['video_bitrate'], 'Max rate': x['maxrate'], 'Audio bitrate': x['audio_bitrate'], 'Bandwidth': x['bandwidth']} for x in result.ladder]), use_container_width=True, hide_index=True)
@@ -163,10 +169,9 @@ with right:
     st.markdown('**▶ Public HLS.js Playback**')
     if result and result.manifest_url:
         st.code(result.manifest_url)
-        st.caption('Note: if Cloudflare Pages has not finished rebuilding yet, wait a short while and refresh the page.')
         components.html(backend.build_hlsjs_player_html(result.manifest_url, title=f'{aspect} Pages playback', autoplay=True, muted=True, low_latency=True), height=980, scrolling=True)
     else:
-        st.caption('Public `master.m3u8` URL appears here after GitHub publication completes.')
+        st.caption('Public `master.m3u8` URL appears here after publication completes.')
     st.markdown('</div>', unsafe_allow_html=True)
     st.markdown("<div class='vf-card'>", unsafe_allow_html=True)
     st.markdown('**📡 Playback analytics companion**')
@@ -174,5 +179,5 @@ with right:
     st.markdown('</div>', unsafe_allow_html=True)
 
 st.divider()
-st.markdown('### How this version works')
-st.markdown('- FFmpeg generates ABR HLS locally inside Streamlit Cloud.\n- The app publishes the generated files into your GitHub repository using the GitHub REST API.\n- Cloudflare Pages Git integration automatically deploys the repo content for the target branch.\n- The player uses your configured Pages base URL plus the published repository folder path to build the `master.m3u8` URL.\n- Optional: if you provide a Cloudflare Deploy Hook, the app also triggers a rebuild explicitly after publication.')
+st.markdown('### Why this final version is more reliable')
+st.markdown('- The previous version updated files one-by-one in GitHub, which could trigger Cloudflare Pages while the package was still incomplete.\n- This final version creates all Git blobs, builds a tree, creates a single commit, and updates the branch reference once.\n- Cloudflare Pages therefore sees one coherent commit instead of many partial commits.\n- Optional Deploy Hook support is still available.\n- The app also waits for the public manifest URL to become reachable before reporting success.')
