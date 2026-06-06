@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import io
@@ -67,7 +66,6 @@ def ffmpeg_ok() -> bool:
 
 
 def wrangler_ok() -> bool:
-    # Accept either wrangler or npx+wrangler in Node environments.
     try:
         subprocess.run(["npx", "wrangler", "--version"], capture_output=True, check=True, timeout=20)
         return True
@@ -125,6 +123,19 @@ def _gop_for_fps(fps: Optional[int]) -> int:
     return max((fps or 24) * 2, 48)
 
 
+def format_audio_codec(codec: str) -> str:
+    mapping = {"aac": "AAC", "mp3": "MP3", "opus": "Opus", "vorbis": "Vorbis", "ac3": "AC-3", "eac3": "E-AC-3", "flac": "FLAC", "pcm_s16le": "PCM 16-bit", "alac": "ALAC"}
+    return mapping.get(codec, (codec or "unknown").upper())
+
+
+def format_sample_rate(sr: int) -> str:
+    return f"{sr // 1000} kHz" if sr >= 1000 else f"{sr} Hz"
+
+
+def format_channels(ch: int) -> str:
+    return {1: "Mono", 2: "Stereo", 6: "5.1", 8: "7.1"}.get(ch, f"{ch} ch")
+
+
 def probe(path: str) -> dict:
     res = {
         "duration": 0.0,
@@ -175,8 +186,12 @@ def ladder_dimensions(aspect_label: str, rung: int, src_meta: Optional[dict] = N
     if aspect_label == "Source / Passthrough" and src_meta and src_meta.get("width") and src_meta.get("height"):
         sw, sh = int(src_meta["width"]), int(src_meta["height"])
         if sw >= sh:
-            h = rung; w = _to_even(round(h * sw / sh)); return w, _to_even(h)
-        w = rung; h = _to_even(round(w * sh / sw)); return _to_even(w), h
+            h = rung
+            w = _to_even(round(h * sw / sh))
+            return w, _to_even(h)
+        w = rung
+        h = _to_even(round(w * sh / sw))
+        return _to_even(w), h
     per_aspect = {
         "16:9 Landscape": {360: (640, 360), 540: (960, 540)},
         "9:16 Vertical": {360: (360, 640), 540: (540, 960)},
@@ -192,15 +207,15 @@ def build_abr_ladder(aspect_label: str, src_meta: Optional[dict] = None) -> list
     ladder = []
     for rung in ABR_RUNGS:
         width, height = ladder_dimensions(aspect_label, rung, src_meta=src_meta)
-        settings = ABR_RUNG_SETTINGS[rung]
-        vbps = int(re.sub(r"[^0-9]", "", settings["video_bitrate"])) * 1000
-        abps = int(re.sub(r"[^0-9]", "", settings["audio_bitrate"])) * 1000
+        s = ABR_RUNG_SETTINGS[rung]
+        vbps = int(re.sub(r"[^0-9]", "", s["video_bitrate"])) * 1000
+        abps = int(re.sub(r"[^0-9]", "", s["audio_bitrate"])) * 1000
         ladder.append({
             "name": f"{rung}p",
             "rung": rung,
             "width": width,
             "height": height,
-            **settings,
+            **s,
             "bandwidth": vbps + abps,
             "avg_bandwidth": vbps,
         })
@@ -241,12 +256,12 @@ def build_multi_variant_vod_hls_cmd(input_source: str, out_dir: str, aspect_labe
             f"-ar:a:{idx}", "48000",
             f"-ac:a:{idx}", "2",
         ]
-    master_name = "master.m3u8"
+    master = os.path.join(out_dir, "master.m3u8")
     segment_pattern = os.path.join(out_dir, "%v_%06d.ts")
     playlist_pattern = os.path.join(out_dir, "%v.m3u8")
     var_stream_map = " ".join(f"v:{idx},a:{idx},name:{variant['name']}" for idx, variant in enumerate(ladder))
     cmd += [
-        "-master_pl_name", master_name,
+        "-master_pl_name", "master.m3u8",
         "-f", "hls",
         "-hls_time", str(segment_seconds),
         "-hls_playlist_type", "vod",
@@ -256,7 +271,7 @@ def build_multi_variant_vod_hls_cmd(input_source: str, out_dir: str, aspect_labe
         "-var_stream_map", var_stream_map,
         playlist_pattern,
     ]
-    return cmd, ladder, os.path.join(out_dir, master_name)
+    return cmd, ladder, master
 
 
 def run_ffmpeg(cmd: list[str], timeout: Optional[int] = None) -> tuple[bool, str, str]:
@@ -306,11 +321,106 @@ def build_branch_name(cf: CloudflareConfig, asset_name: str) -> str:
     return safe_branch(f"{cf.branch_prefix}-{base}-{int(time.time())}")
 
 
+def build_player_analytics_html(meta: dict, source_label: str = "Source") -> str:
+    width = int(meta.get("width", 1920) or 1920)
+    height = int(meta.get("height", 1080) or 1080)
+    fps = float(meta.get("fps", 30.0) or 30.0)
+    bitrate = int(meta.get("vbitrate_kbps", 4000) or 4000)
+    html = f"""
+<div style='font-family: Inter, Segoe UI, Arial, sans-serif; border:1px solid #e5e7eb; border-radius:16px; padding:16px; background:#0f172a; color:#e2e8f0;'>
+  <div style='font-size:12px; color:#93c5fd; text-transform:uppercase; letter-spacing:.08em;'>Playback Analytics</div>
+  <div style='font-size:20px; font-weight:700; margin-bottom:8px;'>{source_label}</div>
+  <div style='font-size:12px; color:#94a3b8;'>{width}×{height} · {fps:.2f} fps · bitrate ~{bitrate} kbps</div>
+</div>
+"""
+    return html
+
+
+def build_hlsjs_player_html(manifest_url: str, title: str = "HLS playback", autoplay: bool = True, muted: bool = True, low_latency: bool = True) -> str:
+    autoplay_str = "true" if autoplay else "false"
+    low_latency_str = "true" if low_latency else "false"
+    muted_attr = "muted" if muted else ""
+    return f"""
+<div style='font-family: Inter, Segoe UI, Arial, sans-serif; border:1px solid #e5e7eb; border-radius:16px; padding:16px; background:#0f172a; color:#e2e8f0;'>
+  <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;'>
+    <div>
+      <div style='font-size:12px; color:#93c5fd; text-transform:uppercase; letter-spacing:.08em;'>Embedded HLS.js Playback</div>
+      <div style='font-size:20px; font-weight:700;'>{title}</div>
+      <div style='font-size:12px; color:#94a3b8; word-break:break-all;'>{manifest_url}</div>
+    </div>
+  </div>
+  <video id='video' controls playsinline {muted_attr} style='width:100%; max-height:560px; background:#000; border-radius:12px;'></video>
+  <div style='display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-top:14px;'>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>State</div><div id='state' style='font-size:22px; font-weight:700;'>booting</div></div>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>Current level</div><div id='level' style='font-size:22px; font-weight:700;'>-</div></div>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>Buffer ahead</div><div id='buffer' style='font-size:22px; font-weight:700;'>0.0 s</div></div>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>Dropped frames</div><div id='drops' style='font-size:22px; font-weight:700;'>0</div></div>
+  </div>
+  <div style='background:#111827; border-radius:12px; padding:12px; margin-top:14px;'>
+    <div style='font-size:13px; font-weight:600; margin-bottom:8px;'>Event log</div>
+    <div id='log' style='font-size:12px; line-height:1.6; color:#cbd5e1; max-height:180px; overflow:auto;'>Waiting for manifest…</div>
+  </div>
+</div>
+<script src='https://cdn.jsdelivr.net/npm/hls.js@latest'></script>
+<script>
+(function() {{
+  const manifestUrl = {json.dumps(manifest_url)};
+  const video = document.getElementById('video');
+  const elState = document.getElementById('state');
+  const elLevel = document.getElementById('level');
+  const elBuffer = document.getElementById('buffer');
+  const elDrops = document.getElementById('drops');
+  const elLog = document.getElementById('log');
+  function pushLog(msg) {{
+    const now = new Date().toLocaleTimeString();
+    elLog.innerHTML = '[' + now + '] ' + msg + '<br/>' + elLog.innerHTML.split('<br/>').slice(0,10).join('<br/>');
+  }}
+  function updateMetrics() {{
+    let bufferAhead = 0;
+    if (video.buffered && video.buffered.length) {{
+      for (let i = 0; i < video.buffered.length; i++) {{
+        if (video.buffered.start(i) <= video.currentTime && video.currentTime <= video.buffered.end(i)) {{
+          bufferAhead = video.buffered.end(i) - video.currentTime;
+          break;
+        }}
+      }}
+    }}
+    elBuffer.textContent = bufferAhead.toFixed(1) + ' s';
+    try {{
+      const q = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
+      if (q && typeof q.droppedVideoFrames === 'number') elDrops.textContent = String(q.droppedVideoFrames);
+    }} catch (e) {{}}
+  }}
+  if (Hls.isSupported()) {{
+    const hls = new Hls({{ lowLatencyMode: {low_latency_str}, enableWorker: true }});
+    hls.loadSource(manifestUrl);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MEDIA_ATTACHED, function() {{ elState.textContent = 'media attached'; pushLog('Media attached'); }});
+    hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {{ elState.textContent = 'manifest parsed'; pushLog('Manifest parsed with ' + data.levels.length + ' level(s)'); if ({autoplay_str}) video.play().catch(() => {{}}); }});
+    hls.on(Hls.Events.LEVEL_SWITCHED, function(event, data) {{ const level = hls.levels[data.level]; elLevel.textContent = level ? ((level.height || '?') + 'p') : String(data.level); pushLog('Level switched'); }});
+    hls.on(Hls.Events.ERROR, function(event, data) {{ pushLog('HLS error: ' + data.type + ' | ' + data.details); elState.textContent = data.fatal ? 'fatal error' : 'recoverable error'; if (data.fatal) {{ if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad(); else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError(); }} }});
+  }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+    video.src = manifestUrl;
+    elState.textContent = 'native HLS';
+    if ({autoplay_str}) video.play().catch(() => {{}});
+  }} else {{
+    elState.textContent = 'unsupported';
+    pushLog('Browser does not support HLS playback');
+  }}
+  ['play','pause','waiting','playing','seeking','stalled','ended','loadedmetadata','canplay'].forEach(function(evt) {{
+    video.addEventListener(evt, function() {{ elState.textContent = evt; pushLog('Video event: ' + evt); updateMetrics(); }});
+  }});
+  setInterval(updateMetrics, 1000);
+}})();
+</script>
+"""
+
+
 def package_and_deploy_vod_to_pages(input_source: str, asset_name: str, aspect_label: str, preset: str, fps: Optional[int], segment_seconds: int, cf: CloudflareConfig, src_meta: Optional[dict] = None) -> DeployResult:
     out_dir = tempfile.mkdtemp(prefix="videoforge_pages_hls_")
     ensure_clean_dir(out_dir)
-    ffmpeg_cmd, ladder, manifest_path = build_multi_variant_vod_hls_cmd(input_source=input_source, out_dir=out_dir, aspect_label=aspect_label, preset=preset, fps=fps, segment_seconds=segment_seconds, src_meta=src_meta)
-    ffmpeg_ok, ffmpeg_msg, ffmpeg_log = run_ffmpeg(ffmpeg_cmd)
+    cmd, ladder, manifest_path = build_multi_variant_vod_hls_cmd(input_source=input_source, out_dir=out_dir, aspect_label=aspect_label, preset=preset, fps=fps, segment_seconds=segment_seconds, src_meta=src_meta)
+    ffmpeg_ok, ffmpeg_msg, ffmpeg_log = run_ffmpeg(cmd)
     if not ffmpeg_ok:
         return DeployResult(False, ffmpeg_msg, out_dir, manifest_path, None, None, None, ffmpeg_log, "", ladder, None)
     branch_alias = None if cf.use_production_branch else build_branch_name(cf, asset_name)
