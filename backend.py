@@ -1,71 +1,48 @@
 
 from __future__ import annotations
 
-import base64
-import io
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
+import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import zipfile
 from dataclasses import dataclass
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 
-MAX_UPLOAD_MB = 300
-DEFAULT_SEGMENT_SECONDS = 4  # fewer segments → fewer files and more stable prototype publishing
-ABR_RUNGS = (360, 540)
+import cv2
+import numpy as np
 
-ASPECT_PRESETS = {
-    "16:9 Landscape": (16, 9),
-    "9:16 Vertical": (9, 16),
-    "1:1 Square": (1, 1),
-    "4:5 Portrait": (4, 5),
-    "3:4 Portrait": (3, 4),
-    "Source / Passthrough": None,
-}
+DEFAULT_TARGET_W = 540
+DEFAULT_TARGET_H = 960
+DEFAULT_SEGMENT_SECONDS = 2
+DEFAULT_LIVE_LIST_SIZE = 4
+DEFAULT_TRANSITION_SEC = 0.35
+MAX_UPLOAD_MB = 400
 
-ABR_RUNG_SETTINGS = {
-    360: {"video_bitrate": "800k", "maxrate": "856k", "bufsize": "1200k", "audio_bitrate": "96k"},
-    540: {"video_bitrate": "1400k", "maxrate": "1498k", "bufsize": "2100k", "audio_bitrate": "96k"},
-}
+ASPECT_PRESETS = [
+    "9:16 Vertical (TikTok Live)",
+]
+
+_HTTP_SERVERS: dict[str, dict] = {}
 
 @dataclass
-class GitHubConfig:
-    owner: str
-    repo: str
-    token: str
-    target_branch: str
-    pages_base_url: str
-    folder_prefix: str = "public/hls"
-    default_branch: str = "main"
-    deploy_hook_url: str | None = None
-    wait_timeout_seconds: int = 150
-
-@dataclass
-class PublishResult:
-    ok: bool
-    message: str
+class LiveJob:
+    proc: subprocess.Popen
     out_dir: str
-    manifest_path: str | None
-    manifest_url: str | None
-    repo_path_prefix: str | None
-    zip_bytes: bytes | None
-    ffmpeg_log: str
-    github_log: str
-    deploy_hook_log: str
-    readiness_log: str
-    ladder: list[dict]
+    manifest_path: str
+    manifest_url: str
+    server_info: dict
+    log_path: str
+    reframed_path: str | None
 
-# -----------------------------
-# Local media helpers
-# -----------------------------
+
 def ffmpeg_ok() -> bool:
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=5)
@@ -75,16 +52,11 @@ def ffmpeg_ok() -> bool:
         return False
 
 
-def safe_token(value: str) -> str:
-    value = value or "stream"
-    return re.sub(r"[^A-Za-z0-9._/-]+", "_", value).strip("._-/") or "stream"
-
-
 def ensure_clean_dir(path: str | os.PathLike[str]) -> None:
-    path = str(path)
-    os.makedirs(path, exist_ok=True)
-    for name in os.listdir(path):
-        fp = os.path.join(path, name)
+    p = str(path)
+    os.makedirs(p, exist_ok=True)
+    for name in os.listdir(p):
+        fp = os.path.join(p, name)
         try:
             if os.path.isdir(fp):
                 shutil.rmtree(fp, ignore_errors=True)
@@ -94,25 +66,42 @@ def ensure_clean_dir(path: str | os.PathLike[str]) -> None:
             pass
 
 
-def zip_dir_bytes(dir_path: str | os.PathLike[str]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(dir_path):
-            for file_name in files:
-                fp = os.path.join(root, file_name)
-                arc = os.path.relpath(fp, dir_path)
-                zf.write(fp, arc)
-    buf.seek(0)
-    return buf.getvalue()
+def safe_token(value: str) -> str:
+    value = value or "stream"
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-") or "stream"
 
 
-def _to_even(v: int) -> int:
-    v = int(v)
-    return v if v % 2 == 0 else v - 1
+def _find_free_port(host: str = "127.0.0.1") -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
 
 
-def _gop_for_fps(fps: Optional[int]) -> int:
-    return max((fps or 24) * 2, 48)
+def start_static_file_server(directory: str, host: str = "127.0.0.1", port: Optional[int] = None) -> dict:
+    key = os.path.abspath(directory)
+    existing = _HTTP_SERVERS.get(key)
+    if existing:
+        return existing
+    port = port or _find_free_port(host)
+    handler = partial(SimpleHTTPRequestHandler, directory=directory)
+    httpd = ThreadingHTTPServer((host, port), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    info = {"directory": key, "host": host, "port": port, "base_url": f"http://{host}:{port}", "server": httpd, "thread": thread}
+    _HTTP_SERVERS[key] = info
+    return info
+
+
+def stop_static_file_server(directory: str) -> None:
+    key = os.path.abspath(directory)
+    info = _HTTP_SERVERS.pop(key, None)
+    if not info:
+        return
+    try:
+        info["server"].shutdown()
+        info["server"].server_close()
+    except Exception:
+        pass
 
 
 def probe(path: str) -> dict:
@@ -158,323 +147,280 @@ def probe(path: str) -> dict:
     return res
 
 
-def format_audio_codec(codec: str) -> str:
-    mapping = {"aac": "AAC", "mp3": "MP3", "opus": "Opus", "vorbis": "Vorbis", "ac3": "AC-3", "eac3": "E-AC-3", "flac": "FLAC", "pcm_s16le": "PCM 16-bit", "alac": "ALAC"}
-    return mapping.get(codec, (codec or "unknown").upper())
+def _tiktok_crop_box(src_w: int, src_h: int) -> tuple[int, int]:
+    # crop window with 9:16 aspect ratio that fits inside source
+    if src_w / src_h >= 9/16:
+        crop_h = src_h
+        crop_w = int(round(src_h * 9 / 16))
+    else:
+        crop_w = src_w
+        crop_h = int(round(src_w * 16 / 9))
+    crop_w = max(32, crop_w - (crop_w % 2))
+    crop_h = max(32, crop_h - (crop_h % 2))
+    return crop_w, crop_h
 
 
-def format_sample_rate(sr: int) -> str:
-    return f"{sr // 1000} kHz" if sr >= 1000 else f"{sr} Hz"
+def _bbox_center(box):
+    x, y, w, h = box
+    return x + w / 2.0, y + h / 2.0
 
 
-def format_channels(ch: int) -> str:
-    return {1: "Mono", 2: "Stereo", 6: "5.1", 8: "7.1"}.get(ch, f"{ch} ch")
-
-# -----------------------------
-# HLS packaging helpers
-# -----------------------------
-def ladder_dimensions(aspect_label: str, rung: int, src_meta: Optional[dict] = None) -> tuple[int, int]:
-    if aspect_label == "Source / Passthrough" and src_meta and src_meta.get("width") and src_meta.get("height"):
-        sw, sh = int(src_meta["width"]), int(src_meta["height"])
-        if sw >= sh:
-            h = rung
-            w = _to_even(round(h * sw / sh))
-            return w, _to_even(h)
-        w = rung
-        h = _to_even(round(w * sh / sw))
-        return _to_even(w), h
-    per_aspect = {
-        "16:9 Landscape": {360: (640, 360), 540: (960, 540)},
-        "9:16 Vertical": {360: (360, 640), 540: (540, 960)},
-        "1:1 Square": {360: (360, 360), 540: (540, 540)},
-        "4:5 Portrait": {360: (288, 360), 540: (432, 540)},
-        "3:4 Portrait": {360: (270, 360), 540: (406, 540)},
-        "Source / Passthrough": {360: (640, 360), 540: (960, 540)},
-    }
-    return per_aspect.get(aspect_label, per_aspect["16:9 Landscape"])[rung]
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
 
-def build_abr_ladder(aspect_label: str, src_meta: Optional[dict] = None) -> list[dict]:
-    ladder = []
-    for rung in ABR_RUNGS:
-        width, height = ladder_dimensions(aspect_label, rung, src_meta=src_meta)
-        s = ABR_RUNG_SETTINGS[rung]
-        vbps = int(re.sub(r"[^0-9]", "", s["video_bitrate"])) * 1000
-        abps = int(re.sub(r"[^0-9]", "", s["audio_bitrate"])) * 1000
-        ladder.append({
-            "name": f"{rung}p",
-            "rung": rung,
-            "width": width,
-            "height": height,
-            **s,
-            "bandwidth": vbps + abps,
-            "avg_bandwidth": vbps,
-        })
-    return ladder
+def smart_reframe_vertical(
+    input_path: str,
+    output_path: str,
+    target_w: int = DEFAULT_TARGET_W,
+    target_h: int = DEFAULT_TARGET_H,
+    smooth_strength: float = 0.88,
+    lead_room: float = 0.18,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
+) -> tuple[bool, str]:
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        return False, "Could not open input video"
 
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if src_w <= 0 or src_h <= 0:
+        cap.release()
+        return False, "Invalid source dimensions"
 
-def variant_video_filter(width: int, height: int) -> str:
-    return f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+    crop_w, crop_h = _tiktok_crop_box(src_w, src_h)
+    max_x = src_w - crop_w
+    max_y = src_h - crop_h
 
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (target_w, target_h))
+    if not writer.isOpened():
+        cap.release()
+        return False, "Could not create output video writer"
 
-def build_multi_variant_vod_hls_cmd(input_source: str, out_dir: str, aspect_label: str = "16:9 Landscape", preset: str = "superfast", fps: Optional[int] = None, segment_seconds: int = DEFAULT_SEGMENT_SECONDS, src_meta: Optional[dict] = None) -> tuple[list[str], list[dict], str]:
-    ladder = build_abr_ladder(aspect_label=aspect_label, src_meta=src_meta)
-    split_labels = [f"v{i}" for i in range(len(ladder))]
-    out_labels = [f"v{i}out" for i in range(len(ladder))]
-    filter_parts = [f"[0:v]split={len(ladder)}" + "".join(f"[{x}]" for x in split_labels)]
-    for idx, variant in enumerate(ladder):
-        vf = variant_video_filter(variant["width"], variant["height"])
-        if fps:
-            vf += f",fps={fps}"
-        filter_parts.append(f"[{split_labels[idx]}]{vf}[{out_labels[idx]}]")
-    cmd = ["ffmpeg", "-y", "-i", input_source, "-filter_complex", ";".join(filter_parts)]
-    for idx in range(len(ladder)):
-        cmd += ["-map", f"[{out_labels[idx]}]", "-map", "0:a:0?"]
-    for idx, variant in enumerate(ladder):
-        cmd += [
-            f"-c:v:{idx}", "libx264",
-            f"-preset:v:{idx}", preset,
-            f"-pix_fmt:v:{idx}", "yuv420p",
-            f"-profile:v:{idx}", "main",
-            f"-b:v:{idx}", variant["video_bitrate"],
-            f"-maxrate:v:{idx}", variant["maxrate"],
-            f"-bufsize:v:{idx}", variant["bufsize"],
-            f"-g:v:{idx}", str(_gop_for_fps(fps)),
-            f"-keyint_min:v:{idx}", str(_gop_for_fps(fps)),
-            f"-sc_threshold:v:{idx}", "0",
-            f"-c:a:{idx}", "aac",
-            f"-b:a:{idx}", variant["audio_bitrate"],
-            f"-ar:a:{idx}", "48000",
-            f"-ac:a:{idx}", "2",
-        ]
-    master = os.path.join(out_dir, "master.m3u8")
-    segment_pattern = os.path.join(out_dir, "%v_%05d.ts")
-    playlist_pattern = os.path.join(out_dir, "%v.m3u8")
-    var_stream_map = " ".join(f"v:{idx},a:{idx},name:{variant['name']}" for idx, variant in enumerate(ladder))
-    cmd += [
-        "-master_pl_name", "master.m3u8",
-        "-f", "hls",
-        "-hls_time", str(segment_seconds),
-        "-hls_playlist_type", "vod",
-        "-hls_list_size", "0",
-        "-hls_flags", "independent_segments",
-        "-hls_segment_filename", segment_pattern,
-        "-var_stream_map", var_stream_map,
-        playlist_pattern,
-    ]
-    return cmd, ladder, master
-
-
-def run_ffmpeg(cmd: list[str], timeout: Optional[int] = None) -> tuple[bool, str, str]:
+    # detectors
+    face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    saliency = None
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        ok = proc.returncode == 0
-        log = ((proc.stderr or "") + ("\n" + proc.stdout if proc.stdout else "")).strip()
-        return ok, ("Done" if ok else f"FFmpeg exited with code {proc.returncode}"), log
-    except subprocess.TimeoutExpired as exc:
-        return False, "Timed out", str(exc)
-    except Exception as exc:
-        return False, str(exc), ""
+        saliency = cv2.saliency.StaticSaliencySpectralResidual_create()
+    except Exception:
+        saliency = None
 
-# -----------------------------
-# GitHub atomic publication layer
-# -----------------------------
-def github_config_from_inputs(owner: str, repo: str, token: str, target_branch: str, pages_base_url: str, folder_prefix: str, default_branch: str, deploy_hook_url: str, wait_timeout_seconds: int) -> GitHubConfig:
-    if not owner:
-        raise ValueError("GitHub owner is required.")
-    if not repo:
-        raise ValueError("GitHub repo is required.")
-    if not token:
-        raise ValueError("GitHub token is required.")
-    if not target_branch:
-        raise ValueError("Target branch is required.")
-    if not pages_base_url:
-        raise ValueError("Cloudflare Pages base URL is required.")
-    return GitHubConfig(
-        owner=owner.strip(),
-        repo=repo.strip(),
-        token=token.strip(),
-        target_branch=target_branch.strip(),
-        pages_base_url=pages_base_url.rstrip('/'),
-        folder_prefix=safe_token(folder_prefix or 'public/hls').strip('/'),
-        default_branch=(default_branch or 'main').strip(),
-        deploy_hook_url=(deploy_hook_url or '').strip() or None,
-        wait_timeout_seconds=max(30, int(wait_timeout_seconds or 150)),
-    )
+    prev_gray = None
+    smoothed_cx = src_w / 2
+    smoothed_cy = src_h / 2
+    prev_target_cx = smoothed_cx
+    prev_target_cy = smoothed_cy
 
+    idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-def _github_request(cfg: GitHubConfig, method: str, path: str, payload: Optional[dict] = None) -> tuple[int, dict | bytes | None, dict]:
-    url = f"https://api.github.com{path}"
-    data = None
-    headers = {
-        'Authorization': f'Bearer {cfg.token}',
-        'Accept': 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'VideoForge-Atomic-GitHub-Publisher',
-    }
-    if payload is not None:
-        data = json.dumps(payload).encode('utf-8')
-        headers['Content-Type'] = 'application/json'
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read()
-            content_type = resp.headers.get('Content-Type', '')
-            parsed = json.loads(raw.decode('utf-8')) if 'application/json' in content_type and raw else None
-            return resp.status, parsed, dict(resp.headers)
-    except urllib.error.HTTPError as e:
-        raw = e.read()
+        candidates = []
+
+        # face candidates (highest priority)
         try:
-            parsed = json.loads(raw.decode('utf-8'))
+            faces = face_detector.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=4, minSize=(40, 40))
         except Exception:
-            parsed = raw
-        return e.code, parsed, dict(e.headers)
+            faces = []
+        for (x, y, w, h) in faces:
+            candidates.append((0.65, (x, y, w, h)))
+
+        # saliency candidate
+        if saliency is not None:
+            try:
+                success, sal_map = saliency.computeSaliency(frame)
+                if success:
+                    sal_map = (sal_map * 255).astype('uint8')
+                    _, thresh = cv2.threshold(sal_map, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if cnts:
+                        c = max(cnts, key=cv2.contourArea)
+                        x, y, w, h = cv2.boundingRect(c)
+                        if w * h > 0.02 * src_w * src_h:
+                            candidates.append((0.45, (x, y, w, h)))
+            except Exception:
+                pass
+
+        # motion candidate
+        if prev_gray is not None:
+            diff = cv2.absdiff(gray, prev_gray)
+            diff = cv2.GaussianBlur(diff, (9, 9), 0)
+            _, motion = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY)
+            motion = cv2.dilate(motion, None, iterations=2)
+            cnts, _ = cv2.findContours(motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if cnts:
+                c = max(cnts, key=cv2.contourArea)
+                x, y, w, h = cv2.boundingRect(c)
+                if w * h > 0.01 * src_w * src_h:
+                    candidates.append((0.35, (x, y, w, h)))
+
+        prev_gray = gray
+
+        # combine candidates into target center
+        if candidates:
+            weight_sum = 0.0
+            cx_sum = 0.0
+            cy_sum = 0.0
+            for weight, box in candidates:
+                cx, cy = _bbox_center(box)
+                weight_sum += weight
+                cx_sum += cx * weight
+                cy_sum += cy * weight
+            target_cx = cx_sum / max(weight_sum, 1e-6)
+            target_cy = cy_sum / max(weight_sum, 1e-6)
+        else:
+            target_cx = smoothed_cx
+            target_cy = smoothed_cy
+
+        # lead-room logic based on recent movement
+        vel_x = target_cx - prev_target_cx
+        vel_y = target_cy - prev_target_cy
+        target_cx += vel_x * lead_room
+        target_cy += vel_y * lead_room * 0.35  # less aggressive vertically
+        prev_target_cx = target_cx
+        prev_target_cy = target_cy
+
+        # smoothing
+        alpha = 1.0 - float(smooth_strength)
+        smoothed_cx = (1 - alpha) * smoothed_cx + alpha * target_cx
+        smoothed_cy = (1 - alpha) * smoothed_cy + alpha * target_cy
+
+        # build crop box
+        x0 = int(round(smoothed_cx - crop_w / 2))
+        y0 = int(round(smoothed_cy - crop_h / 2))
+        x0 = int(_clamp(x0, 0, max_x))
+        y0 = int(_clamp(y0, 0, max_y))
+        crop = frame[y0:y0 + crop_h, x0:x0 + crop_w]
+        if crop.size == 0:
+            crop = frame
+        crop = cv2.resize(crop, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+        writer.write(crop)
+
+        idx += 1
+        if progress_cb and frame_count > 0 and idx % 5 == 0:
+            progress_cb(idx / frame_count, f"Smart reframe analysing frame {idx}/{frame_count}")
+
+    cap.release()
+    writer.release()
+
+    # pass-through / re-encode audio into final mp4 with original audio track if present
+    muxed = output_path.replace('.mp4', '_muxed.mp4')
+    cmd = [
+        'ffmpeg', '-y', '-i', output_path, '-i', input_path,
+        '-map', '0:v:0', '-map', '1:a:0?', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-shortest', muxed
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode == 0 and os.path.exists(muxed):
+        shutil.move(muxed, output_path)
+    return True, 'Done'
 
 
-def get_ref(cfg: GitHubConfig, branch: str) -> dict:
-    status, payload, _ = _github_request(cfg, 'GET', f"/repos/{cfg.owner}/{cfg.repo}/git/ref/heads/{urllib.parse.quote(branch, safe='')}")
-    if status != 200 or not isinstance(payload, dict):
-        raise RuntimeError(f"Failed to read ref for branch {branch}: {payload}")
-    return payload
+def build_live_hls_command(
+    input_path: str,
+    out_dir: str,
+    fps: Optional[int] = None,
+    segment_seconds: int = DEFAULT_SEGMENT_SECONDS,
+    live_list_size: int = DEFAULT_LIVE_LIST_SIZE,
+    loop_input: bool = True,
+    target_w: int = DEFAULT_TARGET_W,
+    target_h: int = DEFAULT_TARGET_H,
+) -> tuple[list[str], str]:
+    os.makedirs(out_dir, exist_ok=True)
+    manifest = os.path.join(out_dir, 'live.m3u8')
+    segment_pattern = os.path.join(out_dir, 'live_%05d.ts')
+    cmd = ['ffmpeg', '-y']
+    if loop_input:
+        cmd += ['-stream_loop', '-1']
+    cmd += ['-re', '-i', input_path]
+    if fps:
+        cmd += ['-r', str(fps)]
+    gop = max((fps or 30) * 2, 48)
+    cmd += [
+        '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+        '-b:v', '1400k', '-maxrate', '1498k', '-bufsize', '2100k',
+        '-g', str(gop), '-keyint_min', str(gop), '-sc_threshold', '0',
+        '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+        '-f', 'hls',
+        '-hls_time', str(segment_seconds),
+        '-hls_list_size', str(live_list_size),
+        '-hls_flags', 'delete_segments+append_list+independent_segments+program_date_time',
+        '-hls_segment_filename', segment_pattern,
+        manifest,
+    ]
+    return cmd, manifest
 
 
-def branch_exists(cfg: GitHubConfig, branch: str) -> bool:
-    status, _, _ = _github_request(cfg, 'GET', f"/repos/{cfg.owner}/{cfg.repo}/git/ref/heads/{urllib.parse.quote(branch, safe='')}")
-    return status == 200
+def start_live_job_from_reframed_file(
+    reframed_path: str,
+    asset_name: str,
+    segment_seconds: int = DEFAULT_SEGMENT_SECONDS,
+    live_list_size: int = DEFAULT_LIVE_LIST_SIZE,
+    fps: Optional[int] = None,
+    loop_input: bool = True,
+) -> LiveJob:
+    out_dir = tempfile.mkdtemp(prefix='videoforge_live_hls_origin_')
+    ensure_clean_dir(out_dir)
+    server = start_static_file_server(out_dir)
+    cmd, manifest = build_live_hls_command(
+        reframed_path, out_dir, fps=fps, segment_seconds=segment_seconds,
+        live_list_size=live_list_size, loop_input=loop_input
+    )
+    log_path = os.path.join(out_dir, 'ffmpeg_live.log')
+    log_fp = open(log_path, 'w', encoding='utf-8')
+    proc = subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT, text=True)
+    manifest_url = f"{server['base_url']}/{os.path.basename(manifest)}"
+    return LiveJob(proc=proc, out_dir=out_dir, manifest_path=manifest, manifest_url=manifest_url, server_info=server, log_path=log_path, reframed_path=reframed_path)
 
 
-def get_commit(cfg: GitHubConfig, sha: str) -> dict:
-    status, payload, _ = _github_request(cfg, 'GET', f"/repos/{cfg.owner}/{cfg.repo}/git/commits/{sha}")
-    if status != 200 or not isinstance(payload, dict):
-        raise RuntimeError(f"Failed to read commit {sha}: {payload}")
-    return payload
+def stop_live_job(job: Optional[LiveJob]) -> None:
+    if not job:
+        return
+    try:
+        if job.proc and job.proc.poll() is None:
+            job.proc.terminate()
+            try:
+                job.proc.wait(timeout=5)
+            except Exception:
+                job.proc.kill()
+    except Exception:
+        pass
 
 
-def create_branch_from_default(cfg: GitHubConfig, branch: str) -> str:
-    base_ref = get_ref(cfg, cfg.default_branch)
-    base_sha = base_ref['object']['sha']
-    payload = {'ref': f'refs/heads/{branch}', 'sha': base_sha}
-    status, data, _ = _github_request(cfg, 'POST', f"/repos/{cfg.owner}/{cfg.repo}/git/refs", payload)
-    if status not in (200, 201):
-        raise RuntimeError(f"Failed to create branch {branch}: {data}")
-    return base_sha
-
-
-def ensure_branch(cfg: GitHubConfig) -> str:
-    if branch_exists(cfg, cfg.target_branch):
-        ref = get_ref(cfg, cfg.target_branch)
-        return ref['object']['sha']
-    return create_branch_from_default(cfg, cfg.target_branch)
-
-
-def create_blob(cfg: GitHubConfig, content_bytes: bytes) -> str:
-    payload = {'content': base64.b64encode(content_bytes).decode('ascii'), 'encoding': 'base64'}
-    status, data, _ = _github_request(cfg, 'POST', f"/repos/{cfg.owner}/{cfg.repo}/git/blobs", payload)
-    if status not in (200, 201) or not isinstance(data, dict) or not data.get('sha'):
-        raise RuntimeError(f"Failed to create blob: {data}")
-    return data['sha']
-
-
-def create_tree(cfg: GitHubConfig, base_tree_sha: str, entries: list[dict]) -> str:
-    payload = {'base_tree': base_tree_sha, 'tree': entries}
-    status, data, _ = _github_request(cfg, 'POST', f"/repos/{cfg.owner}/{cfg.repo}/git/trees", payload)
-    if status not in (200, 201) or not isinstance(data, dict) or not data.get('sha'):
-        raise RuntimeError(f"Failed to create tree: {data}")
-    return data['sha']
-
-
-def create_commit(cfg: GitHubConfig, message: str, tree_sha: str, parent_sha: str) -> str:
-    payload = {'message': message, 'tree': tree_sha, 'parents': [parent_sha]}
-    status, data, _ = _github_request(cfg, 'POST', f"/repos/{cfg.owner}/{cfg.repo}/git/commits", payload)
-    if status not in (200, 201) or not isinstance(data, dict) or not data.get('sha'):
-        raise RuntimeError(f"Failed to create commit: {data}")
-    return data['sha']
-
-
-def update_ref(cfg: GitHubConfig, branch: str, commit_sha: str) -> None:
-    payload = {'sha': commit_sha, 'force': True}
-    status, data, _ = _github_request(cfg, 'PATCH', f"/repos/{cfg.owner}/{cfg.repo}/git/refs/heads/{urllib.parse.quote(branch, safe='')}", payload)
-    if status not in (200, 201):
-        raise RuntimeError(f"Failed to update ref for {branch}: {data}")
-
-
-def publish_directory_to_github_atomic(cfg: GitHubConfig, local_dir: str, repo_path_prefix: str, commit_message: str) -> str:
-    head_sha = ensure_branch(cfg)
-    parent_commit = get_commit(cfg, head_sha)
-    base_tree_sha = parent_commit['tree']['sha']
-    entries = []
-    logs = []
-    for root, _, files in os.walk(local_dir):
-        files.sort()
-        for file_name in files:
-            local_path = os.path.join(root, file_name)
-            rel_path = os.path.relpath(local_path, local_dir).replace('\\', '/')
-            repo_path = f"{repo_path_prefix}/{rel_path}" if repo_path_prefix else rel_path
-            with open(local_path, 'rb') as fh:
-                content = fh.read()
-            blob_sha = create_blob(cfg, content)
-            entries.append({'path': repo_path, 'mode': '100644', 'type': 'blob', 'sha': blob_sha})
-            logs.append(f"prepared {repo_path} blob={blob_sha[:10]}")
-    new_tree_sha = create_tree(cfg, base_tree_sha, entries)
-    logs.append(f"created tree {new_tree_sha}")
-    new_commit_sha = create_commit(cfg, commit_message, new_tree_sha, head_sha)
-    logs.append(f"created commit {new_commit_sha}")
-    update_ref(cfg, cfg.target_branch, new_commit_sha)
-    logs.append(f"updated branch {cfg.target_branch} -> {new_commit_sha}")
-    return '\n'.join(logs)
-
-
-def trigger_deploy_hook(cfg: GitHubConfig) -> str:
-    if not cfg.deploy_hook_url:
-        return 'No deploy hook configured; relying on Cloudflare Pages automatic git deployment.'
-    req = urllib.request.Request(cfg.deploy_hook_url, data=b'', method='POST', headers={'User-Agent': 'VideoForge-Atomic-GitHub-Publisher'})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        body = resp.read().decode('utf-8', errors='ignore')
-        return f"Deploy hook POST returned HTTP {resp.status}. Response: {body[:1000]}"
-
-
-def build_public_manifest_url(cfg: GitHubConfig, repo_path_prefix: str) -> str:
-    return f"{cfg.pages_base_url}/{repo_path_prefix}/master.m3u8"
-
-
-def wait_for_manifest(manifest_url: str, timeout_seconds: int = 150, poll_interval_seconds: int = 5) -> tuple[bool, str]:
-    started = time.time()
-    attempts = []
-    while time.time() - started < timeout_seconds:
-        try:
-            req = urllib.request.Request(manifest_url, headers={'User-Agent': 'VideoForge-Manifest-Checker'})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                body = resp.read(4096).decode('utf-8', errors='ignore')
-                if resp.status == 200 and '#EXTM3U' in body:
-                    attempts.append(f"HTTP 200 and playlist marker found at {int(time.time()-started)}s")
-                    return True, '\n'.join(attempts)
-                attempts.append(f"HTTP {resp.status} without m3u8 marker at {int(time.time()-started)}s")
-        except Exception as exc:
-            attempts.append(f"retry at {int(time.time()-started)}s -> {exc}")
-        time.sleep(poll_interval_seconds)
-    return False, '\n'.join(attempts)
-
-# -----------------------------
-# Player HTML helpers
-# -----------------------------
-def build_player_analytics_html(meta: dict, source_label: str = 'Source') -> str:
-    width = int(meta.get('width', 1920) or 1920)
-    height = int(meta.get('height', 1080) or 1080)
-    fps = float(meta.get('fps', 30.0) or 30.0)
-    bitrate = int(meta.get('vbitrate_kbps', 4000) or 4000)
-    return f"<div style='font-family:Inter,Segoe UI,Arial,sans-serif;border:1px solid #e5e7eb;border-radius:16px;padding:16px;background:#0f172a;color:#e2e8f0;'><div style='font-size:12px;color:#93c5fd;text-transform:uppercase;letter-spacing:.08em;'>Playback Analytics</div><div style='font-size:20px;font-weight:700;margin-bottom:8px;'>{source_label}</div><div style='font-size:12px;color:#94a3b8;'>{width}×{height} · {fps:.2f} fps · bitrate ~{bitrate} kbps</div></div>"
-
-
-def build_hlsjs_player_html(manifest_url: str, title: str = 'HLS playback', autoplay: bool = True, muted: bool = True, low_latency: bool = True) -> str:
+def build_live_player_html(manifest_url: str, title: str = 'TikTok-style vertical live', autoplay: bool = True, muted: bool = True) -> str:
     autoplay_str = 'true' if autoplay else 'false'
     muted_attr = 'muted' if muted else ''
-    low_latency_str = 'true' if low_latency else 'false'
     return f"""
-<div style='font-family:Inter,Segoe UI,Arial,sans-serif;border:1px solid #e5e7eb;border-radius:16px;padding:16px;background:#0f172a;color:#e2e8f0;'>
-  <div style='margin-bottom:12px;'><div style='font-size:12px;color:#93c5fd;text-transform:uppercase;letter-spacing:.08em;'>Embedded HLS.js Playback</div><div style='font-size:20px;font-weight:700;'>{title}</div><div style='font-size:12px;color:#94a3b8;word-break:break-all;'>{manifest_url}</div></div>
-  <video id='video' controls playsinline {muted_attr} style='width:100%;max-height:560px;background:#000;border-radius:12px;'></video>
-  <div style='display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px;'><div style='background:#111827;border-radius:12px;padding:12px;'><div style='font-size:12px;color:#94a3b8;'>State</div><div id='state' style='font-size:22px;font-weight:700;'>booting</div></div><div style='background:#111827;border-radius:12px;padding:12px;'><div style='font-size:12px;color:#94a3b8;'>Current level</div><div id='level' style='font-size:22px;font-weight:700;'>-</div></div><div style='background:#111827;border-radius:12px;padding:12px;'><div style='font-size:12px;color:#94a3b8;'>Buffer ahead</div><div id='buffer' style='font-size:22px;font-weight:700;'>0.0 s</div></div><div style='background:#111827;border-radius:12px;padding:12px;'><div style='font-size:12px;color:#94a3b8;'>Dropped frames</div><div id='drops' style='font-size:22px;font-weight:700;'>0</div></div></div>
-  <div style='background:#111827;border-radius:12px;padding:12px;margin-top:14px;'><div style='font-size:13px;font-weight:600;margin-bottom:8px;'>Event log</div><div id='log' style='font-size:12px;line-height:1.6;color:#cbd5e1;max-height:180px;overflow:auto;'>Waiting for manifest…</div></div>
+<div style='font-family:Inter,Segoe UI,Arial,sans-serif;background:#0f172a;color:#e2e8f0;border:1px solid #e5e7eb;border-radius:16px;padding:16px;'>
+  <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;'>
+    <div>
+      <div style='font-size:12px;color:#93c5fd;text-transform:uppercase;letter-spacing:.08em;'>Live vertical player</div>
+      <div style='font-size:20px;font-weight:700;'>{title}</div>
+      <div style='font-size:12px;color:#94a3b8;word-break:break-all;'>{manifest_url}</div>
+    </div>
+    <div style='display:flex; gap:8px; align-items:center;'>
+      <div id='liveBadge' style='padding:6px 10px; border-radius:999px; background:#7f1d1d; color:#fee2e2; font-weight:700;'>LIVE</div>
+      <button id='goLiveBtn' style='padding:8px 12px; border-radius:10px; border:none; background:#1d4ed8; color:#eff6ff; cursor:pointer;'>Go live</button>
+    </div>
+  </div>
+  <div style='display:flex; justify-content:center;'>
+    <video id='video' controls playsinline {muted_attr} style='width:360px; height:640px; background:#000; border-radius:16px; object-fit:cover;'></video>
+  </div>
+  <div style='display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-top:14px;'>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px;color:#94a3b8;'>State</div><div id='state' style='font-size:22px;font-weight:700;'>booting</div></div>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px;color:#94a3b8;'>Latency</div><div id='latency' style='font-size:22px;font-weight:700;'>0.0 s</div></div>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px;color:#94a3b8;'>Buffer ahead</div><div id='buffer' style='font-size:22px;font-weight:700;'>0.0 s</div></div>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px;color:#94a3b8;'>Current level</div><div id='level' style='font-size:22px;font-weight:700;'>-</div></div>
+  </div>
+  <div style='background:#111827; border-radius:12px; padding:12px; margin-top:14px;'>
+    <div style='font-size:13px;font-weight:600;margin-bottom:8px;'>Live event log</div>
+    <div id='log' style='font-size:12px;line-height:1.6;color:#cbd5e1;max-height:180px;overflow:auto;'>Waiting for live playlist…</div>
+  </div>
 </div>
 <script src='https://cdn.jsdelivr.net/npm/hls.js@latest'></script>
 <script>
@@ -482,15 +428,16 @@ def build_hlsjs_player_html(manifest_url: str, title: str = 'HLS playback', auto
   const manifestUrl = {json.dumps(manifest_url)};
   const video = document.getElementById('video');
   const elState = document.getElementById('state');
-  const elLevel = document.getElementById('level');
+  const elLatency = document.getElementById('latency');
   const elBuffer = document.getElementById('buffer');
-  const elDrops = document.getElementById('drops');
+  const elLevel = document.getElementById('level');
   const elLog = document.getElementById('log');
+  const goLiveBtn = document.getElementById('goLiveBtn');
   function pushLog(msg) {{
     const now = new Date().toLocaleTimeString();
-    elLog.innerHTML = '[' + now + '] ' + msg + '<br/>' + elLog.innerHTML.split('<br/>').slice(0,10).join('<br/>');
+    elLog.innerHTML = '[' + now + '] ' + msg + '<br/>' + elLog.innerHTML.split('<br/>').slice(0,12).join('<br/>');
   }}
-  function updateMetrics() {{
+  function updateMetrics(hls) {{
     let bufferAhead = 0;
     if (video.buffered && video.buffered.length) {{
       for (let i = 0; i < video.buffered.length; i++) {{
@@ -501,48 +448,43 @@ def build_hlsjs_player_html(manifest_url: str, title: str = 'HLS playback', auto
       }}
     }}
     elBuffer.textContent = bufferAhead.toFixed(1) + ' s';
-    try {{ const q = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null; if (q && typeof q.droppedVideoFrames === 'number') elDrops.textContent = String(q.droppedVideoFrames); }} catch (e) {{}}
+    if (hls && typeof hls.latency === 'number') {{
+      elLatency.textContent = hls.latency.toFixed(1) + ' s';
+    }}
+  }}
+  function goLive(hls) {{
+    if (hls && typeof hls.liveSyncPosition === 'number' && !Number.isNaN(hls.liveSyncPosition)) {{
+      video.currentTime = Math.max(0, hls.liveSyncPosition);
+      pushLog('Jumped to live edge');
+    }}
   }}
   if (Hls.isSupported()) {{
-    const hls = new Hls({{ lowLatencyMode: {low_latency_str}, enableWorker: true }});
+    const hls = new Hls({{
+      lowLatencyMode: true,
+      backBufferLength: 20,
+      liveSyncDurationCount: 2,
+      liveMaxLatencyDurationCount: 4,
+      maxLiveSyncPlaybackRate: 1.25,
+      enableWorker: true,
+      fragLoadingRetryDelay: 500,
+      manifestLoadingRetryDelay: 500,
+      levelLoadingRetryDelay: 500,
+    }});
     hls.loadSource(manifestUrl);
     hls.attachMedia(video);
     hls.on(Hls.Events.MEDIA_ATTACHED, function() {{ elState.textContent = 'media attached'; pushLog('Media attached'); }});
-    hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {{ elState.textContent = 'manifest parsed'; pushLog('Manifest parsed with ' + data.levels.length + ' level(s)'); if ({autoplay_str}) video.play().catch(() => {{}}); }});
+    hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {{ elState.textContent = 'live playlist parsed'; pushLog('Playlist parsed with ' + data.levels.length + ' level(s)'); if ({autoplay_str}) video.play().catch(() => {{}}); }});
     hls.on(Hls.Events.LEVEL_SWITCHED, function(event, data) {{ const level = hls.levels[data.level]; elLevel.textContent = level ? ((level.height || '?') + 'p') : String(data.level); pushLog('Level switched'); }});
     hls.on(Hls.Events.ERROR, function(event, data) {{ pushLog('HLS error: ' + data.type + ' | ' + data.details); elState.textContent = data.fatal ? 'fatal error' : 'recoverable error'; if (data.fatal) {{ if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad(); else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError(); }} }});
+    goLiveBtn.addEventListener('click', function() {{ goLive(hls); }});
+    setInterval(function() {{ updateMetrics(hls); }}, 1000);
   }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-    video.src = manifestUrl; elState.textContent = 'native HLS'; if ({autoplay_str}) video.play().catch(() => {{}});
+    video.src = manifestUrl; elState.textContent = 'native live HLS'; if ({autoplay_str}) video.play().catch(() => {{}});
+    goLiveBtn.addEventListener('click', function() {{ if (video.seekable && video.seekable.length) video.currentTime = video.seekable.end(video.seekable.length - 1); }});
   }} else {{ elState.textContent = 'unsupported'; pushLog('Browser does not support HLS playback'); }}
-  ['play','pause','waiting','playing','seeking','stalled','ended','loadedmetadata','canplay'].forEach(function(evt) {{ video.addEventListener(evt, function() {{ elState.textContent = evt; pushLog('Video event: ' + evt); updateMetrics(); }}); }});
-  setInterval(updateMetrics, 1000);
+  ['play','pause','waiting','playing','seeking','stalled','ended','loadedmetadata','canplay'].forEach(function(evt) {{
+    video.addEventListener(evt, function() {{ elState.textContent = evt; pushLog('Video event: ' + evt); }});
+  }});
 }})();
 </script>
 """
-
-# -----------------------------
-# End-to-end publish flow
-# -----------------------------
-def package_and_publish_via_github_atomic(input_source: str, asset_name: str, aspect_label: str, preset: str, fps: Optional[int], segment_seconds: int, cfg: GitHubConfig, src_meta: Optional[dict] = None) -> PublishResult:
-    out_dir = tempfile.mkdtemp(prefix='videoforge_pages_git_atomic_hls_')
-    ensure_clean_dir(out_dir)
-    cmd, ladder, manifest_path = build_multi_variant_vod_hls_cmd(input_source, out_dir, aspect_label, preset, fps, segment_seconds, src_meta)
-    ff_ok, ff_msg, ff_log = run_ffmpeg(cmd)
-    if not ff_ok:
-        return PublishResult(False, ff_msg, out_dir, manifest_path, None, None, None, ff_log, '', '', '', ladder)
-
-    object_prefix = f"{cfg.folder_prefix}/{safe_token(Path(asset_name).stem)}_{int(time.time())}"
-    github_log = ''
-    deploy_hook_log = ''
-    readiness_log = ''
-    try:
-        github_log = publish_directory_to_github_atomic(cfg, out_dir, object_prefix, f"Publish HLS asset {safe_token(Path(asset_name).stem)}")
-        deploy_hook_log = trigger_deploy_hook(cfg)
-        manifest_url = build_public_manifest_url(cfg, object_prefix)
-        ready, readiness_log = wait_for_manifest(manifest_url, cfg.wait_timeout_seconds, 5)
-        zbytes = zip_dir_bytes(out_dir)
-        if ready:
-            return PublishResult(True, 'Atomic GitHub publication succeeded and manifest is reachable', out_dir, manifest_path, manifest_url, object_prefix, zbytes, ff_log, github_log, deploy_hook_log, readiness_log, ladder)
-        return PublishResult(False, 'Atomic GitHub publication succeeded, but manifest was not reachable before timeout', out_dir, manifest_path, manifest_url, object_prefix, zbytes, ff_log, github_log, deploy_hook_log, readiness_log, ladder)
-    except Exception as exc:
-        return PublishResult(False, f'Atomic GitHub publication failed: {exc}', out_dir, manifest_path, None, object_prefix, None, ff_log, github_log or str(exc), deploy_hook_log, readiness_log, ladder)
