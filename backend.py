@@ -20,9 +20,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 MAX_UPLOAD_MB = 300
-DEFAULT_SEGMENT_SECONDS = 4
-DEFAULT_LIVE_LIST_SIZE = 6
+DEFAULT_SEGMENT_SECONDS = 2
+DEFAULT_LIVE_LIST_SIZE = 4
 DEFAULT_GOP_FPS = 24
+ABR_RUNGS = (360, 540)
 
 ASPECT_PRESETS = {
     "Source / Passthrough": None,
@@ -36,8 +37,6 @@ ASPECT_PRESETS = {
 ABR_RUNG_SETTINGS = {
     360: {"video_bitrate": "800k",  "maxrate": "856k",  "bufsize": "1200k", "audio_bitrate": "96k"},
     540: {"video_bitrate": "1400k", "maxrate": "1498k", "bufsize": "2100k", "audio_bitrate": "96k"},
-    720: {"video_bitrate": "2800k", "maxrate": "2996k", "bufsize": "4200k", "audio_bitrate": "128k"},
-    1080: {"video_bitrate": "5000k", "maxrate": "5350k", "bufsize": "7500k", "audio_bitrate": "128k"},
 }
 
 CODEC_PRESETS = {
@@ -121,7 +120,14 @@ def start_static_file_server(directory: str, host: str = "127.0.0.1", port: Opti
     httpd = ThreadingHTTPServer((host, port), handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
-    server_info = {"directory": key, "host": host, "port": port, "base_url": f"http://{host}:{port}", "server": httpd, "thread": thread}
+    server_info = {
+        "directory": key,
+        "host": host,
+        "port": port,
+        "base_url": f"http://{host}:{port}",
+        "server": httpd,
+        "thread": thread,
+    }
     _HTTP_SERVERS[key] = server_info
     return server_info
 
@@ -136,12 +142,6 @@ def stop_static_file_server(directory: str) -> None:
         info["server"].server_close()
     except Exception:
         pass
-
-
-def serve_manifest_url(directory: str, manifest_path: str) -> str:
-    server = start_static_file_server(directory)
-    manifest_name = os.path.basename(manifest_path)
-    return f"{server['base_url']}/{manifest_name}"
 
 
 def probe(path: str) -> dict:
@@ -247,13 +247,8 @@ def build_player_analytics_html(meta: dict, source_label: str = "Source") -> str
     height = int(meta.get("height", 1080) or 1080)
     fps = float(meta.get("fps", 30.0) or 30.0)
     bitrate = int(meta.get("vbitrate_kbps", 4000) or 4000)
-    if height >= 1080 or width >= 1920:
-        ladder = [("1080p", 5000), ("720p", 2800), ("540p", 1400), ("360p", 800)]
-    elif height >= 720 or width >= 1280:
-        ladder = [("720p", 2800), ("540p", 1400), ("360p", 800)]
-    else:
-        ladder = [("540p", 1400), ("360p", 800)]
-    active = min(ladder, key=lambda x: abs(x[1] - bitrate))[0]
+    ladder = [(f"{r}p", int(re.sub(r'[^0-9]', '', ABR_RUNG_SETTINGS[r]['video_bitrate']))) for r in ABR_RUNGS]
+    active = min(ladder, key=lambda x: abs(x[1] - max(1, bitrate)))[0]
     html = """
 <div style='font-family: Inter, Segoe UI, Arial, sans-serif; border:1px solid #e5e7eb; border-radius:16px; padding:16px; background:#0f172a; color:#e2e8f0;'>
   <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;'>
@@ -297,9 +292,9 @@ function renderLadder(active) {
 renderLadder(current);
 setInterval(function() {
   tick += 1;
-  const bw = (4.2 + Math.sin(tick / 2) * 0.8 + Math.random() * 0.4).toFixed(2);
-  const buffer = (18 + Math.sin(tick / 3) * 3 + Math.random()).toFixed(1);
-  const rtt = Math.max(65, Math.round(115 + Math.sin(tick / 2) * 25 + Math.random() * 15));
+  const bw = (1.6 + Math.sin(tick / 2) * 0.4 + Math.random() * 0.2).toFixed(2);
+  const buffer = (6 + Math.sin(tick / 3) * 1.3 + Math.random()).toFixed(1);
+  const rtt = Math.max(55, Math.round(95 + Math.sin(tick / 2) * 20 + Math.random() * 10));
   const ranked = [...ladder].sort((a,b) => b.bps - a.bps);
   const numericBw = Number(bw) * 1000;
   let found = ranked.find(x => x.bps < numericBw * 0.72);
@@ -323,9 +318,8 @@ setInterval(function() {
     return html
 
 
-def build_hlsjs_player_html(manifest_url: str, title: str = "HLS playback", autoplay: bool = False, muted: bool = True, low_latency: bool = True) -> str:
+def build_hlsjs_player_html(manifest_url: str, title: str = "HLS playback", autoplay: bool = True, muted: bool = True, low_latency: bool = True) -> str:
     autoplay_str = "true" if autoplay else "false"
-    muted_str = "true" if muted else "false"
     low_latency_str = "true" if low_latency else "false"
     return f"""
 <div style='font-family: Inter, Segoe UI, Arial, sans-serif; border:1px solid #e5e7eb; border-radius:16px; padding:16px; background:#0f172a; color:#e2e8f0;'>
@@ -335,11 +329,11 @@ def build_hlsjs_player_html(manifest_url: str, title: str = "HLS playback", auto
       <div style='font-size:20px; font-weight:700;'>{title}</div>
       <div style='font-size:12px; color:#94a3b8; word-break:break-all;'>{manifest_url}</div>
     </div>
-    <div style='padding:6px 10px; border-radius:999px; background:#172554; color:#dbeafe; font-size:12px;'>served immediately over local HTTP</div>
+    <div style='padding:6px 10px; border-radius:999px; background:#172554; color:#dbeafe; font-size:12px;'>player attaches immediately and waits for first 1–2 segments</div>
   </div>
-  <video id='video' controls playsinline style='width:100%; max-height:560px; background:#000; border-radius:12px;' {'muted' if muted else ''}></video>
+  <video id='video' controls playsinline muted style='width:100%; max-height:560px; background:#000; border-radius:12px;'></video>
   <div style='display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-top:14px;'>
-    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>State</div><div id='state' style='font-size:22px; font-weight:700;'>initialising</div></div>
+    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>State</div><div id='state' style='font-size:22px; font-weight:700;'>booting</div></div>
     <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>Current level</div><div id='level' style='font-size:22px; font-weight:700;'>-</div></div>
     <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>Buffer ahead</div><div id='buffer' style='font-size:22px; font-weight:700;'>0.0 s</div></div>
     <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px; color:#94a3b8;'>Dropped frames</div><div id='drops' style='font-size:22px; font-weight:700;'>0</div></div>
@@ -351,7 +345,7 @@ def build_hlsjs_player_html(manifest_url: str, title: str = "HLS playback", auto
   </div>
   <div style='background:#111827; border-radius:12px; padding:12px; margin-top:14px;'>
     <div style='font-size:13px; font-weight:600; margin-bottom:8px;'>Player event log</div>
-    <div id='log' style='font-size:12px; line-height:1.6; color:#cbd5e1; max-height:160px; overflow:auto;'>Booting HLS.js…</div>
+    <div id='log' style='font-size:12px; line-height:1.6; color:#cbd5e1; max-height:160px; overflow:auto;'>Waiting for manifest and first segments…</div>
   </div>
 </div>
 <script src='https://cdn.jsdelivr.net/npm/hls.js@latest'></script>
@@ -396,64 +390,69 @@ def build_hlsjs_player_html(manifest_url: str, title: str = "HLS playback", auto
       elLatency.textContent = window.hls.latency.toFixed(1) + ' s';
     }}
   }}
-
-  if (Hls.isSupported()) {{
-    const hls = new Hls({{
-      lowLatencyMode: {low_latency_str},
-      backBufferLength: 90,
-      liveSyncDurationCount: 2,
-      liveMaxLatencyDurationCount: 4,
-      maxLiveSyncPlaybackRate: 1.2,
-      enableWorker: true,
-    }});
-    window.hls = hls;
-    hls.loadSource(manifestUrl);
-    hls.attachMedia(video);
-    hls.on(Hls.Events.MEDIA_ATTACHED, function() {{
-      elState.textContent = 'media attached';
-      pushLog('Media attached');
+  function setupPlayer() {{
+    if (Hls.isSupported()) {{
+      const hls = new Hls({{
+        lowLatencyMode: {low_latency_str},
+        backBufferLength: 30,
+        liveSyncDurationCount: 2,
+        liveMaxLatencyDurationCount: 3,
+        maxLiveSyncPlaybackRate: 1.3,
+        fragLoadingRetryDelay: 500,
+        manifestLoadingRetryDelay: 500,
+        levelLoadingRetryDelay: 500,
+        enableWorker: true,
+      }});
+      window.hls = hls;
+      hls.loadSource(manifestUrl);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MEDIA_ATTACHED, function() {{
+        elState.textContent = 'media attached';
+        pushLog('Media attached; waiting for segments');
+      }});
+      hls.on(Hls.Events.MANIFEST_LOADED, function() {{
+        elState.textContent = 'manifest loaded';
+        pushLog('Manifest reachable');
+      }});
+      hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {{
+        elState.textContent = 'manifest parsed';
+        pushLog('Manifest parsed with ' + data.levels.length + ' levels');
+        if ({autoplay_str}) video.play().catch(() => {{}});
+      }});
+      hls.on(Hls.Events.LEVEL_LOADED, function(event, data) {{
+        pushLog('Playlist refreshed with ' + data.details.fragments.length + ' fragments');
+      }});
+      hls.on(Hls.Events.LEVEL_SWITCHED, function(event, data) {{
+        const level = hls.levels[data.level];
+        const label = level ? ((level.height || '?') + 'p @ ' + Math.round((level.bitrate || 0)/1000) + ' kbps') : String(data.level);
+        elLevel.textContent = label;
+        pushLog('Level switched to ' + label);
+      }});
+      hls.on(Hls.Events.ERROR, function(event, data) {{
+        pushLog('HLS error: ' + data.type + ' | ' + data.details);
+        elState.textContent = data.fatal ? 'fatal error' : 'recoverable error';
+        if (data.fatal) {{
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+          else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+        }}
+      }});
+    }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+      video.src = manifestUrl;
+      elState.textContent = 'native HLS';
       if ({autoplay_str}) video.play().catch(() => {{}});
-    }});
-    hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {{
-      elState.textContent = 'manifest parsed';
-      pushLog('Manifest parsed with ' + data.levels.length + ' levels');
-      if ({autoplay_str}) video.play().catch(() => {{}});
-    }});
-    hls.on(Hls.Events.LEVEL_SWITCHED, function(event, data) {{
-      const level = hls.levels[data.level];
-      const label = level ? ((level.height || '?') + 'p @ ' + Math.round((level.bitrate || 0)/1000) + ' kbps') : String(data.level);
-      elLevel.textContent = label;
-      pushLog('Level switched to ' + label);
-    }});
-    hls.on(Hls.Events.FRAG_BUFFERED, function() {{
-      elState.textContent = video.paused ? 'buffered / paused' : 'playing';
-      updateMetrics();
-    }});
-    hls.on(Hls.Events.ERROR, function(event, data) {{
-      pushLog('HLS error: ' + data.type + ' | ' + data.details);
-      elState.textContent = data.fatal ? 'fatal error' : 'recoverable error';
-      if (data.fatal) {{
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-        else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-      }}
-    }});
-  }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-    video.src = manifestUrl;
-    elState.textContent = 'native HLS';
-    pushLog('Using native HLS playback');
-    if ({autoplay_str}) video.play().catch(() => {{}});
-  }} else {{
-    elState.textContent = 'unsupported';
-    pushLog('This browser does not support HLS playback');
+    }} else {{
+      elState.textContent = 'unsupported';
+      pushLog('This browser does not support HLS playback');
+    }}
   }}
-
-  ['play','pause','waiting','playing','seeking','stalled','ended','loadedmetadata'].forEach(function(evt) {{
+  ['play','pause','waiting','playing','seeking','stalled','ended','loadedmetadata','canplay'].forEach(function(evt) {{
     video.addEventListener(evt, function() {{
       elState.textContent = evt;
       pushLog('Video event: ' + evt);
       updateMetrics();
     }});
   }});
+  setupPlayer();
   setInterval(updateMetrics, 1000);
 }})();
 </script>
@@ -574,11 +573,11 @@ def ladder_dimensions(aspect_label: str, rung: int, src_meta: Optional[dict] = N
             h = rung; w = _to_even(round(h * sw / sh)); return w, _to_even(h)
         w = rung; h = _to_even(round(w * sh / sw)); return _to_even(w), h
     mapping = {
-        "16:9 Landscape": {360: (640, 360), 540: (960, 540), 720: (1280, 720), 1080: (1920, 1080)},
-        "9:16 Vertical": {360: (360, 640), 540: (540, 960), 720: (720, 1280), 1080: (1080, 1920)},
-        "1:1 Square": {360: (360, 360), 540: (540, 540), 720: (720, 720), 1080: (1080, 1080)},
-        "4:5 Portrait": {360: (288, 360), 540: (432, 540), 720: (576, 720), 1080: (864, 1080)},
-        "3:4 Portrait": {360: (270, 360), 540: (406, 540), 720: (540, 720), 1080: (810, 1080)},
+        "16:9 Landscape": {360: (640, 360), 540: (960, 540)},
+        "9:16 Vertical": {360: (360, 640), 540: (540, 960)},
+        "1:1 Square": {360: (360, 360), 540: (540, 540)},
+        "4:5 Portrait": {360: (288, 360), 540: (432, 540)},
+        "3:4 Portrait": {360: (270, 360), 540: (406, 540)},
     }
     return mapping.get(aspect_label, mapping["16:9 Landscape"])[rung]
 
@@ -589,7 +588,7 @@ def variant_video_filter(width: int, height: int) -> str:
 
 def build_abr_ladder(aspect_label: str, src_meta: Optional[dict] = None) -> list[dict]:
     out = []
-    for rung in (360, 540, 720, 1080):
+    for rung in ABR_RUNGS:
         w, h = ladder_dimensions(aspect_label, rung, src_meta=src_meta)
         s = ABR_RUNG_SETTINGS[rung]
         vbps = int(re.sub(r"[^0-9]", "", s["video_bitrate"])) * 1000
@@ -598,28 +597,47 @@ def build_abr_ladder(aspect_label: str, src_meta: Optional[dict] = None) -> list
     return out
 
 
-def build_single_rendition_hls_cmd(input_source: str, manifest_path: str, segment_pattern: str, aspect_label: str = "Source / Passthrough", video_bitrate: str = "4500k", audio_bitrate: str = "128k", preset: str = "veryfast", fps: Optional[int] = None, live: bool = False, segment_seconds: int = DEFAULT_SEGMENT_SECONDS, list_size: int = DEFAULT_LIVE_LIST_SIZE) -> list[str]:
+def create_placeholder_hls_structure(out_dir: str, ladder: list[dict], segment_seconds: int, single_manifest_name: Optional[str] = None) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    if ladder:
+        master = os.path.join(out_dir, "master.m3u8")
+        lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
+        for variant in ladder:
+            lines.append(f"#EXT-X-STREAM-INF:BANDWIDTH={variant['bandwidth']},AVERAGE-BANDWIDTH={variant['avg_bandwidth']},RESOLUTION={variant['width']}x{variant['height']}")
+            lines.append(f"{variant['name']}.m3u8")
+            media = os.path.join(out_dir, f"{variant['name']}.m3u8")
+            Path(media).write_text("\n".join(["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{segment_seconds}", "#EXT-X-MEDIA-SEQUENCE:0"]) + "\n", encoding="utf-8")
+        Path(master).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return master
+    token = single_manifest_name or "stream.m3u8"
+    manifest = os.path.join(out_dir, token)
+    Path(manifest).write_text("\n".join(["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{segment_seconds}", "#EXT-X-MEDIA-SEQUENCE:0"]) + "\n", encoding="utf-8")
+    return manifest
+
+
+def build_single_preview_hls_cmd(input_source: str, manifest_path: str, segment_pattern: str, aspect_label: str = "Source / Passthrough", video_bitrate: str = "1400k", audio_bitrate: str = "96k", preset: str = "superfast", fps: Optional[int] = None, segment_seconds: int = DEFAULT_SEGMENT_SECONDS) -> list[str]:
     vf = None
     if aspect_label != "Source / Passthrough":
-        w, h = ladder_dimensions(aspect_label, 1080)
+        w, h = ladder_dimensions(aspect_label, 540)
         vf = variant_video_filter(w, h)
-    cmd = ["ffmpeg", "-y"]
-    if live:
-        cmd += ["-fflags", "nobuffer", "-flags", "low_delay", "-thread_queue_size", "1024"]
-    cmd += ["-i", input_source]
+    cmd = ["ffmpeg", "-y", "-i", input_source]
     if vf:
         cmd += ["-vf", vf]
     if fps:
         cmd += ["-r", str(fps)]
-    cmd += ["-c:v", "libx264", "-preset", preset, "-pix_fmt", "yuv420p", "-profile:v", "high", "-level:v", "4.1", "-b:v", video_bitrate, "-maxrate", video_bitrate, "-bufsize", f"{max(int(re.sub(r'[^0-9]', '', video_bitrate) or '4500') * 2, 2000)}k", "-g", str(_gop_for_fps(fps)), "-keyint_min", str(_gop_for_fps(fps)), "-sc_threshold", "0", "-c:a", "aac", "-b:a", audio_bitrate, "-ar", "48000", "-ac", "2"]
-    if live:
-        cmd += ["-f", "hls", "-hls_time", str(segment_seconds), "-hls_list_size", str(list_size), "-hls_flags", "delete_segments+append_list+independent_segments+program_date_time", "-hls_segment_filename", segment_pattern, manifest_path]
-    else:
-        cmd += ["-f", "hls", "-hls_time", str(segment_seconds), "-hls_playlist_type", "vod", "-hls_list_size", "0", "-hls_flags", "independent_segments", "-hls_segment_filename", segment_pattern, manifest_path]
+    cmd += [
+        "-c:v", "libx264", "-preset", preset, "-pix_fmt", "yuv420p", "-profile:v", "main",
+        "-b:v", video_bitrate, "-maxrate", video_bitrate, "-bufsize", f"{max(int(re.sub(r'[^0-9]', '', video_bitrate) or '1400') * 2, 1000)}k",
+        "-g", str(_gop_for_fps(fps)), "-keyint_min", str(_gop_for_fps(fps)), "-sc_threshold", "0",
+        "-c:a", "aac", "-b:a", audio_bitrate, "-ar", "48000", "-ac", "2",
+        "-f", "hls", "-hls_time", str(segment_seconds), "-hls_list_size", "0",
+        "-hls_flags", "append_list+independent_segments+program_date_time",
+        "-hls_segment_filename", segment_pattern, manifest_path,
+    ]
     return cmd
 
 
-def build_multi_variant_hls_cmd(input_source: str, out_dir: str, aspect_label: str = "16:9 Landscape", preset: str = "veryfast", fps: Optional[int] = None, live: bool = False, segment_seconds: int = DEFAULT_SEGMENT_SECONDS, list_size: int = DEFAULT_LIVE_LIST_SIZE, src_meta: Optional[dict] = None) -> tuple[list[str], list[dict], str]:
+def build_multi_variant_hls_cmd(input_source: str, out_dir: str, aspect_label: str = "16:9 Landscape", preset: str = "superfast", fps: Optional[int] = None, progressive_preview: bool = True, segment_seconds: int = DEFAULT_SEGMENT_SECONDS, src_meta: Optional[dict] = None) -> tuple[list[str], list[dict], str]:
     os.makedirs(out_dir, exist_ok=True)
     ladder = build_abr_ladder(aspect_label=aspect_label, src_meta=src_meta)
     split_labels = [f"v{i}" for i in range(len(ladder))]
@@ -630,21 +648,23 @@ def build_multi_variant_hls_cmd(input_source: str, out_dir: str, aspect_label: s
         if fps:
             vf += f",fps={fps}"
         filter_parts.append(f"[{split_labels[idx]}]{vf}[{out_labels[idx]}]")
-    cmd = ["ffmpeg", "-y"]
-    if live:
-        cmd += ["-fflags", "nobuffer", "-flags", "low_delay", "-thread_queue_size", "1024"]
-    cmd += ["-i", input_source, "-filter_complex", ";".join(filter_parts)]
+    cmd = ["ffmpeg", "-y", "-i", input_source, "-filter_complex", ";".join(filter_parts)]
     for idx in range(len(ladder)):
         cmd += ["-map", f"[{out_labels[idx]}]", "-map", "0:a:0?"]
     for idx, variant in enumerate(ladder):
-        cmd += [f"-c:v:{idx}", "libx264", f"-preset:v:{idx}", preset, f"-pix_fmt:v:{idx}", "yuv420p", f"-profile:v:{idx}", "high", f"-level:v:{idx}", "4.1", f"-b:v:{idx}", variant["video_bitrate"], f"-maxrate:v:{idx}", variant["maxrate"], f"-bufsize:v:{idx}", variant["bufsize"], f"-g:v:{idx}", str(_gop_for_fps(fps)), f"-keyint_min:v:{idx}", str(_gop_for_fps(fps)), f"-sc_threshold:v:{idx}", "0", f"-c:a:{idx}", "aac", f"-b:a:{idx}", variant["audio_bitrate"], f"-ar:a:{idx}", "48000", f"-ac:a:{idx}", "2"]
+        cmd += [
+            f"-c:v:{idx}", "libx264", f"-preset:v:{idx}", preset, f"-pix_fmt:v:{idx}", "yuv420p", f"-profile:v:{idx}", "main",
+            f"-b:v:{idx}", variant["video_bitrate"], f"-maxrate:v:{idx}", variant["maxrate"], f"-bufsize:v:{idx}", variant["bufsize"],
+            f"-g:v:{idx}", str(_gop_for_fps(fps)), f"-keyint_min:v:{idx}", str(_gop_for_fps(fps)), f"-sc_threshold:v:{idx}", "0",
+            f"-c:a:{idx}", "aac", f"-b:a:{idx}", variant["audio_bitrate"], f"-ar:a:{idx}", "48000", f"-ac:a:{idx}", "2",
+        ]
     master_name = "master.m3u8"
     segment_pattern = os.path.join(out_dir, "%v_%06d.ts")
     media_playlist_pattern = os.path.join(out_dir, "%v.m3u8")
     var_stream_map = " ".join(f"v:{idx},a:{idx},name:{variant['name']}" for idx, variant in enumerate(ladder))
     cmd += ["-master_pl_name", master_name, "-f", "hls", "-hls_time", str(segment_seconds), "-hls_segment_filename", segment_pattern, "-var_stream_map", var_stream_map]
-    if live:
-        cmd += ["-hls_list_size", str(list_size), "-hls_flags", "delete_segments+append_list+independent_segments+program_date_time"]
+    if progressive_preview:
+        cmd += ["-hls_list_size", "0", "-hls_flags", "append_list+independent_segments+program_date_time"]
     else:
         cmd += ["-hls_playlist_type", "vod", "-hls_list_size", "0", "-hls_flags", "independent_segments"]
     cmd += [media_playlist_pattern]
@@ -680,53 +700,72 @@ def stop_live_job(job: Optional[dict]) -> None:
         pass
 
 
+def start_background_ffmpeg_job(cmd: list[str], out_dir: str, manifest_path: str, ladder: list[dict], input_source: str, log_name: str, server_info: Optional[dict] = None) -> dict:
+    log_path = os.path.join(out_dir, log_name)
+    log_fp = open(log_path, "w", encoding="utf-8")
+    if server_info is None:
+        server_info = start_static_file_server(out_dir)
+    proc = subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT, text=True)
+    manifest_url = f"{server_info['base_url']}/{os.path.basename(manifest_path)}"
+    return {
+        "proc": proc,
+        "out_dir": out_dir,
+        "master_manifest": manifest_path,
+        "manifest_url": manifest_url,
+        "server_info": server_info,
+        "log_path": log_path,
+        "input_source": input_source,
+        "ladder": ladder,
+        "started_at": time.time(),
+    }
+
+
+def collect_job_outputs(job: dict) -> dict:
+    out_dir = job.get("out_dir")
+    zbytes = zip_dir_bytes(out_dir) if out_dir and os.path.isdir(out_dir) else None
+    return {"zip_bytes": zbytes}
+
+
 @dataclass
-class BuildHlsResult:
-    ok: bool
-    message: str
+class PreviewHlsJobStartResult:
     out_dir: str
     master_manifest: str
-    zip_bytes: bytes | None
-    ffmpeg_log: str
+    manifest_url: str
     ladder: list[dict]
-    manifest_url: str | None = None
-    server_info: dict | None = None
+    server_info: dict
+    job: dict
 
 
-def build_vod_hls_package(input_source: str, asset_name: str, aspect_label: str, preset: str, fps: Optional[int], segment_seconds: int, abr_enabled: bool, src_meta: Optional[dict] = None) -> BuildHlsResult:
-    out_dir = tempfile.mkdtemp(prefix="videoforge_hls_")
+def start_vod_preview_job(input_source: str, asset_name: str, aspect_label: str, preset: str, fps: Optional[int], segment_seconds: int, abr_enabled: bool, src_meta: Optional[dict] = None) -> PreviewHlsJobStartResult:
+    out_dir = tempfile.mkdtemp(prefix="videoforge_hls_preview_")
     ensure_clean_dir(out_dir)
     if abr_enabled:
-        cmd, ladder, master_manifest = build_multi_variant_hls_cmd(input_source=input_source, out_dir=out_dir, aspect_label=aspect_label, preset=preset, fps=fps, live=False, segment_seconds=segment_seconds, src_meta=src_meta)
+        ladder = build_abr_ladder(aspect_label=aspect_label, src_meta=src_meta)
+        master_manifest = create_placeholder_hls_structure(out_dir, ladder, segment_seconds)
+        cmd, ladder, master_manifest = build_multi_variant_hls_cmd(input_source=input_source, out_dir=out_dir, aspect_label=aspect_label, preset=preset, fps=fps, progressive_preview=True, segment_seconds=segment_seconds, src_meta=src_meta)
     else:
-        token = safe_token(Path(asset_name).stem)
-        master_manifest = os.path.join(out_dir, f"{token}.m3u8")
-        segment_pattern = os.path.join(out_dir, f"{token}_%05d.ts")
-        cmd = build_single_rendition_hls_cmd(input_source=input_source, manifest_path=master_manifest, segment_pattern=segment_pattern, aspect_label=aspect_label, live=False, segment_seconds=segment_seconds, preset=preset, fps=fps)
         ladder = []
-    ok, msg, ffmpeg_log = run_ffmpeg(cmd)
-    zbytes = zip_dir_bytes(out_dir) if ok else None
-    manifest_url = None
-    server_info = None
-    if ok:
-        server_info = start_static_file_server(out_dir)
-        manifest_url = f"{server_info['base_url']}/{os.path.basename(master_manifest)}"
-    return BuildHlsResult(ok=ok, message=msg, out_dir=out_dir, master_manifest=master_manifest, zip_bytes=zbytes, ffmpeg_log=ffmpeg_log, ladder=ladder, manifest_url=manifest_url, server_info=server_info)
+        token = safe_token(Path(asset_name).stem) + ".m3u8"
+        master_manifest = create_placeholder_hls_structure(out_dir, [], segment_seconds, single_manifest_name=token)
+        segment_pattern = os.path.join(out_dir, safe_token(Path(asset_name).stem) + "_%05d.ts")
+        cmd = build_single_preview_hls_cmd(input_source=input_source, manifest_path=master_manifest, segment_pattern=segment_pattern, aspect_label=aspect_label, preset=preset, fps=fps, segment_seconds=segment_seconds)
+    server_info = start_static_file_server(out_dir)
+    job = start_background_ffmpeg_job(cmd=cmd, out_dir=out_dir, manifest_path=master_manifest, ladder=ladder, input_source=input_source, log_name="ffmpeg_preview.log", server_info=server_info)
+    return PreviewHlsJobStartResult(out_dir=out_dir, master_manifest=master_manifest, manifest_url=job["manifest_url"], ladder=ladder, server_info=server_info, job=job)
 
 
 def start_live_hls_job(input_source: str, aspect_label: str, preset: str, fps: Optional[int], segment_seconds: int, list_size: int, abr_enabled: bool, src_meta: Optional[dict] = None) -> tuple[dict, list[dict]]:
     out_dir = tempfile.mkdtemp(prefix="videoforge_live_hls_")
     ensure_clean_dir(out_dir)
     if abr_enabled:
-        cmd, ladder, master_manifest = build_multi_variant_hls_cmd(input_source=input_source, out_dir=out_dir, aspect_label=aspect_label, preset=preset, fps=fps, live=True, segment_seconds=segment_seconds, list_size=list_size, src_meta=src_meta)
+        ladder = build_abr_ladder(aspect_label=aspect_label, src_meta=src_meta)
+        master_manifest = create_placeholder_hls_structure(out_dir, ladder, segment_seconds)
+        cmd, ladder, master_manifest = build_multi_variant_hls_cmd(input_source=input_source, out_dir=out_dir, aspect_label=aspect_label, preset=preset, fps=fps, progressive_preview=True, segment_seconds=segment_seconds, src_meta=src_meta)
     else:
-        master_manifest = os.path.join(out_dir, "live.m3u8")
-        segment_pattern = os.path.join(out_dir, "live_%05d.ts")
-        cmd = build_single_rendition_hls_cmd(input_source=input_source, manifest_path=master_manifest, segment_pattern=segment_pattern, aspect_label=aspect_label, live=True, segment_seconds=segment_seconds, list_size=list_size, preset=preset, fps=fps)
         ladder = []
-    log_path = os.path.join(out_dir, "ffmpeg_live.log")
-    log_fp = open(log_path, "w", encoding="utf-8")
+        master_manifest = create_placeholder_hls_structure(out_dir, [], segment_seconds, single_manifest_name="live.m3u8")
+        segment_pattern = os.path.join(out_dir, "live_%05d.ts")
+        cmd = build_single_preview_hls_cmd(input_source=input_source, manifest_path=master_manifest, segment_pattern=segment_pattern, aspect_label=aspect_label, preset=preset, fps=fps, segment_seconds=segment_seconds)
     server_info = start_static_file_server(out_dir)
-    proc = subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT, text=True)
-    manifest_url = f"{server_info['base_url']}/{os.path.basename(master_manifest)}"
-    return {"proc": proc, "out_dir": out_dir, "master_manifest": master_manifest, "manifest_url": manifest_url, "server_info": server_info, "log_path": log_path, "input_source": input_source, "abr_enabled": abr_enabled}, ladder
+    job = start_background_ffmpeg_job(cmd=cmd, out_dir=out_dir, manifest_path=master_manifest, ladder=ladder, input_source=input_source, log_name="ffmpeg_live.log", server_info=server_info)
+    return job, ladder
