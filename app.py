@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import os
@@ -44,13 +43,13 @@ def render_header():
           <div style='display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;'>
             <div>
               <div class='vf-title'>VideoForge Studio</div>
-              <div class='vf-subtitle'>Free-prototype architecture: Streamlit UI triggers FFmpeg → HLS packaged locally → deployed to Cloudflare Pages Direct Upload → public master.m3u8 played in HLS.js</div>
+              <div class='vf-subtitle'>Matched final pair: Streamlit UI triggers FFmpeg → HLS packaged locally → deployed to Cloudflare Pages Direct Upload → public master.m3u8 played in HLS.js</div>
             </div>
             <div>
-              <span class='vf-chip'>Cloudflare Pages Direct Upload</span>
+              <span class='vf-chip'>Cloudflare Pages</span>
               <span class='vf-chip'>ABR 360p / 540p</span>
               <span class='vf-chip'>HLS.js embedded player</span>
-              <span class='vf-chip'>Player-side analytics</span>
+              <span class='vf-chip'>Same matched backend</span>
             </div>
           </div>
         </div>
@@ -101,17 +100,17 @@ def render_player(manifest_url: str | None, title: str):
 
 def restream_pages_workflow():
     st.subheader("📡 Upload file → Cloudflare Pages origin → HLS.js playback")
-    st.info("This final prototype path is optimized for a free demo: Streamlit handles UI + FFmpeg processing, but Cloudflare Pages is the public origin for `master.m3u8` and segments.")
+    st.info("This is the rechecked matched final version. Replace both files together.")
 
     st.markdown("### 1) Cloudflare Pages Direct Upload settings")
     c1, c2 = st.columns(2)
     with c1:
-        project_name = st.text_input("Pages project name", value=os.getenv("CLOUDFLARE_PAGES_PROJECT_NAME", ""), help="Direct Upload project in Cloudflare Pages. Production URL is <project>.pages.dev.")
-        branch_prefix = st.text_input("Preview branch prefix", value=os.getenv("CLOUDFLARE_PAGES_BRANCH_PREFIX", "preview"), help="Each upload can be pushed to a preview branch alias for a unique URL.")
+        project_name = st.text_input("Pages project name", value=os.getenv("CLOUDFLARE_PAGES_PROJECT_NAME", ""))
+        branch_prefix = st.text_input("Preview branch prefix", value=os.getenv("CLOUDFLARE_PAGES_BRANCH_PREFIX", "preview"))
     with c2:
         account_id = st.text_input("Cloudflare account ID", value=os.getenv("CLOUDFLARE_ACCOUNT_ID", ""))
         api_token = st.text_input("Cloudflare API token", value=os.getenv("CLOUDFLARE_API_TOKEN", ""), type="password")
-    use_production_branch = st.checkbox("Deploy to production branch / root pages.dev URL", value=False, help="Unchecked is safer for prototypes because each upload creates a preview alias URL instead of overwriting the root deployment.")
+    use_production_branch = st.checkbox("Deploy to production branch / root pages.dev URL", value=False)
 
     cf_cfg = None
     if project_name and account_id and api_token:
@@ -130,7 +129,7 @@ def restream_pages_workflow():
     segment_seconds = s3.slider("HLS segment (s)", 1, 6, backend.DEFAULT_SEGMENT_SECONDS)
     preset = s4.selectbox("x264 preset", ["ultrafast", "superfast", "veryfast", "faster", "fast"], index=1)
     ladder = backend.build_abr_ladder(aspect_label=aspect)
-    with st.expander("ABR ladder (capped for free prototype)", expanded=True):
+    with st.expander("ABR ladder", expanded=True):
         render_ladder(ladder)
 
     uploaded = st.file_uploader(f"Upload source video (recommended max {backend.MAX_UPLOAD_MB} MB)", type=["avi", "mp4", "mkv", "mov", "webm", "flv", "ts", "m4v", "mxf"], key="upload_pages_hls")
@@ -154,11 +153,11 @@ def restream_pages_workflow():
     size_mb = os.path.getsize(src_path) / (1024 * 1024)
     st.caption(f"Source: {meta['width']}×{meta['height']} @ {meta['fps']} fps · {meta['duration']:.1f}s · {meta['vcodec'].upper()}")
 
-    run_disabled = (cf_cfg is None) or (not backend.ffmpeg_ok()) or (not backend.wrangler_ok())
-    if st.button("🎬 Generate HLS + Deploy to Cloudflare Pages", type="primary", disabled=run_disabled):
-        with st.spinner("FFmpeg is generating HLS and Wrangler is deploying the folder to Cloudflare Pages…"):
+    disabled = (cf_cfg is None) or (not backend.ffmpeg_ok()) or (not backend.wrangler_ok())
+    if st.button("🎬 Generate HLS + Deploy to Cloudflare Pages", type="primary", disabled=disabled):
+        with st.spinner("FFmpeg is generating HLS and Wrangler is deploying to Cloudflare Pages…"):
             fps_value = None if target_fps == "Source" else int(target_fps)
-            result = backend.package_and_deploy_vod_to_pages(
+            st.session_state.restream_result = backend.package_and_deploy_vod_to_pages(
                 input_source=src_path,
                 asset_name=uploaded.name,
                 aspect_label=aspect,
@@ -168,10 +167,8 @@ def restream_pages_workflow():
                 cf=cf_cfg,
                 src_meta=meta,
             )
-            st.session_state.restream_result = result
 
     result = st.session_state.restream_result
-
     left, right = st.columns([2, 3], gap="large")
     with left:
         render_source_info(meta, size_mb)
@@ -187,7 +184,7 @@ def restream_pages_workflow():
                 st.caption(f"Preview branch alias: {result.branch_alias}")
             with st.expander("FFmpeg log"):
                 st.code(result.ffmpeg_log or "(empty)", language="bash")
-            with st.expander("Wrangler / Cloudflare Pages deploy log"):
+            with st.expander("Wrangler deploy log"):
                 st.code(result.deploy_log or "(empty)", language="bash")
             if result.zip_bytes:
                 st.download_button("⬇ Download generated HLS bundle (.zip)", data=result.zip_bytes, file_name="cloudflare_pages_hls_bundle.zip", mime="application/zip")
@@ -201,35 +198,18 @@ def restream_pages_workflow():
         render_player(result.manifest_url if result else None, title=f"{aspect} Cloudflare Pages playback")
         st.markdown("<div class='vf-card'>", unsafe_allow_html=True)
         st.markdown("**📡 Playback analytics companion**")
-        components.html(backend.build_player_analytics_html(meta, source_label="Source-side analytics companion"), height=360, scrolling=True)
+        components.html(backend.build_player_analytics_html(meta, source_label="Source-side analytics companion"), height=220, scrolling=True)
         st.markdown("</div>", unsafe_allow_html=True)
-
-    st.divider()
-    st.markdown("### How this prototype works")
-    st.markdown(
-        "- **Streamlit UI triggers the job** after upload.\n"
-        "- **FFmpeg** generates ABR HLS (360p + 540p) locally.\n"
-        "- **Wrangler Pages Direct Upload** pushes the generated folder to Cloudflare Pages.\n"
-        "- The UI receives a **public `master.m3u8` URL** (`<branch>.<project>.pages.dev/master.m3u8` for preview, or `<project>.pages.dev/master.m3u8` for production).\n"
-        "- Embedded **HLS.js** plays that public URL.\n"
-        "- The analytics widget reads **actual player events** from the embedded player."
-    )
-    st.markdown("### Important notes for free prototype")
-    st.markdown(
-        "- This implementation is best for **prototype / demo VOD packaging** rather than true continuous livestream origin updates.\n"
-        "- Cloudflare Pages Direct Upload is static deployment oriented, so a real always-on low-latency live origin is not the target for Pages.\n"
-        "- Use the **preview branch alias** option for safer experiments; deploy to production only when you want to overwrite the root Pages URL."
-    )
 
 
 def main():
     render_header()
     if not backend.ffmpeg_ok():
-        st.error("FFmpeg / ffprobe not found. Make sure ffmpeg is installed in your runtime.")
+        st.error("FFmpeg / ffprobe not found.")
         st.stop()
     restream_pages_workflow()
     st.markdown("---")
-    st.caption("VideoForge Studio · Streamlit UI + processing · Cloudflare Pages origin · embedded HLS.js player")
+    st.caption("Rechecked final matched pair: app.py + backend.py")
 
 
 if __name__ == "__main__":
