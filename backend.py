@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import tempfile
-import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,9 +93,12 @@ def format_sample_rate(sr: int) -> str:
 def format_channels(ch: int) -> str:
     return {1: "Mono", 2: "Stereo", 6: "5.1", 8: "7.1"}.get(ch, f"{ch} ch")
 
+# -----------------------------
+# Smart reframe engine
+# -----------------------------
 
 def _tiktok_crop_box(src_w: int, src_h: int) -> tuple[int, int]:
-    if src_w / src_h >= 9/16:
+    if src_w / src_h >= 9 / 16:
         crop_h = src_h
         crop_w = int(round(src_h * 9 / 16))
     else:
@@ -115,17 +117,27 @@ def _bbox_center(box):
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
-# -----------------------------
-# Smart reframe engine
-# -----------------------------
+
+def _circularity(cnt) -> float:
+    area = cv2.contourArea(cnt)
+    if area <= 0:
+        return 0.0
+    peri = cv2.arcLength(cnt, True)
+    if peri <= 0:
+        return 0.0
+    return float(4 * math.pi * area / (peri * peri))
+
 
 def smart_reframe_vertical(
     input_path: str,
     output_path: str,
     target_w: int = DEFAULT_TARGET_W,
     target_h: int = DEFAULT_TARGET_H,
-    smooth_strength: float = 0.88,
-    lead_room: float = 0.18,
+    smooth_strength: float = 0.90,
+    lead_room: float = 0.20,
+    sports_mode: bool = True,
+    detect_ball: bool = True,
+    detect_players: bool = True,
     progress_cb: Optional[Callable[[float, str], None]] = None,
 ) -> tuple[bool, str]:
     cap = cv2.VideoCapture(input_path)
@@ -150,10 +162,19 @@ def smart_reframe_vertical(
         cap.release()
         return False, "Could not create output video writer"
 
+    # detectors
     face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    hog = None
+    if detect_players:
+        try:
+            hog = cv2.HOGDescriptor()
+            hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        except Exception:
+            hog = None
     saliency = None
     try:
-        saliency = cv2.saliency.StaticSaliencySpectralResidual_create()
+        if hasattr(cv2, 'saliency'):
+            saliency = cv2.saliency.StaticSaliencySpectralResidual_create()
     except Exception:
         saliency = None
 
@@ -162,6 +183,11 @@ def smart_reframe_vertical(
     smoothed_cy = src_h / 2
     prev_target_cx = smoothed_cx
     prev_target_cy = smoothed_cy
+    last_player_boxes = []
+    analysis_stride = 3 if sports_mode else 5
+    max_pan_px = max(8, crop_w * 0.06)  # motion-aware smoothing cap per processed frame
+    deadzone_px = max(6, crop_w * 0.02)
+    last_ball_center = None
 
     idx = 0
     while True:
@@ -171,14 +197,34 @@ def smart_reframe_vertical(
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         candidates = []
 
+        # 1) optional face detection (useful for interviews / close-up)
         try:
             faces = face_detector.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=4, minSize=(40, 40))
         except Exception:
             faces = []
-        for (x, y, w, h) in faces:
-            candidates.append((0.65, (x, y, w, h)))
+        for (x, y, w, h) in faces[:2]:
+            candidates.append((0.45, (x, y, w, h), 'face'))
 
-        if saliency is not None:
+        # 2) sports-aware player detection (HOG, only every few frames)
+        if detect_players and hog is not None and (idx % analysis_stride == 0):
+            try:
+                rects, weights = hog.detectMultiScale(frame, winStride=(8, 8), padding=(8, 8), scale=1.05)
+                player_boxes = []
+                for (x, y, w, h), wt in zip(rects, weights):
+                    area = w * h
+                    if area < 0.015 * src_w * src_h:
+                        continue
+                    player_boxes.append((float(wt), (int(x), int(y), int(w), int(h))))
+                player_boxes.sort(key=lambda z: z[0], reverse=True)
+                last_player_boxes = player_boxes[:4]
+            except Exception:
+                pass
+        for wt, box in last_player_boxes[:4]:
+            base_w = 0.22 if sports_mode else 0.18
+            candidates.append((base_w + min(0.12, wt / 5.0), box, 'player'))
+
+        # 3) saliency fallback
+        if saliency is not None and (idx % analysis_stride == 0):
             try:
                 success, sal_map = saliency.computeSaliency(frame)
                 if success:
@@ -189,29 +235,67 @@ def smart_reframe_vertical(
                         c = max(cnts, key=cv2.contourArea)
                         x, y, w, h = cv2.boundingRect(c)
                         if w * h > 0.02 * src_w * src_h:
-                            candidates.append((0.45, (x, y, w, h)))
+                            candidates.append((0.18, (x, y, w, h), 'saliency'))
             except Exception:
                 pass
 
+        # 4) motion & ball candidate
         if prev_gray is not None:
             diff = cv2.absdiff(gray, prev_gray)
-            diff = cv2.GaussianBlur(diff, (9, 9), 0)
-            _, motion = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY)
+            diff = cv2.GaussianBlur(diff, (7, 7), 0)
+            _, motion = cv2.threshold(diff, 20, 255, cv2.THRESH_BINARY)
             motion = cv2.dilate(motion, None, iterations=2)
             cnts, _ = cv2.findContours(motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if cnts:
-                c = max(cnts, key=cv2.contourArea)
+            big_motion_added = False
+            ball_added = False
+            # sort by area descending for robust processing
+            cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+            for c in cnts[:20]:
                 x, y, w, h = cv2.boundingRect(c)
-                if w * h > 0.01 * src_w * src_h:
-                    candidates.append((0.35, (x, y, w, h)))
+                area = float(w * h)
+                if area < 15:
+                    continue
+                # large motion region (pan / active play area)
+                if not big_motion_added and area > 0.015 * src_w * src_h:
+                    candidates.append((0.22, (x, y, w, h), 'motion'))
+                    big_motion_added = True
+                # ball candidate heuristic: small, compact, fast-moving blob near player cluster or previous ball
+                circ = _circularity(c)
+                aspect = w / max(h, 1)
+                plausible_ball = detect_ball and (0.55 <= circ <= 1.25) and (0.6 <= aspect <= 1.6) and (10 <= w <= 70) and (10 <= h <= 70)
+                if plausible_ball and not ball_added:
+                    cx, cy = _bbox_center((x, y, w, h))
+                    score = 0.0
+                    if last_ball_center is not None:
+                        dist = math.hypot(cx - last_ball_center[0], cy - last_ball_center[1])
+                        score += max(0.0, 1.0 - dist / max(src_w, src_h))
+                    if last_player_boxes:
+                        # prefer ball near players rather than random crowd motion
+                        dists = [math.hypot(cx - _bbox_center(box)[0], cy - _bbox_center(box)[1]) for _, box in last_player_boxes]
+                        if dists:
+                            score += max(0.0, 1.0 - min(dists) / max(src_w, src_h))
+                    candidates.append((0.70 + 0.25 * score, (x, y, w, h), 'ball'))
+                    last_ball_center = (cx, cy)
+                    ball_added = True
+            # decay last ball center if nothing plausible appears for a while
+            if not ball_added and last_ball_center is not None and idx % (analysis_stride * 4) == 0:
+                last_ball_center = None
         prev_gray = gray
 
+        # 5) multi-focus combine (ball + players + action cluster)
         if candidates:
+            # give ball highest priority for sports mode
             weight_sum = 0.0
             cx_sum = 0.0
             cy_sum = 0.0
-            for weight, box in candidates:
+            # keep strongest few to reduce noise
+            candidates = sorted(candidates, key=lambda z: z[0], reverse=True)[:6]
+            for weight, box, tag in candidates:
                 cx, cy = _bbox_center(box)
+                if sports_mode and tag == 'ball':
+                    weight *= 1.25
+                if sports_mode and tag == 'player':
+                    weight *= 1.10
                 weight_sum += weight
                 cx_sum += cx * weight
                 cy_sum += cy * weight
@@ -221,6 +305,7 @@ def smart_reframe_vertical(
             target_cx = smoothed_cx
             target_cy = smoothed_cy
 
+        # 6) motion-aware lead-room
         vel_x = target_cx - prev_target_cx
         vel_y = target_cy - prev_target_cy
         target_cx += vel_x * lead_room
@@ -228,9 +313,18 @@ def smart_reframe_vertical(
         prev_target_cx = target_cx
         prev_target_cy = target_cy
 
+        # 7) motion-aware crop smoothing with deadzone and max pan speed
+        desired_dx = target_cx - smoothed_cx
+        desired_dy = target_cy - smoothed_cy
+        if abs(desired_dx) < deadzone_px:
+            desired_dx = 0.0
+        if abs(desired_dy) < deadzone_px * 0.6:
+            desired_dy = 0.0
         alpha = 1.0 - float(smooth_strength)
-        smoothed_cx = (1 - alpha) * smoothed_cx + alpha * target_cx
-        smoothed_cy = (1 - alpha) * smoothed_cy + alpha * target_cy
+        step_x = max(-max_pan_px, min(max_pan_px, desired_dx * alpha))
+        step_y = max(-max_pan_px * 0.55, min(max_pan_px * 0.55, desired_dy * alpha))
+        smoothed_cx += step_x
+        smoothed_cy += step_y
 
         x0 = int(round(smoothed_cx - crop_w / 2))
         y0 = int(round(smoothed_cy - crop_h / 2))
@@ -244,7 +338,7 @@ def smart_reframe_vertical(
 
         idx += 1
         if progress_cb and frame_count > 0 and idx % 5 == 0:
-            progress_cb(idx / frame_count, f"Smart reframe analysing frame {idx}/{frame_count}")
+            progress_cb(idx / frame_count, f"Sports-aware smart reframe frame {idx}/{frame_count}")
 
     cap.release()
     writer.release()
@@ -268,7 +362,7 @@ class CFStreamConfig:
     account_id: str
     api_token: str
     customer_code: str
-    prefer_low_latency: bool = True
+    prefer_low_latency: bool = False
 
 @dataclass
 class CFStreamLiveSession:
@@ -283,14 +377,15 @@ class CFStreamLiveSession:
     status: str
 
 
-def cfstream_config_from_inputs(account_id: str, api_token: str, customer_code: str, prefer_low_latency: bool = True) -> CFStreamConfig:
+def cfstream_config_from_inputs(account_id: str, api_token: str, customer_code: str, prefer_low_latency: bool = False) -> CFStreamConfig:
     if not account_id:
         raise ValueError('Cloudflare account ID is required.')
     if not api_token:
         raise ValueError('Cloudflare API token is required.')
     if not customer_code:
         raise ValueError('Cloudflare customer code is required for public playback URLs.')
-    return CFStreamConfig(account_id=account_id.strip(), api_token=api_token.strip(), customer_code=customer_code.strip(), prefer_low_latency=bool(prefer_low_latency))
+    code = customer_code.strip().replace('customer-', '').replace('.cloudflarestream.com', '').strip('/')
+    return CFStreamConfig(account_id=account_id.strip(), api_token=api_token.strip(), customer_code=code, prefer_low_latency=bool(prefer_low_latency))
 
 
 def _cf_api_request(cfg: CFStreamConfig, method: str, path: str, payload: Optional[dict] = None) -> tuple[int, dict]:
@@ -299,7 +394,7 @@ def _cf_api_request(cfg: CFStreamConfig, method: str, path: str, payload: Option
     headers = {
         'Authorization': f'Bearer {cfg.api_token}',
         'Content-Type': 'application/json',
-        'User-Agent': 'TikTok-Live-Verticalizer',
+        'User-Agent': 'TikTok-Live-Verticalizer-Sports',
     }
     if payload is not None:
         data = json.dumps(payload).encode('utf-8')
@@ -331,13 +426,6 @@ def create_live_input(cfg: CFStreamConfig, name: str, recording_mode: str = 'aut
     return parsed['result']
 
 
-def get_live_input(cfg: CFStreamConfig, uid: str) -> dict:
-    status, parsed = _cf_api_request(cfg, 'GET', f'/accounts/{cfg.account_id}/stream/live_inputs/{uid}')
-    if status != 200 or not parsed.get('success'):
-        raise RuntimeError(f'Get live input failed: {parsed}')
-    return parsed['result']
-
-
 def disable_live_input(cfg: CFStreamConfig, uid: str) -> None:
     payload = {'enabled': False}
     _cf_api_request(cfg, 'PUT', f'/accounts/{cfg.account_id}/stream/live_inputs/{uid}', payload)
@@ -352,16 +440,19 @@ def build_public_playback_urls(cfg: CFStreamConfig, uid: str) -> tuple[str, str]
     return hls, dash
 
 
-def build_rtmps_push_command(reframed_mp4: str, rtmps_url: str, stream_key: str, fps: Optional[int] = None, loop_input: bool = True) -> list[str]:
+def build_rtmps_push_command(reframed_mp4: str, rtmps_url: str, stream_key: str, fps: Optional[int] = 30, loop_input: bool = True) -> list[str]:
     target = rtmps_url.rstrip('/') + '/' + stream_key
+    fps = int(fps or 30)
+    # tuned for smoother sports motion on Cloudflare preview: 30 fps, ~1.8 Mbps, 2s GOP
     cmd = ['ffmpeg', '-y']
     if loop_input:
         cmd += ['-stream_loop', '-1']
     cmd += ['-re', '-i', reframed_mp4]
-    gop = max((fps or 30) * 2, 48)
+    gop = max(fps * 2, 60)
     cmd += [
         '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
-        '-b:v', '1400k', '-maxrate', '1498k', '-bufsize', '2100k',
+        '-r', str(fps),
+        '-b:v', '1800k', '-maxrate', '2000k', '-bufsize', '3000k',
         '-g', str(gop), '-keyint_min', str(gop), '-sc_threshold', '0',
         '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
         '-f', 'flv', target,
@@ -369,7 +460,7 @@ def build_rtmps_push_command(reframed_mp4: str, rtmps_url: str, stream_key: str,
     return cmd
 
 
-def start_cloudflare_live_push(cfg: CFStreamConfig, reframed_mp4: str, asset_name: str, fps: Optional[int] = None, loop_input: bool = True) -> CFStreamLiveSession:
+def start_cloudflare_live_push(cfg: CFStreamConfig, reframed_mp4: str, asset_name: str, fps: Optional[int] = 30, loop_input: bool = True) -> CFStreamLiveSession:
     live_input = create_live_input(cfg, name=safe_token(Path(asset_name).stem))
     uid = live_input['uid']
     rtmps_url = live_input['rtmps']['url']
@@ -469,11 +560,11 @@ def build_cloudflare_live_player_html(hls_url: str, title: str = 'TikTok-style v
   }}
   if (Hls.isSupported()) {{
     const hls = new Hls({{
-      lowLatencyMode: true,
+      lowLatencyMode: false,
       backBufferLength: 20,
-      liveSyncDurationCount: 2,
-      liveMaxLatencyDurationCount: 4,
-      maxLiveSyncPlaybackRate: 1.25,
+      liveSyncDurationCount: 3,
+      liveMaxLatencyDurationCount: 6,
+      maxLiveSyncPlaybackRate: 1.15,
       enableWorker: true,
       fragLoadingRetryDelay: 500,
       manifestLoadingRetryDelay: 500,
