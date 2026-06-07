@@ -8,7 +8,7 @@ import streamlit.components.v1 as components
 
 import backend
 
-st.set_page_config(page_title='TikTok Live Verticalizer → Cloudflare Stream', page_icon='📱', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='TikTok Live Verticalizer → Cloudflare Stream (Sports)', page_icon='📱', layout='wide', initial_sidebar_state='expanded')
 
 st.markdown("""
 <style>
@@ -32,14 +32,14 @@ st.markdown("""
 <div class='hero'>
   <div style='display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;'>
     <div>
-      <div style='font-size:1.85rem; font-weight:800; margin-bottom:4px;'>TikTok Live Verticalizer → Cloudflare Stream</div>
-      <div style='font-size:.98rem; color:#cbd5e1;'>Fixed version: vertical smart reframe, output pushed to Cloudflare Stream Live input, public Cloudflare playback URL, LIVE UX preserved.</div>
+      <div style='font-size:1.85rem; font-weight:800; margin-bottom:4px;'>TikTok Live Verticalizer → Cloudflare Stream (Sports)</div>
+      <div style='font-size:.98rem; color:#cbd5e1;'>Updated version: sports-aware smart reframe, motion-aware crop smoothing, multi-focus detection (ball + players), and normal HLS playback URL for any open-source HLS player.</div>
     </div>
     <div>
-      <span class='chip'>Vertical smart reframe</span>
-      <span class='chip'>Push to Cloudflare live input</span>
-      <span class='chip'>Public Cloudflare playback URL</span>
-      <span class='chip'>LIVE badge + Go live</span>
+      <span class='chip'>Sports-aware smart reframe</span>
+      <span class='chip'>Motion-aware crop smoothing</span>
+      <span class='chip'>Ball + players focus</span>
+      <span class='chip'>Normal HLS test URL</span>
     </div>
   </div>
 </div>
@@ -55,8 +55,8 @@ with left_cf:
     account_id = st.text_input('Cloudflare account ID', value=os.getenv('CLOUDFLARE_ACCOUNT_ID', ''))
     api_token = st.text_input('Cloudflare Stream API token', value=os.getenv('CLOUDFLARE_STREAM_API_TOKEN', ''), type='password')
 with right_cf:
-    customer_code = st.text_input('Cloudflare Stream customer code', value=os.getenv('CLOUDFLARE_STREAM_CUSTOMER_CODE', ''), help='Needed to construct the public HLS playback URL: https://customer-<CODE>.cloudflarestream.com/<UID>/manifest/video.m3u8')
-    prefer_low_latency = st.checkbox('Prefer LL-HLS where available', value=True)
+    customer_code = st.text_input('Cloudflare Stream customer code', value=os.getenv('CLOUDFLARE_STREAM_CUSTOMER_CODE', ''), help='Enter only the code, not the full domain. Example: p2urnuq01pg24ltd')
+    prefer_low_latency = st.checkbox('Prefer LL-HLS where available', value=False, help='Keep OFF for now to test normal HLS and reduce jitter/debug complexity.')
 
 cf_cfg = None
 if account_id and api_token and customer_code:
@@ -68,15 +68,18 @@ if account_id and api_token and customer_code:
 else:
     st.warning('Fill in Account ID, Stream API token, and customer code.')
 
-st.subheader('2) Smart reframe settings')
+st.subheader('2) Sports smart reframe settings')
 upl = st.file_uploader(f'Upload source video (recommended max {backend.MAX_UPLOAD_MB} MB)', type=['avi', 'mp4', 'mkv', 'mov', 'webm', 'flv', 'ts', 'm4v', 'mxf'])
 reframe_left, reframe_right = st.columns([2, 1], gap='large')
 with reframe_right:
-    smooth_strength = st.slider('Smoothing strength', 0.50, 0.98, 0.88, 0.01)
-    lead_room = st.slider('Lead-room', 0.0, 0.50, 0.18, 0.01)
+    smooth_strength = st.slider('Motion-aware smoothing strength', 0.60, 0.98, 0.90, 0.01)
+    lead_room = st.slider('Lead-room', 0.0, 0.50, 0.20, 0.01)
     target_w = st.selectbox('Vertical output width', [360, 540, 720], index=1)
     target_h = int(round(target_w * 16 / 9))
-    loop_input = st.checkbox('Loop uploaded clip as pseudo-live source', value=True, help='Useful to demonstrate live behavior from a short clip. For real ingest, replace uploaded file with RTMP/SRT camera feed later.')
+    sports_mode = st.checkbox('Sports-aware mode', value=True)
+    detect_ball = st.checkbox('Detect ball focus', value=True)
+    detect_players = st.checkbox('Detect player focus', value=True)
+    loop_input = st.checkbox('Loop uploaded clip as pseudo-live source', value=True)
 
 if upl:
     if getattr(upl, 'size', 0) > backend.MAX_UPLOAD_MB * 1024 * 1024:
@@ -96,10 +99,10 @@ if st.session_state.meta:
     c.metric('Duration', f"{meta['duration']:.1f}s")
 
 progress_bar = st.progress(0.0, text='Waiting')
-if st.button('Analyse + create vertical smart-reframed master', disabled=not bool(st.session_state.input_path)):
+if st.button('Analyse + create sports-aware vertical master', disabled=not bool(st.session_state.input_path)):
     out_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
     def _cb(pct, msg):
-        progress_bar.progress(min(max(float(pct),0.0),1.0), text=msg)
+        progress_bar.progress(min(max(float(pct), 0.0), 1.0), text=msg)
     ok, msg = backend.smart_reframe_vertical(
         st.session_state.input_path,
         out_path,
@@ -107,18 +110,21 @@ if st.button('Analyse + create vertical smart-reframed master', disabled=not boo
         target_h=target_h,
         smooth_strength=smooth_strength,
         lead_room=lead_room,
+        sports_mode=sports_mode,
+        detect_ball=detect_ball,
+        detect_players=detect_players,
         progress_cb=_cb,
     )
     if ok:
         st.session_state.reframed_path = out_path
-        progress_bar.progress(1.0, text='Smart reframe complete')
-        st.success('Vertical smart-reframed master created.')
+        progress_bar.progress(1.0, text='Sports-aware smart reframe complete')
+        st.success('Sports-aware vertical master created.')
     else:
         st.error(msg)
 
 if st.session_state.reframed_path and os.path.exists(st.session_state.reframed_path):
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown('**Vertical smart-reframed master preview**')
+    st.markdown('**Sports-aware vertical smart-reframed master preview**')
     st.video(st.session_state.reframed_path)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -130,11 +136,11 @@ if st.button('Start Cloudflare live push', disabled=not (cf_cfg and st.session_s
         cfg=cf_cfg,
         reframed_mp4=st.session_state.reframed_path,
         asset_name=upl.name if upl else 'vertical_live_demo',
-        fps=int(round(st.session_state.meta.get('fps') or 30)) if st.session_state.meta else 30,
+        fps=30,
         loop_input=loop_input,
     )
     st.session_state.live_session = session
-    st.success('Cloudflare live input created and FFmpeg push started.')
+    st.success('Cloudflare live input created and FFmpeg push started with sports-tuned normal HLS settings.')
 
 if st.button('Stop Cloudflare live push', disabled=not bool(st.session_state.live_session)):
     backend.stop_cloudflare_live_push(cf_cfg, st.session_state.live_session)
@@ -147,7 +153,9 @@ if st.session_state.live_session:
     st.markdown('**Cloudflare Stream live session**')
     st.caption(f'Live input UID: {session.uid}')
     st.code(session.hls_url)
-    st.caption('This is the public Cloudflare playback URL (HLS manifest).')
+    st.caption('Use this NORMAL HLS test URL in any open-source HLS player (hls.js demo, VLC, etc.).')
+    test_url = f'https://customer-{cf_cfg.customer_code}.cloudflarestream.com/{session.uid}/manifest/video.m3u8' if cf_cfg else session.hls_url
+    st.text_input('Normal HLS test playback URL', value=test_url, key='normal_hls_test_url')
     with st.expander('FFmpeg push log'):
         if os.path.exists(session.log_path):
             with open(session.log_path, 'r', encoding='utf-8', errors='ignore') as fp:
@@ -155,13 +163,14 @@ if st.session_state.live_session:
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.subheader('4) Public Cloudflare playback with LIVE UX preserved')
-    components.html(backend.build_cloudflare_live_player_html(session.hls_url, title='TikTok-style vertical live on Cloudflare', autoplay=True, muted=True), height=980, scrolling=True)
+    components.html(backend.build_cloudflare_live_player_html(test_url, title='TikTok-style vertical live on Cloudflare (sports-tuned normal HLS)', autoplay=True, muted=True), height=980, scrolling=True)
 
 st.divider()
 st.markdown('### Notes')
 st.markdown(
-    '- This fixes the localhost playback problem by pushing the vertical stream to **Cloudflare Stream Live** instead of serving `127.0.0.1` to the browser.\n'
-    '- The player uses the **public Cloudflare HLS URL**.\n'
-    '- The uploaded clip can be looped as a pseudo-live source for demonstration.\n'
-    '- For real live contribution, replace the uploaded file input with a true camera/live source and keep the Cloudflare live input + player flow.'
+    '- This update adds **sports-aware smart reframe** using player detection + ball heuristics + motion saliency.\n'
+    '- Crop smoothing is now **motion-aware**, with deadzone and max-pan limits to reduce jitter.\n'
+    '- Multi-focus combines **ball + player cluster + motion** instead of using a single center.\n'
+    '- The **normal HLS test URL** is shown explicitly so you can paste it into any open-source HLS player.\n'
+    '- LL-HLS is OFF by default here because you asked to proceed with normal HLS for easier testing.'
 )
