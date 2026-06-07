@@ -3,7 +3,7 @@ pandas>=2.0.0
 
 # Optional enhancements
 plotly>=5.0.0
-opencv-python-headless>=4.9.0
+opencv-contrib-python-headless>=4.9.0
 numpy>=1.26.0
 
 # Optional AI features (uncomment if needed)
