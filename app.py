@@ -23,8 +23,6 @@ st.markdown(
       .card {border:1px solid rgba(148,163,184,.24); border-radius:18px; padding:18px; background:linear-gradient(180deg, rgba(15,23,42,.98), rgba(15,23,42,.92)); color:#e5e7eb; box-shadow:0 14px 30px rgba(2,6,23,.18);}
       .hero {border:1px solid rgba(59,130,246,.18); border-radius:22px; padding:20px 22px; margin-bottom:16px; background:radial-gradient(circle at top right, rgba(37,99,235,.18), transparent 28%), linear-gradient(180deg, #0b1220 0%, #0f172a 100%); color:white;}
       .chip {display:inline-block; padding:6px 12px; border-radius:999px; font-size:.78rem; border:1px solid rgba(148,163,184,.25); background:#0f172a; color:#cbd5e1; margin-right:6px; margin-top:6px;}
-      .ok {color:#10b981; font-weight:700;}
-      .warn {color:#f59e0b; font-weight:700;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -38,6 +36,13 @@ for key, value in {
 }.items():
     if key not in st.session_state:
         st.session_state[key] = value
+
+# Hard reset incompatible live_session objects from older deployments.
+ls = st.session_state.get("live_session")
+required_attrs = ["uid", "hls_url", "iframe_url", "log_path"]
+if ls is not None and not all(hasattr(ls, attr) for attr in required_attrs):
+    st.session_state.live_session = None
+    ls = None
 
 st.markdown(
     """
@@ -136,14 +141,14 @@ if source_value and source_kind in ("Upload file", "Local path / arbitrary URL")
     st.session_state.meta = backend.probe_source(str(source_value))
 elif source_value and isinstance(source_value, str) and source_value.lower().startswith(("rtmp://", "rtmps://", "srt://", "http://", "https://")):
     st.session_state.meta = backend.probe_source(str(source_value))
-    st.info("For URL-based ingest, metadata can be approximate at setup time. The pipeline now primes Cloudflare immediately and continues buffering in the background.")
+    st.info("For URL-based ingest, metadata can be approximate at setup time. The pipeline primes Cloudflare immediately and continues buffering in the background.")
 
 if st.session_state.meta:
     meta = st.session_state.meta
     a, b, c = st.columns(3)
-    a.metric("Source resolution", f"{int(meta['width'])}×{int(meta['height'])}")
-    b.metric("FPS", f"{meta['fps']}")
-    c.metric("Duration", f"{meta['duration']:.1f}s")
+    a.metric("Source resolution", f"{int(meta.get('width', 0))}×{int(meta.get('height', 0))}")
+    b.metric("FPS", f"{meta.get('fps', 0)}")
+    c.metric("Duration", f"{float(meta.get('duration', 0.0)):.1f}s")
 
 progress_bar = st.progress(0.0, text="Waiting")
 
@@ -153,20 +158,10 @@ if workflow == "VOD → Live (full-file verticalize first)":
         st.warning("VOD → Live is intended for file-like sources. Switch to Delayed realtime for RTMP/SRT URLs.")
     if st.button("Create vertical master", disabled=not bool(source_value) or source_kind in ("RTMP URL", "SRT URL")):
         out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-
         def _cb(pct, msg):
             progress_bar.progress(min(max(float(pct), 0.0), 1.0), text=msg)
-
         ok, msg = backend.create_vertical_master(
-            str(source_value),
-            out_path,
-            target_w,
-            target_h,
-            smooth_strength,
-            analysis_stride,
-            deadzone_ratio,
-            max_pan_ratio,
-            _cb,
+            str(source_value), out_path, target_w, target_h, smooth_strength, analysis_stride, deadzone_ratio, max_pan_ratio, _cb
         )
         if ok:
             st.session_state.reframed_path = out_path
@@ -187,7 +182,7 @@ if workflow == "VOD → Live (full-file verticalize first)":
 else:
     st.markdown("### 3B) Delayed realtime")
     st.caption("Use this for horizontal file / RTMP / SRT source → frame-by-frame vertical output with ~20–25s delay.")
-    st.caption("This mode now sends startup placeholder frames immediately, so Cloudflare should no longer sit on 'Stream has not started yet' while the source buffer fills.")
+    st.caption("This mode sends startup placeholder frames immediately so Cloudflare should not wait for the delayed buffer to fill before playback becomes available.")
     if st.button("Start delayed realtime push", disabled=not (cf_cfg and source_value)):
         if st.session_state.live_session:
             backend.stop_live_session(cf_cfg, st.session_state.live_session)
@@ -211,7 +206,8 @@ else:
 left_action, right_action = st.columns([1, 1])
 with left_action:
     if st.button("Stop current live push", disabled=not bool(st.session_state.live_session)):
-        backend.stop_live_session(cf_cfg, st.session_state.live_session)
+        if cf_cfg and st.session_state.live_session:
+            backend.stop_live_session(cf_cfg, st.session_state.live_session)
         st.session_state.live_session = None
         st.info("Current live session stopped and Cloudflare input disabled.")
 with right_action:
@@ -221,42 +217,56 @@ if st.session_state.live_session:
     session = st.session_state.live_session
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("**Shared Cloudflare playback section**")
-    st.caption(f"Live input UID: {session.uid}")
-    normal_hls = session.hls_url.split("?")[0]
+    st.caption(f"Live input UID: {getattr(session, 'uid', '-')}")
+
+    normal_hls = getattr(session, 'hls_url', '')
+    normal_hls = normal_hls.split('?')[0] if normal_hls else ''
     st.text_input("Normal HLS test playback URL", value=normal_hls, key="normal_hls_test_url")
     st.caption("Use the normal HLS URL above in any open-source HLS player if LL-HLS playback looks unstable.")
-    st.text_input("Cloudflare iframe player URL", value=session.iframe_url, key="iframe_player_url")
+    st.text_input("Cloudflare iframe player URL", value=getattr(session, 'iframe_url', ''), key="iframe_player_url")
 
-    stats = session.stats or {}
+    stats = getattr(session, 'stats', {}) or {}
+    session_status = getattr(session, 'status', 'unknown')
+    session_error = getattr(session, 'error', '')
+
     s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Pipeline status", session.status)
+    s1.metric("Pipeline status", session_status)
     s2.metric("Working source", stats.get("working_resolution", "-"))
     s3.metric("Delay frames", stats.get("delay_frames", "-"))
     s4.metric("Frames out", stats.get("frames_out", 0))
 
-    if session.error:
-        st.error(session.error)
+    if session_error:
+        st.error(session_error)
 
-    if session.status in {"priming_output", "connecting_source", "buffering"}:
+    if session_status in {"priming_output", "connecting_source", "buffering"}:
         st.warning("The output has started and Cloudflare is being primed. Wait a few seconds, then refresh the Cloudflare playback page or open the public HLS URL.")
-    elif session.status == "streaming":
+    elif session_status == "streaming":
         st.success("The pipeline is actively pushing frames to Cloudflare.")
-    elif session.status in {"ffmpeg_pipe_broken", "worker_error", "ffmpeg_start_failed"}:
-        st.error("The worker hit an error. Check the FFmpeg log below.")
+    elif session_status in {"ffmpeg_pipe_broken", "worker_error", "ffmpeg_start_failed", "source_ended"}:
+        st.error("The worker hit an error or the source ended. Check the FFmpeg log below.")
 
-    with st.expander("FFmpeg push log", expanded=session.status in {"ffmpeg_pipe_broken", "worker_error", "ffmpeg_start_failed"}):
-        st.code(backend.read_log_tail(session.log_path) or "(empty)", language="bash")
+    with st.expander(
+        "FFmpeg push log",
+        expanded=session_status in {"ffmpeg_pipe_broken", "worker_error", "ffmpeg_start_failed", "source_ended"},
+    ):
+        log_path = getattr(session, 'log_path', '')
+        if log_path:
+            st.code(backend.read_log_tail(log_path) or "(empty)", language="bash")
+        else:
+            st.code("(no log path available)", language="bash")
 
     st.markdown("</div>", unsafe_allow_html=True)
     st.subheader("4) In-app playback")
-    iframe_html = (
-        '<div style="position:relative;padding-top:177.78%;max-width:360px;margin:0 auto;">'
-        + f'<iframe src="{session.iframe_url}" '
-        + 'style="border:none;position:absolute;top:0;left:0;height:100%;width:100%;border-radius:16px;overflow:hidden;" '
-        + 'allow="accelerometer; gyroscope; autoplay; encrypted-media; picture-in-picture;" allowfullscreen="true"></iframe>'
-        + "</div>"
-    )
-    components.html(iframe_html, height=760, scrolling=False)
+    iframe_url = getattr(session, 'iframe_url', '')
+    if iframe_url:
+        iframe_html = (
+            '<div style="position:relative;padding-top:177.78%;max-width:360px;margin:0 auto;">'
+            + f'<iframe src="{iframe_url}" '
+            + 'style="border:none;position:absolute;top:0;left:0;height:100%;width:100%;border-radius:16px;overflow:hidden;" '
+            + 'allow="accelerometer; gyroscope; autoplay; encrypted-media; picture-in-picture;" allowfullscreen="true"></iframe>'
+            + "</div>"
+        )
+        components.html(iframe_html, height=760, scrolling=False)
 
     if auto_refresh:
         time.sleep(3)
@@ -271,5 +281,6 @@ st.markdown(
     "- delayed realtime mode\n"
     "- RTMP demo URL support\n"
     "- Cloudflare startup priming to avoid the 'stream has not started yet' issue\n"
+    "- stale session protection for Streamlit redeploys\n"
     "- shared playback section with normal HLS + iframe + logs"
 )
