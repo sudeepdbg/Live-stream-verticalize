@@ -1,28 +1,13 @@
 from __future__ import annotations
-
-import json
-import math
-import os
-import re
-import shutil
-import subprocess
-import tempfile
-import urllib.error
-import urllib.request
+import json, os, re, shutil, subprocess, tempfile, urllib.error, urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable
-
 import cv2
-import numpy as np
 
 DEFAULT_TARGET_W = 540
 DEFAULT_TARGET_H = 960
 MAX_UPLOAD_MB = 400
-
-# -----------------------------
-# Generic helpers
-# -----------------------------
 
 def ffmpeg_ok() -> bool:
     try:
@@ -32,30 +17,15 @@ def ffmpeg_ok() -> bool:
     except Exception:
         return False
 
-
 def safe_token(value: str) -> str:
     value = value or "stream"
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-") or "stream"
 
-
 def probe(path: str) -> dict:
-    res = {
-        "duration": 0.0,
-        "width": 0,
-        "height": 0,
-        "fps": 0.0,
-        "vcodec": "unknown",
-        "vbitrate_kbps": 0,
-        "acodec": "unknown",
-        "abitrate_kbps": 0,
-        "sample_rate": 0,
-        "channels": 0,
-        "has_audio": False,
-    }
+    res = {"duration": 0.0, "width": 0, "height": 0, "fps": 0.0, "vcodec": "unknown", "vbitrate_kbps": 0,
+           "acodec": "unknown", "abitrate_kbps": 0, "sample_rate": 0, "channels": 0, "has_audio": False}
     try:
-        out = subprocess.check_output([
-            "ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", path
-        ], text=True, stderr=subprocess.DEVNULL, timeout=30)
+        out = subprocess.check_output(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", path], text=True, stderr=subprocess.DEVNULL, timeout=30)
         data = json.loads(out)
         fmt = data.get("format", {})
         res["duration"] = float(fmt.get("duration", 0) or 0)
@@ -80,25 +50,8 @@ def probe(path: str) -> dict:
         pass
     return res
 
-
-def format_audio_codec(codec: str) -> str:
-    mapping = {"aac": "AAC", "mp3": "MP3", "opus": "Opus", "vorbis": "Vorbis", "ac3": "AC-3", "eac3": "E-AC-3", "flac": "FLAC", "pcm_s16le": "PCM 16-bit", "alac": "ALAC"}
-    return mapping.get(codec, (codec or "unknown").upper())
-
-
-def format_sample_rate(sr: int) -> str:
-    return f"{sr // 1000} kHz" if sr >= 1000 else f"{sr} Hz"
-
-
-def format_channels(ch: int) -> str:
-    return {1: "Mono", 2: "Stereo", 6: "5.1", 8: "7.1"}.get(ch, f"{ch} ch")
-
-# -----------------------------
-# Smart reframe engine
-# -----------------------------
-
-def _tiktok_crop_box(src_w: int, src_h: int) -> tuple[int, int]:
-    if src_w / src_h >= 9 / 16:
+def _vertical_crop_box(src_w: int, src_h: int) -> tuple[int, int]:
+    if src_w / src_h >= 9/16:
         crop_h = src_h
         crop_w = int(round(src_h * 9 / 16))
     else:
@@ -108,69 +61,28 @@ def _tiktok_crop_box(src_w: int, src_h: int) -> tuple[int, int]:
     crop_h = max(32, crop_h - (crop_h % 2))
     return crop_w, crop_h
 
-
-def _bbox_center(box):
-    x, y, w, h = box
-    return x + w / 2.0, y + h / 2.0
-
-
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
-
-def _circularity(cnt) -> float:
-    area = cv2.contourArea(cnt)
-    if area <= 0:
-        return 0.0
-    peri = cv2.arcLength(cnt, True)
-    if peri <= 0:
-        return 0.0
-    return float(4 * math.pi * area / (peri * peri))
-
-
-def smart_reframe_vertical(
-    input_path: str,
-    output_path: str,
-    target_w: int = DEFAULT_TARGET_W,
-    target_h: int = DEFAULT_TARGET_H,
-    smooth_strength: float = 0.90,
-    lead_room: float = 0.20,
-    sports_mode: bool = True,
-    detect_ball: bool = True,
-    detect_players: bool = True,
-    progress_cb: Optional[Callable[[float, str], None]] = None,
-) -> tuple[bool, str]:
+def smart_reframe_vertical_smooth(input_path: str, output_path: str, target_w: int = DEFAULT_TARGET_W, target_h: int = DEFAULT_TARGET_H,
+                                  smooth_strength: float = 0.96, analysis_stride: int = 6, deadzone_ratio: float = 0.06,
+                                  max_pan_ratio: float = 0.02, progress_cb: Optional[Callable[[float, str], None]] = None) -> tuple[bool, str]:
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
-        return False, "Could not open input video"
-
+        return False, 'Could not open input video'
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     if src_w <= 0 or src_h <= 0:
-        cap.release()
-        return False, "Invalid source dimensions"
-
-    crop_w, crop_h = _tiktok_crop_box(src_w, src_h)
-    max_x = src_w - crop_w
-    max_y = src_h - crop_h
-
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (target_w, target_h))
+        cap.release(); return False, 'Invalid source dimensions'
+    crop_w, crop_h = _vertical_crop_box(src_w, src_h)
+    max_x, max_y = src_w - crop_w, src_h - crop_h
+    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (target_w, target_h))
     if not writer.isOpened():
-        cap.release()
-        return False, "Could not create output video writer"
+        cap.release(); return False, 'Could not create output video writer'
 
-    # detectors
     face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    hog = None
-    if detect_players:
-        try:
-            hog = cv2.HOGDescriptor()
-            hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-        except Exception:
-            hog = None
     saliency = None
     try:
         if hasattr(cv2, 'saliency'):
@@ -179,183 +91,83 @@ def smart_reframe_vertical(
         saliency = None
 
     prev_gray = None
-    smoothed_cx = src_w / 2
-    smoothed_cy = src_h / 2
-    prev_target_cx = smoothed_cx
-    prev_target_cy = smoothed_cy
-    last_player_boxes = []
-    analysis_stride = 3 if sports_mode else 5
-    max_pan_px = max(8, crop_w * 0.06)  # motion-aware smoothing cap per processed frame
-    deadzone_px = max(6, crop_w * 0.02)
-    last_ball_center = None
+    smoothed_cx, smoothed_cy = src_w/2.0, src_h/2.0
+    target_cx, target_cy = smoothed_cx, smoothed_cy
+    deadzone_px = max(10.0, crop_w * deadzone_ratio)
+    max_pan_px = max(4.0, crop_w * max_pan_ratio)
 
     idx = 0
     while True:
         ok, frame = cap.read()
-        if not ok:
-            break
+        if not ok: break
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        candidates = []
-
-        # 1) optional face detection (useful for interviews / close-up)
-        try:
-            faces = face_detector.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=4, minSize=(40, 40))
-        except Exception:
-            faces = []
-        for (x, y, w, h) in faces[:2]:
-            candidates.append((0.45, (x, y, w, h), 'face'))
-
-        # 2) sports-aware player detection (HOG, only every few frames)
-        if detect_players and hog is not None and (idx % analysis_stride == 0):
+        if idx % max(1, int(analysis_stride)) == 0:
+            candidates = []
             try:
-                rects, weights = hog.detectMultiScale(frame, winStride=(8, 8), padding=(8, 8), scale=1.05)
-                player_boxes = []
-                for (x, y, w, h), wt in zip(rects, weights):
-                    area = w * h
-                    if area < 0.015 * src_w * src_h:
-                        continue
-                    player_boxes.append((float(wt), (int(x), int(y), int(w), int(h))))
-                player_boxes.sort(key=lambda z: z[0], reverse=True)
-                last_player_boxes = player_boxes[:4]
+                faces = face_detector.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=4, minSize=(40,40))
             except Exception:
-                pass
-        for wt, box in last_player_boxes[:4]:
-            base_w = 0.22 if sports_mode else 0.18
-            candidates.append((base_w + min(0.12, wt / 5.0), box, 'player'))
-
-        # 3) saliency fallback
-        if saliency is not None and (idx % analysis_stride == 0):
-            try:
-                success, sal_map = saliency.computeSaliency(frame)
-                if success:
-                    sal_map = (sal_map * 255).astype('uint8')
-                    _, thresh = cv2.threshold(sal_map, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    if cnts:
-                        c = max(cnts, key=cv2.contourArea)
-                        x, y, w, h = cv2.boundingRect(c)
-                        if w * h > 0.02 * src_w * src_h:
-                            candidates.append((0.18, (x, y, w, h), 'saliency'))
-            except Exception:
-                pass
-
-        # 4) motion & ball candidate
-        if prev_gray is not None:
-            diff = cv2.absdiff(gray, prev_gray)
-            diff = cv2.GaussianBlur(diff, (7, 7), 0)
-            _, motion = cv2.threshold(diff, 20, 255, cv2.THRESH_BINARY)
-            motion = cv2.dilate(motion, None, iterations=2)
-            cnts, _ = cv2.findContours(motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            big_motion_added = False
-            ball_added = False
-            # sort by area descending for robust processing
-            cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
-            for c in cnts[:20]:
-                x, y, w, h = cv2.boundingRect(c)
-                area = float(w * h)
-                if area < 15:
-                    continue
-                # large motion region (pan / active play area)
-                if not big_motion_added and area > 0.015 * src_w * src_h:
-                    candidates.append((0.22, (x, y, w, h), 'motion'))
-                    big_motion_added = True
-                # ball candidate heuristic: small, compact, fast-moving blob near player cluster or previous ball
-                circ = _circularity(c)
-                aspect = w / max(h, 1)
-                plausible_ball = detect_ball and (0.55 <= circ <= 1.25) and (0.6 <= aspect <= 1.6) and (10 <= w <= 70) and (10 <= h <= 70)
-                if plausible_ball and not ball_added:
-                    cx, cy = _bbox_center((x, y, w, h))
-                    score = 0.0
-                    if last_ball_center is not None:
-                        dist = math.hypot(cx - last_ball_center[0], cy - last_ball_center[1])
-                        score += max(0.0, 1.0 - dist / max(src_w, src_h))
-                    if last_player_boxes:
-                        # prefer ball near players rather than random crowd motion
-                        dists = [math.hypot(cx - _bbox_center(box)[0], cy - _bbox_center(box)[1]) for _, box in last_player_boxes]
-                        if dists:
-                            score += max(0.0, 1.0 - min(dists) / max(src_w, src_h))
-                    candidates.append((0.70 + 0.25 * score, (x, y, w, h), 'ball'))
-                    last_ball_center = (cx, cy)
-                    ball_added = True
-            # decay last ball center if nothing plausible appears for a while
-            if not ball_added and last_ball_center is not None and idx % (analysis_stride * 4) == 0:
-                last_ball_center = None
+                faces = []
+            for (x,y,w,h) in faces[:2]:
+                candidates.append((0.55, (x+w/2.0, y+h/2.0)))
+            if prev_gray is not None:
+                diff = cv2.absdiff(gray, prev_gray)
+                diff = cv2.GaussianBlur(diff, (11,11), 0)
+                _, motion = cv2.threshold(diff, 22, 255, cv2.THRESH_BINARY)
+                motion = cv2.dilate(motion, None, iterations=2)
+                cnts, _ = cv2.findContours(motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                pts = []
+                for c in sorted(cnts, key=cv2.contourArea, reverse=True)[:6]:
+                    x,y,w,h = cv2.boundingRect(c)
+                    if w*h > 0.015 * src_w * src_h:
+                        pts.append((x,y,w,h))
+                if pts:
+                    x0 = min(p[0] for p in pts); y0 = min(p[1] for p in pts)
+                    x1 = max(p[0]+p[2] for p in pts); y1 = max(p[1]+p[3] for p in pts)
+                    candidates.append((0.35, ((x0+x1)/2.0, (y0+y1)/2.0)))
+            if saliency is not None:
+                try:
+                    success, sal_map = saliency.computeSaliency(frame)
+                    if success:
+                        sal_map = (sal_map * 255).astype('uint8')
+                        _, thresh = cv2.threshold(sal_map, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        if cnts:
+                            c = max(cnts, key=cv2.contourArea)
+                            x,y,w,h = cv2.boundingRect(c)
+                            if w*h > 0.03 * src_w * src_h:
+                                candidates.append((0.20, (x+w/2.0, y+h/2.0)))
+                except Exception:
+                    pass
+            if candidates:
+                ws = sum(w for w, _ in candidates)
+                target_cx = sum(cx*w for w,(cx,cy) in candidates) / max(ws, 1e-6)
+                target_cy = sum(cy*w for w,(cx,cy) in candidates) / max(ws, 1e-6)
+            else:
+                target_cx, target_cy = src_w/2.0, src_h/2.0
         prev_gray = gray
-
-        # 5) multi-focus combine (ball + players + action cluster)
-        if candidates:
-            # give ball highest priority for sports mode
-            weight_sum = 0.0
-            cx_sum = 0.0
-            cy_sum = 0.0
-            # keep strongest few to reduce noise
-            candidates = sorted(candidates, key=lambda z: z[0], reverse=True)[:6]
-            for weight, box, tag in candidates:
-                cx, cy = _bbox_center(box)
-                if sports_mode and tag == 'ball':
-                    weight *= 1.25
-                if sports_mode and tag == 'player':
-                    weight *= 1.10
-                weight_sum += weight
-                cx_sum += cx * weight
-                cy_sum += cy * weight
-            target_cx = cx_sum / max(weight_sum, 1e-6)
-            target_cy = cy_sum / max(weight_sum, 1e-6)
-        else:
-            target_cx = smoothed_cx
-            target_cy = smoothed_cy
-
-        # 6) motion-aware lead-room
-        vel_x = target_cx - prev_target_cx
-        vel_y = target_cy - prev_target_cy
-        target_cx += vel_x * lead_room
-        target_cy += vel_y * lead_room * 0.35
-        prev_target_cx = target_cx
-        prev_target_cy = target_cy
-
-        # 7) motion-aware crop smoothing with deadzone and max pan speed
-        desired_dx = target_cx - smoothed_cx
-        desired_dy = target_cy - smoothed_cy
-        if abs(desired_dx) < deadzone_px:
-            desired_dx = 0.0
-        if abs(desired_dy) < deadzone_px * 0.6:
-            desired_dy = 0.0
+        dx, dy = target_cx - smoothed_cx, target_cy - smoothed_cy
+        if abs(dx) < deadzone_px: dx = 0.0
+        if abs(dy) < deadzone_px * 0.5: dy = 0.0
         alpha = 1.0 - float(smooth_strength)
-        step_x = max(-max_pan_px, min(max_pan_px, desired_dx * alpha))
-        step_y = max(-max_pan_px * 0.55, min(max_pan_px * 0.55, desired_dy * alpha))
-        smoothed_cx += step_x
-        smoothed_cy += step_y
-
-        x0 = int(round(smoothed_cx - crop_w / 2))
-        y0 = int(round(smoothed_cy - crop_h / 2))
-        x0 = int(_clamp(x0, 0, max_x))
-        y0 = int(_clamp(y0, 0, max_y))
-        crop = frame[y0:y0 + crop_h, x0:x0 + crop_w]
-        if crop.size == 0:
-            crop = frame
+        smoothed_cx += max(-max_pan_px, min(max_pan_px, dx * alpha))
+        smoothed_cy += max(-(max_pan_px*0.4), min((max_pan_px*0.4), dy * alpha))
+        x0 = int(round(smoothed_cx - crop_w/2.0)); y0 = int(round(smoothed_cy - crop_h/2.0))
+        x0 = int(_clamp(x0, 0, max_x)); y0 = int(_clamp(y0, 0, max_y))
+        crop = frame[y0:y0+crop_h, x0:x0+crop_w]
+        if crop.size == 0: crop = frame
         crop = cv2.resize(crop, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
         writer.write(crop)
-
         idx += 1
         if progress_cb and frame_count > 0 and idx % 5 == 0:
-            progress_cb(idx / frame_count, f"Sports-aware smart reframe frame {idx}/{frame_count}")
-
-    cap.release()
-    writer.release()
+            progress_cb(idx / frame_count, f'Building smooth vertical master {idx}/{frame_count}')
+    cap.release(); writer.release()
 
     muxed = output_path.replace('.mp4', '_muxed.mp4')
-    cmd = [
-        'ffmpeg', '-y', '-i', output_path, '-i', input_path,
-        '-map', '0:v:0', '-map', '1:a:0?', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-shortest', muxed
-    ]
+    cmd = ['ffmpeg','-y','-i',output_path,'-i',input_path,'-map','0:v:0','-map','1:a:0?','-c:v','copy','-c:a','aac','-b:a','128k','-shortest',muxed]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode == 0 and os.path.exists(muxed):
         shutil.move(muxed, output_path)
     return True, 'Done'
-
-# -----------------------------
-# Cloudflare Stream Live integration
-# -----------------------------
 
 @dataclass
 class CFStreamConfig:
@@ -371,39 +183,28 @@ class CFStreamLiveSession:
     stream_key: str
     hls_url: str
     dash_url: str
+    iframe_url: str
     ffmpeg_cmd: list[str]
     proc: Optional[subprocess.Popen]
     log_path: str
     status: str
 
-
 def cfstream_config_from_inputs(account_id: str, api_token: str, customer_code: str, prefer_low_latency: bool = False) -> CFStreamConfig:
-    if not account_id:
-        raise ValueError('Cloudflare account ID is required.')
-    if not api_token:
-        raise ValueError('Cloudflare API token is required.')
-    if not customer_code:
-        raise ValueError('Cloudflare customer code is required for public playback URLs.')
+    if not account_id: raise ValueError('Cloudflare account ID is required.')
+    if not api_token: raise ValueError('Cloudflare API token is required.')
+    if not customer_code: raise ValueError('Cloudflare customer code is required.')
     code = customer_code.strip().replace('customer-', '').replace('.cloudflarestream.com', '').strip('/')
-    return CFStreamConfig(account_id=account_id.strip(), api_token=api_token.strip(), customer_code=code, prefer_low_latency=bool(prefer_low_latency))
-
+    return CFStreamConfig(account_id.strip(), api_token.strip(), code, bool(prefer_low_latency))
 
 def _cf_api_request(cfg: CFStreamConfig, method: str, path: str, payload: Optional[dict] = None) -> tuple[int, dict]:
     url = f'https://api.cloudflare.com/client/v4{path}'
-    data = None
-    headers = {
-        'Authorization': f'Bearer {cfg.api_token}',
-        'Content-Type': 'application/json',
-        'User-Agent': 'TikTok-Live-Verticalizer-Sports',
-    }
-    if payload is not None:
-        data = json.dumps(payload).encode('utf-8')
+    data = json.dumps(payload).encode('utf-8') if payload is not None else None
+    headers = {'Authorization': f'Bearer {cfg.api_token}', 'Content-Type': 'application/json', 'User-Agent': 'Smooth-Vertical-Cloudflare'}
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             body = resp.read().decode('utf-8')
-            parsed = json.loads(body) if body else {}
-            return resp.status, parsed
+            return resp.status, (json.loads(body) if body else {})
     except urllib.error.HTTPError as e:
         body = e.read().decode('utf-8', errors='ignore')
         try:
@@ -412,179 +213,56 @@ def _cf_api_request(cfg: CFStreamConfig, method: str, path: str, payload: Option
             parsed = {'success': False, 'errors': [{'message': body}]}
         return e.code, parsed
 
-
 def create_live_input(cfg: CFStreamConfig, name: str, recording_mode: str = 'automatic') -> dict:
-    payload = {
-        'meta': {'name': name},
-        'recording': {'mode': recording_mode, 'timeoutSeconds': 0},
-        'preferLowLatency': bool(cfg.prefer_low_latency),
-        'enabled': True,
-    }
+    payload = {'meta': {'name': name}, 'recording': {'mode': recording_mode, 'timeoutSeconds': 0}, 'preferLowLatency': bool(cfg.prefer_low_latency), 'enabled': True}
     status, parsed = _cf_api_request(cfg, 'POST', f'/accounts/{cfg.account_id}/stream/live_inputs', payload)
-    if status not in (200, 201) or not parsed.get('success'):
+    if status not in (200,201) or not parsed.get('success'):
         raise RuntimeError(f'Create live input failed: {parsed}')
     return parsed['result']
 
-
 def disable_live_input(cfg: CFStreamConfig, uid: str) -> None:
-    payload = {'enabled': False}
-    _cf_api_request(cfg, 'PUT', f'/accounts/{cfg.account_id}/stream/live_inputs/{uid}', payload)
+    _cf_api_request(cfg, 'PUT', f'/accounts/{cfg.account_id}/stream/live_inputs/{uid}', {'enabled': False})
 
-
-def build_public_playback_urls(cfg: CFStreamConfig, uid: str) -> tuple[str, str]:
+def build_public_playback_urls(cfg: CFStreamConfig, uid: str) -> tuple[str,str,str]:
     base = f'https://customer-{cfg.customer_code}.cloudflarestream.com/{uid}'
     hls = f'{base}/manifest/video.m3u8'
     if cfg.prefer_low_latency:
         hls += '?protocol=llhls'
     dash = f'{base}/manifest/video.mpd'
-    return hls, dash
+    iframe = f'{base}/iframe?autoplay=true&muted=true&controls=true&preload=metadata'
+    return hls, dash, iframe
 
-
-def build_rtmps_push_command(reframed_mp4: str, rtmps_url: str, stream_key: str, fps: Optional[int] = 30, loop_input: bool = True) -> list[str]:
+def build_rtmps_push_command(reframed_mp4: str, rtmps_url: str, stream_key: str, loop_input: bool = True) -> list[str]:
     target = rtmps_url.rstrip('/') + '/' + stream_key
-    fps = int(fps or 30)
-    # tuned for smoother sports motion on Cloudflare preview: 30 fps, ~1.8 Mbps, 2s GOP
     cmd = ['ffmpeg', '-y']
     if loop_input:
         cmd += ['-stream_loop', '-1']
-    cmd += ['-re', '-i', reframed_mp4]
-    gop = max(fps * 2, 60)
-    cmd += [
-        '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
-        '-r', str(fps),
-        '-b:v', '1800k', '-maxrate', '2000k', '-bufsize', '3000k',
-        '-g', str(gop), '-keyint_min', str(gop), '-sc_threshold', '0',
-        '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
-        '-f', 'flv', target,
-    ]
+    cmd += ['-re', '-i', reframed_mp4, '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+            '-r', '30', '-b:v', '1500k', '-maxrate', '1700k', '-bufsize', '2500k',
+            '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
+            '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2', '-f', 'flv', target]
     return cmd
 
-
-def start_cloudflare_live_push(cfg: CFStreamConfig, reframed_mp4: str, asset_name: str, fps: Optional[int] = 30, loop_input: bool = True) -> CFStreamLiveSession:
+def start_cloudflare_live_push(cfg: CFStreamConfig, reframed_mp4: str, asset_name: str, loop_input: bool = True) -> CFStreamLiveSession:
     live_input = create_live_input(cfg, name=safe_token(Path(asset_name).stem))
     uid = live_input['uid']
     rtmps_url = live_input['rtmps']['url']
     stream_key = live_input['rtmps']['streamKey']
-    hls_url, dash_url = build_public_playback_urls(cfg, uid)
-    cmd = build_rtmps_push_command(reframed_mp4, rtmps_url, stream_key, fps=fps, loop_input=loop_input)
+    hls_url, dash_url, iframe_url = build_public_playback_urls(cfg, uid)
+    cmd = build_rtmps_push_command(reframed_mp4, rtmps_url, stream_key, loop_input=loop_input)
     log_path = tempfile.NamedTemporaryFile(delete=False, suffix='.log').name
     log_fp = open(log_path, 'w', encoding='utf-8')
     proc = subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT, text=True)
-    return CFStreamLiveSession(uid=uid, rtmps_url=rtmps_url, stream_key=stream_key, hls_url=hls_url, dash_url=dash_url, ffmpeg_cmd=cmd, proc=proc, log_path=log_path, status='starting')
-
+    return CFStreamLiveSession(uid, rtmps_url, stream_key, hls_url, dash_url, iframe_url, cmd, proc, log_path, 'starting')
 
 def stop_cloudflare_live_push(cfg: CFStreamConfig, session: Optional[CFStreamLiveSession]) -> None:
-    if not session:
-        return
+    if not session: return
     try:
         if session.proc and session.proc.poll() is None:
             session.proc.terminate()
-            try:
-                session.proc.wait(timeout=5)
-            except Exception:
-                session.proc.kill()
+            try: session.proc.wait(timeout=5)
+            except Exception: session.proc.kill()
     except Exception:
         pass
-    try:
-        disable_live_input(cfg, session.uid)
-    except Exception:
-        pass
-
-# -----------------------------
-# Embedded player with LIVE UX preserved
-# -----------------------------
-
-def build_cloudflare_live_player_html(hls_url: str, title: str = 'TikTok-style vertical live on Cloudflare', autoplay: bool = True, muted: bool = True) -> str:
-    autoplay_str = 'true' if autoplay else 'false'
-    muted_attr = 'muted' if muted else ''
-    return f"""
-<div style='font-family:Inter,Segoe UI,Arial,sans-serif;background:#0f172a;color:#e2e8f0;border:1px solid #e5e7eb;border-radius:16px;padding:16px;'>
-  <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;'>
-    <div>
-      <div style='font-size:12px;color:#93c5fd;text-transform:uppercase;letter-spacing:.08em;'>Cloudflare Stream Live</div>
-      <div style='font-size:20px;font-weight:700;'>{title}</div>
-      <div style='font-size:12px;color:#94a3b8;word-break:break-all;'>{hls_url}</div>
-    </div>
-    <div style='display:flex; gap:8px; align-items:center;'>
-      <div style='padding:6px 10px; border-radius:999px; background:#7f1d1d; color:#fee2e2; font-weight:700;'>LIVE</div>
-      <button id='goLiveBtn' style='padding:8px 12px; border-radius:10px; border:none; background:#1d4ed8; color:#eff6ff; cursor:pointer;'>Go live</button>
-    </div>
-  </div>
-  <div style='display:flex; justify-content:center;'>
-    <video id='video' controls playsinline {muted_attr} style='width:360px; height:640px; background:#000; border-radius:16px; object-fit:cover;'></video>
-  </div>
-  <div style='display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-top:14px;'>
-    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px;color:#94a3b8;'>State</div><div id='state' style='font-size:22px;font-weight:700;'>booting</div></div>
-    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px;color:#94a3b8;'>Latency</div><div id='latency' style='font-size:22px;font-weight:700;'>0.0 s</div></div>
-    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px;color:#94a3b8;'>Buffer ahead</div><div id='buffer' style='font-size:22px;font-weight:700;'>0.0 s</div></div>
-    <div style='background:#111827; border-radius:12px; padding:12px;'><div style='font-size:12px;color:#94a3b8;'>Current level</div><div id='level' style='font-size:22px;font-weight:700;'>-</div></div>
-  </div>
-  <div style='background:#111827; border-radius:12px; padding:12px; margin-top:14px;'>
-    <div style='font-size:13px;font-weight:600;margin-bottom:8px;'>Live event log</div>
-    <div id='log' style='font-size:12px;line-height:1.6;color:#cbd5e1;max-height:180px;overflow:auto;'>Waiting for live playlist…</div>
-  </div>
-</div>
-<script src='https://cdn.jsdelivr.net/npm/hls.js@latest'></script>
-<script>
-(function() {{
-  const manifestUrl = {json.dumps(hls_url)};
-  const video = document.getElementById('video');
-  const elState = document.getElementById('state');
-  const elLatency = document.getElementById('latency');
-  const elBuffer = document.getElementById('buffer');
-  const elLevel = document.getElementById('level');
-  const elLog = document.getElementById('log');
-  const goLiveBtn = document.getElementById('goLiveBtn');
-  function pushLog(msg) {{
-    const now = new Date().toLocaleTimeString();
-    elLog.innerHTML = '[' + now + '] ' + msg + '<br/>' + elLog.innerHTML.split('<br/>').slice(0,12).join('<br/>');
-  }}
-  function updateMetrics(hls) {{
-    let bufferAhead = 0;
-    if (video.buffered && video.buffered.length) {{
-      for (let i = 0; i < video.buffered.length; i++) {{
-        if (video.buffered.start(i) <= video.currentTime && video.currentTime <= video.buffered.end(i)) {{
-          bufferAhead = video.buffered.end(i) - video.currentTime;
-          break;
-        }}
-      }}
-    }}
-    elBuffer.textContent = bufferAhead.toFixed(1) + ' s';
-    if (hls && typeof hls.latency === 'number') elLatency.textContent = hls.latency.toFixed(1) + ' s';
-  }}
-  function goLive(hls) {{
-    if (hls && typeof hls.liveSyncPosition === 'number' && !Number.isNaN(hls.liveSyncPosition)) {{
-      video.currentTime = Math.max(0, hls.liveSyncPosition);
-      pushLog('Jumped to live edge');
-    }}
-  }}
-  if (Hls.isSupported()) {{
-    const hls = new Hls({{
-      lowLatencyMode: false,
-      backBufferLength: 20,
-      liveSyncDurationCount: 3,
-      liveMaxLatencyDurationCount: 6,
-      maxLiveSyncPlaybackRate: 1.15,
-      enableWorker: true,
-      fragLoadingRetryDelay: 500,
-      manifestLoadingRetryDelay: 500,
-      levelLoadingRetryDelay: 500,
-    }});
-    hls.loadSource(manifestUrl);
-    hls.attachMedia(video);
-    hls.on(Hls.Events.MEDIA_ATTACHED, function() {{ elState.textContent = 'media attached'; pushLog('Media attached'); }});
-    hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {{ elState.textContent = 'live playlist parsed'; pushLog('Playlist parsed with ' + data.levels.length + ' level(s)'); if ({autoplay_str}) video.play().catch(() => {{}}); }});
-    hls.on(Hls.Events.LEVEL_SWITCHED, function(event, data) {{ const level = hls.levels[data.level]; elLevel.textContent = level ? ((level.height || '?') + 'p') : String(data.level); pushLog('Level switched'); }});
-    hls.on(Hls.Events.ERROR, function(event, data) {{ pushLog('HLS error: ' + data.type + ' | ' + data.details); elState.textContent = data.fatal ? 'fatal error' : 'recoverable error'; if (data.fatal) {{ if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad(); else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError(); }} }});
-    goLiveBtn.addEventListener('click', function() {{ goLive(hls); }});
-    setInterval(function() {{ updateMetrics(hls); }}, 1000);
-  }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-    video.src = manifestUrl; elState.textContent = 'native live HLS'; if ({autoplay_str}) video.play().catch(() => {{}});
-    goLiveBtn.addEventListener('click', function() {{ if (video.seekable && video.seekable.length) video.currentTime = video.seekable.end(video.seekable.length - 1); }});
-  }} else {{ elState.textContent = 'unsupported'; pushLog('Browser does not support HLS playback'); }}
-  ['play','pause','waiting','playing','seeking','stalled','ended','loadedmetadata','canplay'].forEach(function(evt) {{
-    video.addEventListener(evt, function() {{ elState.textContent = evt; pushLog('Video event: ' + evt); }});
-  }});
-}})();
-</script>
-"""
+    try: disable_live_input(cfg, session.uid)
+    except Exception: pass
