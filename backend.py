@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import collections
 import json
 import math
@@ -151,126 +150,224 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+def _resize_cover(image: np.ndarray, width: int, height: int) -> np.ndarray:
+    if image is None or image.size == 0 or width <= 0 or height <= 0:
+        return np.zeros((max(1, height), max(1, width), 3), dtype=np.uint8)
+    h, w = image.shape[:2]
+    scale = max(width / max(w, 1), height / max(h, 1))
+    nw = max(1, int(round(w * scale)))
+    nh = max(1, int(round(h * scale)))
+    resized = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC)
+    x0 = max(0, (nw - width) // 2)
+    y0 = max(0, (nh - height) // 2)
+    return resized[y0:y0 + height, x0:x0 + width]
+
+
 # ---------------------------------------------------------------------------
-# Overlay / Scorecard Detector
+# Overlay / scorecard logic
 # ---------------------------------------------------------------------------
 
 class OverlayDetector:
-    """Detects static broadcast overlays (scorecards, tickers, bug logos)
-    at the top and bottom of the source frame. Generates exclusion masks
-    so that overlay regions do not influence reframing decisions, and
-    optionally extracts the scorecard strip for compositing into the
-    vertical output."""
+    """
+    Detects *broadcast graphics* at top and bottom.
 
-    def __init__(self, src_w: int, src_h: int, top_scan_ratio: float = 0.15,
-                 bottom_scan_ratio: float = 0.12, stability_frames: int = 25,
-                 edge_density_thresh: float = 0.025, diff_thresh: float = 12.0):
-        self.src_w = src_w
-        self.src_h = src_h
-        self.top_scan_h = max(8, int(src_h * top_scan_ratio))
-        self.bottom_scan_h = max(8, int(src_h * bottom_scan_ratio))
-        self.stability_frames = max(5, stability_frames)
-        self.edge_density_thresh = edge_density_thresh
-        self.diff_thresh = diff_thresh
+    Key refinement vs the previous version:
+    - Finds the actual vertical boundary row-by-row instead of assuming the
+      entire scan band is overlay.
+    - Treats top-scoreboard and bottom-lower-third asymmetrically.
+    - Bottom graphics are only accepted if they look like a *compact lower-third*
+      or ticker; pitch-side ad boards should not be promoted into a reserved band.
+    - Exposes safe play bounds so the crop can exclude the original overlay area,
+      preventing duplication when compositing the extracted strip.
+    """
 
-        # Running accumulators (float32 for precision)
-        self.top_acc: Optional[np.ndarray] = None
-        self.bottom_acc: Optional[np.ndarray] = None
+    def __init__(
+        self,
+        src_w: int,
+        src_h: int,
+        top_scan_ratio: float = 0.18,
+        bottom_scan_ratio: float = 0.14,
+        warmup_frames: int = 18,
+        stable_diff_threshold: float = 11.0,
+        row_text_threshold: float = 0.018,
+        overlay_hold_frames: int = 10,
+    ):
+        self.src_w = int(src_w)
+        self.src_h = int(src_h)
+        self.top_scan_h = max(24, int(round(src_h * top_scan_ratio)))
+        self.bottom_scan_h = max(24, int(round(src_h * bottom_scan_ratio)))
+        self.warmup_frames = max(4, int(warmup_frames))
+        self.stable_diff_threshold = float(stable_diff_threshold)
+        self.row_text_threshold = float(row_text_threshold)
+        self.overlay_hold_frames = max(1, int(overlay_hold_frames))
+
+        self.top_avg: Optional[np.ndarray] = None
+        self.bottom_avg: Optional[np.ndarray] = None
         self.frame_count = 0
 
-        # Detected stable overlay bounds (y0, y1) relative to source
-        self.top_overlay: Optional[tuple[int, int]] = None      # (0, h)
-        self.bottom_overlay: Optional[tuple[int, int]] = None    # (y, src_h)
+        self.top_overlay: Optional[tuple[int, int]] = None
+        self.bottom_overlay: Optional[tuple[int, int]] = None
+        self.top_hold = 0
+        self.bottom_hold = 0
 
-        # Exclusion mask (same size as source, uint8, 255 = exclude)
-        self.exclusion_mask = np.zeros((src_h, src_w), dtype=np.uint8)
+        self.exclusion_mask = np.zeros((self.src_h, self.src_w), dtype=np.uint8)
 
-    def _edge_density(self, gray_patch: np.ndarray) -> float:
+    def _row_edge_density(self, gray_patch: np.ndarray) -> np.ndarray:
         edges = cv2.Canny(gray_patch, 60, 180)
-        return float(np.count_nonzero(edges)) / max(1.0, float(edges.size))
+        return edges.mean(axis=1) / 255.0
 
-    def _has_text_like_content(self, gray_patch: np.ndarray) -> bool:
-        density = self._edge_density(gray_patch)
-        return density >= self.edge_density_thresh
+    def _row_sat_mean(self, bgr_patch: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(bgr_patch, cv2.COLOR_BGR2HSV)
+        return hsv[:, :, 1].mean(axis=1) / 255.0
 
-    def update(self, gray: np.ndarray) -> None:
-        h, w = gray.shape[:2]
-        top_strip = gray[:self.top_scan_h, :].astype(np.float32)
-        bottom_strip = gray[h - self.bottom_scan_h:, :].astype(np.float32)
+    def _row_green_ratio(self, bgr_patch: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(bgr_patch, cv2.COLOR_BGR2HSV)
+        green = cv2.inRange(hsv, np.array([30, 30, 25], dtype=np.uint8), np.array([90, 255, 255], dtype=np.uint8))
+        return (green > 0).mean(axis=1)
 
-        if self.top_acc is None:
-            self.top_acc = top_strip.copy()
-            self.bottom_acc = bottom_strip.copy()
-            self.frame_count = 1
-            return
+    def _detect_overlay_range(self, current_bgr: np.ndarray, avg_bgr: np.ndarray, *, top: bool) -> Optional[tuple[int, int]]:
+        curr_gray = cv2.cvtColor(current_bgr, cv2.COLOR_BGR2GRAY)
+        avg_gray = cv2.cvtColor(np.clip(avg_bgr, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        diff = np.abs(curr_gray.astype(np.float32) - avg_gray.astype(np.float32))
+        row_diff = diff.mean(axis=1)
+        row_edges = self._row_edge_density(curr_gray)
+        row_sat = self._row_sat_mean(current_bgr)
+        row_green = self._row_green_ratio(current_bgr)
 
-        # Exponential moving average
-        alpha = 0.92
-        self.top_acc = alpha * self.top_acc + (1.0 - alpha) * top_strip
-        self.bottom_acc = alpha * self.bottom_acc + (1.0 - alpha) * bottom_strip
+        stable = row_diff < self.stable_diff_threshold
+        texty = row_edges > self.row_text_threshold
+        colorful = row_sat > 0.10
+        not_field = row_green < 0.35
+        active = stable & texty & (colorful | not_field)
+
+        # strengthen by closing gaps
+        if active.any():
+            kernel = np.ones(5, dtype=np.uint8)
+            active_u8 = np.convolve(active.astype(np.uint8), kernel, mode='same') > 1
+        else:
+            active_u8 = active
+
+        idx = np.where(active_u8)[0]
+        if idx.size == 0:
+            return None
+
+        # largest contiguous run
+        runs = []
+        start = idx[0]
+        prev = idx[0]
+        for v in idx[1:]:
+            if v == prev + 1:
+                prev = v
+            else:
+                runs.append((start, prev + 1))
+                start = v
+                prev = v
+        runs.append((start, prev + 1))
+        runs.sort(key=lambda x: (x[1] - x[0]), reverse=True)
+        y0, y1 = runs[0]
+        band_h = y1 - y0
+
+        # Top scoreboards are usually compact and near the top edge.
+        if top:
+            if y0 > int(0.06 * current_bgr.shape[0]):
+                return None
+            if band_h < 12:
+                return None
+            # expand slightly to include full banner background
+            y0 = max(0, y0 - 6)
+            y1 = min(current_bgr.shape[0], y1 + 6)
+            if (y1 - y0) > int(0.16 * self.src_h):
+                y1 = y0 + int(0.16 * self.src_h)
+            return (y0, y1)
+
+        # Bottom lower-thirds should be compact. If the band is too tall,
+        # it is likely pitch-side ads / stadium wall, not a broadcast graphic.
+        if band_h < 10:
+            return None
+        if band_h > int(0.075 * self.src_h):
+            return None
+        if y1 < int(0.45 * current_bgr.shape[0]):
+            return None
+        y0 = max(0, y0 - 4)
+        y1 = min(current_bgr.shape[0], y1 + 4)
+        return (y0, y1)
+
+    def update(self, frame_bgr: np.ndarray) -> None:
         self.frame_count += 1
 
-        if self.frame_count < self.stability_frames:
+        top_patch = frame_bgr[:self.top_scan_h].astype(np.float32)
+        bot_patch = frame_bgr[self.src_h - self.bottom_scan_h:].astype(np.float32)
+
+        if self.top_avg is None:
+            self.top_avg = top_patch.copy()
+            self.bottom_avg = bot_patch.copy()
             return
 
-        # Check top: compare current strip to running average
-        top_diff = np.mean(np.abs(top_strip - self.top_acc))
-        if top_diff < self.diff_thresh and self._has_text_like_content(gray[:self.top_scan_h, :]):
-            self.top_overlay = (0, self.top_scan_h)
-        else:
-            self.top_overlay = None
+        alpha = 0.93
+        self.top_avg = alpha * self.top_avg + (1.0 - alpha) * top_patch
+        self.bottom_avg = alpha * self.bottom_avg + (1.0 - alpha) * bot_patch
 
-        # Check bottom
-        bot_diff = np.mean(np.abs(bottom_strip - self.bottom_acc))
-        if bot_diff < self.diff_thresh and self._has_text_like_content(gray[h - self.bottom_scan_h:, :]):
-            self.bottom_overlay = (h - self.bottom_scan_h, h)
-        else:
-            self.bottom_overlay = None
+        if self.frame_count >= self.warmup_frames:
+            top_range = self._detect_overlay_range(frame_bgr[:self.top_scan_h], self.top_avg, top=True)
+            bot_local = self._detect_overlay_range(frame_bgr[self.src_h - self.bottom_scan_h:], self.bottom_avg, top=False)
+            bot_range = None
+            if bot_local is not None:
+                bot_range = (self.src_h - self.bottom_scan_h + bot_local[0], self.src_h - self.bottom_scan_h + bot_local[1])
 
-        # Rebuild exclusion mask
+            if top_range is not None:
+                self.top_overlay = top_range
+                self.top_hold = self.overlay_hold_frames
+            elif self.top_hold > 0:
+                self.top_hold -= 1
+            else:
+                self.top_overlay = None
+
+            if bot_range is not None:
+                self.bottom_overlay = bot_range
+                self.bottom_hold = self.overlay_hold_frames
+            elif self.bottom_hold > 0:
+                self.bottom_hold -= 1
+            else:
+                self.bottom_overlay = None
+
         self.exclusion_mask[:] = 0
         if self.top_overlay is not None:
             self.exclusion_mask[self.top_overlay[0]:self.top_overlay[1], :] = 255
         if self.bottom_overlay is not None:
             self.exclusion_mask[self.bottom_overlay[0]:self.bottom_overlay[1], :] = 255
 
-    def extract_scorecard_strip(self, frame: np.ndarray) -> Optional[np.ndarray]:
-        """Return the top overlay region as a BGR image strip, or None."""
+    def get_play_area_bounds(self) -> tuple[int, int]:
+        top_y = self.top_overlay[1] if self.top_overlay is not None else 0
+        bot_y = self.bottom_overlay[0] if self.bottom_overlay is not None else self.src_h
+        # add modest safe margins so the crop does not sit right on overlay edges
+        top_y = min(self.src_h - 32, top_y + 6)
+        bot_y = max(32, bot_y - 6)
+        if bot_y <= top_y + 32:
+            top_y = 0
+            bot_y = self.src_h
+        return top_y, bot_y
+
+    def extract_top_strip(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
         if self.top_overlay is None:
             return None
         y0, y1 = self.top_overlay
-        strip = frame[y0:y1, :]
-        if strip.size == 0:
-            return None
-        return strip.copy()
+        strip = frame_bgr[y0:y1]
+        return strip.copy() if strip.size else None
 
-    def extract_bottom_strip(self, frame: np.ndarray) -> Optional[np.ndarray]:
-        """Return the bottom overlay region as a BGR image strip, or None."""
+    def extract_bottom_strip(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
         if self.bottom_overlay is None:
             return None
         y0, y1 = self.bottom_overlay
-        strip = frame[y0:y1, :]
-        if strip.size == 0:
-            return None
-        return strip.copy()
-
-    def get_play_area_bounds(self) -> tuple[int, int]:
-        """Return (top_y, bottom_y) of the actual play area excluding overlays."""
-        top_y = self.top_overlay[1] if self.top_overlay else 0
-        bot_y = self.bottom_overlay[0] if self.bottom_overlay else self.src_h
-        return top_y, bot_y
+        strip = frame_bgr[y0:y1]
+        return strip.copy() if strip.size else None
 
 
 # ---------------------------------------------------------------------------
-# Scene-change detector
+# Scene change detector
 # ---------------------------------------------------------------------------
 
 class SceneChangeDetector:
-    """Detects hard camera cuts in broadcast footage so the reframer can
-    reset smoothing gently instead of wildly jumping."""
-
-    def __init__(self, hist_diff_thresh: float = 0.55, pixel_diff_thresh: float = 45.0,
-                 cooldown_frames: int = 8):
+    def __init__(self, hist_diff_thresh: float = 0.55, pixel_diff_thresh: float = 45.0, cooldown_frames: int = 8):
         self.hist_diff_thresh = hist_diff_thresh
         self.pixel_diff_thresh = pixel_diff_thresh
         self.cooldown_frames = cooldown_frames
@@ -279,51 +376,36 @@ class SceneChangeDetector:
         self.cooldown = 0
 
     def check(self, gray: np.ndarray) -> bool:
-        """Return True if a scene change / hard cut is detected."""
         if self.cooldown > 0:
             self.cooldown -= 1
-
         hist = cv2.calcHist([gray], [0], None, [64], [0, 256])
         cv2.normalize(hist, hist)
-
         is_cut = False
         if self.prev_hist is not None and self.cooldown <= 0:
             corr = float(cv2.compareHist(self.prev_hist, hist, cv2.HISTCMP_CORREL))
             hist_diff = 1.0 - corr
-
             mean_pixel_diff = 0.0
             if self.prev_gray is not None:
                 mean_pixel_diff = float(np.mean(cv2.absdiff(gray, self.prev_gray)))
-
             if hist_diff > self.hist_diff_thresh and mean_pixel_diff > self.pixel_diff_thresh:
                 is_cut = True
                 self.cooldown = self.cooldown_frames
-
         self.prev_hist = hist
         self.prev_gray = gray.copy()
         return is_cut
 
 
 # ---------------------------------------------------------------------------
-# Ball Tracker (multi-method, sport-aware)
+# Ball tracker
 # ---------------------------------------------------------------------------
 
 class BallTracker:
-    """Multi-method ball detection tuned for basketball, cricket, and soccer.
-    Uses up to three detection methods and fuses results:
-      1. HoughCircles for circular shape
-      2. Contour circularity analysis on filtered masks
-      3. Color-blob detection in HSV space
-    Temporal smoothing with velocity prediction reduces jitter."""
-
     def __init__(self, src_w: int, src_h: int, sport_profile: str = "auto"):
-        self.src_w = src_w
-        self.src_h = src_h
+        self.src_w = int(src_w)
+        self.src_h = int(src_h)
         self.sport = (sport_profile or "auto").strip().lower()
         if self.sport not in {"basketball", "cricket", "soccer"}:
             self.sport = "generic"
-
-        # State
         self.cx = src_w / 2.0
         self.cy = src_h / 2.0
         self.radius = 0.0
@@ -331,18 +413,13 @@ class BallTracker:
         self.vx = 0.0
         self.vy = 0.0
         self.missing_count = 0
-        self.max_missing = 12  # frames before confidence fully decays
-
-        # Size bounds (relative to min dimension)
+        self.max_missing = 12
         min_dim = min(src_w, src_h)
         self.min_r = max(3, int(round(min_dim * 0.006)))
         self.max_r = max(self.min_r + 4, int(round(min_dim * 0.038)))
-
-        # Gating distance for temporal prediction
         self.gate_radius = max(self.src_w * 0.35, 80.0)
 
     def _build_field_mask(self, hsv: np.ndarray) -> Optional[np.ndarray]:
-        """Build a mask of the playing field (green areas) for soccer/cricket."""
         if self.sport not in {"soccer", "cricket"}:
             return None
         lower_green = np.array([30, 30, 30], dtype=np.uint8)
@@ -366,7 +443,6 @@ class BallTracker:
         return [(float(c[0]), float(c[1]), float(c[2])) for c in circles[0][:25]]
 
     def _candidates_contour(self, gray: np.ndarray, field_mask: Optional[np.ndarray]) -> list[tuple[float, float, float]]:
-        """Find small circular contours on an edge+threshold image."""
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.0)
         edges = cv2.Canny(blurred, 50, 150)
         if field_mask is not None:
@@ -390,37 +466,25 @@ class BallTracker:
         return results[:20]
 
     def _candidates_color_blob(self, hsv: np.ndarray, field_mask: Optional[np.ndarray]) -> list[tuple[float, float, float]]:
-        """Detect ball-colored blobs using sport-specific HSV ranges."""
         masks: list[np.ndarray] = []
         if self.sport == "basketball":
             masks.append(cv2.inRange(hsv, np.array([3, 80, 80]), np.array([22, 255, 255])))
         elif self.sport == "cricket":
-            # Red ball
             masks.append(cv2.inRange(hsv, np.array([0, 100, 60]), np.array([10, 255, 255])))
             masks.append(cv2.inRange(hsv, np.array([165, 100, 60]), np.array([179, 255, 255])))
-            # White ball
             masks.append(cv2.inRange(hsv, np.array([0, 0, 180]), np.array([179, 45, 255])))
         elif self.sport == "soccer":
-            # White / light ball
             masks.append(cv2.inRange(hsv, np.array([0, 0, 170]), np.array([179, 60, 255])))
         else:
-            # Generic bright objects
             masks.append(cv2.inRange(hsv, np.array([0, 0, 180]), np.array([179, 55, 255])))
-
-        if not masks:
-            return []
-
         combined = masks[0]
         for m in masks[1:]:
             combined = cv2.bitwise_or(combined, m)
-
         if field_mask is not None and self.sport in {"soccer", "cricket"}:
             combined = cv2.bitwise_and(combined, field_mask)
-
         kernel = np.ones((3, 3), np.uint8)
         combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel, iterations=1)
         combined = cv2.dilate(combined, kernel, iterations=1)
-
         cnts, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         results: list[tuple[float, float, float]] = []
         for c in cnts:
@@ -437,11 +501,7 @@ class BallTracker:
         results.sort(key=lambda t: abs(t[2] - (self.min_r + self.max_r) / 2.0))
         return results[:15]
 
-    def _score_candidate(self, cx: float, cy: float, radius: float,
-                         hsv: np.ndarray, motion_mask: Optional[np.ndarray],
-                         source: str) -> float:
-        """Score a ball candidate based on multiple cues."""
-        # --- Color score ---
+    def _score_candidate(self, cx: float, cy: float, radius: float, hsv: np.ndarray, motion_mask: Optional[np.ndarray], source: str) -> float:
         r_int = max(3, int(radius))
         x0 = max(0, int(cx - r_int))
         y0 = max(0, int(cy - r_int))
@@ -467,8 +527,6 @@ class BallTracker:
                     color_score = 0.5
             else:
                 color_score = 0.3 if mv >= 150 else 0.0
-
-        # --- Motion score ---
         motion_score = 0.0
         if motion_mask is not None:
             mr = max(5, int(radius * 2.0))
@@ -479,24 +537,14 @@ class BallTracker:
             mp = motion_mask[my0:my1, mx0:mx1]
             if mp.size > 0:
                 motion_score = float(np.count_nonzero(mp)) / float(mp.size)
-
-        # --- Proximity to prediction ---
         pred_x = self.cx + self.vx
         pred_y = self.cy + self.vy
         dist = math.hypot(cx - pred_x, cy - pred_y)
         proximity_score = max(0.0, 1.0 - dist / self.gate_radius)
-
-        # --- Size score (prefer expected ball size) ---
         expected_r = (self.min_r + self.max_r) / 2.0
         size_dev = abs(radius - expected_r) / max(expected_r, 1.0)
         size_score = max(0.0, 1.0 - size_dev)
-
-        # --- Source bonus (multiple detection methods found same area) ---
-        source_bonus = 0.0
-        if source == "multi":
-            source_bonus = 0.15
-
-        # --- Sport-specific weighting ---
+        source_bonus = 0.15 if source == "multi" else 0.0
         if self.sport == "cricket":
             score = 0.25 * color_score + 0.25 * motion_score + 0.25 * proximity_score + 0.15 * size_score + 0.10 * source_bonus
         elif self.sport == "basketball":
@@ -505,23 +553,14 @@ class BallTracker:
             score = 0.22 * color_score + 0.28 * motion_score + 0.28 * proximity_score + 0.12 * size_score + 0.10 * source_bonus
         else:
             score = 0.20 * color_score + 0.30 * motion_score + 0.30 * proximity_score + 0.10 * size_score + 0.10 * source_bonus
-
         return float(score)
 
-    def update(self, frame: np.ndarray, gray: np.ndarray,
-               motion_mask: Optional[np.ndarray],
-               exclusion_mask: Optional[np.ndarray] = None) -> Optional[tuple[float, float, float, float]]:
-        """Run detection and return (cx, cy, radius, confidence) or None."""
+    def update(self, frame: np.ndarray, gray: np.ndarray, motion_mask: Optional[np.ndarray], exclusion_mask: Optional[np.ndarray] = None) -> Optional[tuple[float, float, float, float]]:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        # Apply exclusion mask to gray for detection (zero-out overlay regions)
         det_gray = gray.copy()
         if exclusion_mask is not None:
             det_gray[exclusion_mask > 0] = 0
-
         field_mask = self._build_field_mask(hsv)
-
-        # Collect candidates from all methods
         raw_candidates: list[tuple[float, float, float, str]] = []
         for cx, cy, r in self._candidates_hough(det_gray):
             raw_candidates.append((cx, cy, r, "hough"))
@@ -529,18 +568,13 @@ class BallTracker:
             raw_candidates.append((cx, cy, r, "contour"))
         for cx, cy, r in self._candidates_color_blob(hsv, field_mask):
             raw_candidates.append((cx, cy, r, "color"))
-
-        # Filter out candidates that fall in exclusion zones
         if exclusion_mask is not None:
             filtered = []
             for cx, cy, r, src in raw_candidates:
                 ix, iy = int(round(cx)), int(round(cy))
-                if 0 <= iy < self.src_h and 0 <= ix < self.src_w:
-                    if exclusion_mask[iy, ix] == 0:
-                        filtered.append((cx, cy, r, src))
+                if 0 <= iy < self.src_h and 0 <= ix < self.src_w and exclusion_mask[iy, ix] == 0:
+                    filtered.append((cx, cy, r, src))
             raw_candidates = filtered
-
-        # Cluster nearby candidates & mark "multi" source
         clusters: list[tuple[float, float, float, str]] = []
         used = [False] * len(raw_candidates)
         merge_dist = max(self.max_r * 2.5, 20.0)
@@ -567,8 +601,6 @@ class BallTracker:
             avg_r = sum(group_r) / len(group_r)
             src_tag = "multi" if len(sources) > 1 else list(sources)[0]
             clusters.append((avg_cx, avg_cy, avg_r, src_tag))
-
-        # Score each cluster
         best: Optional[tuple[float, float, float, float]] = None
         best_score = -1.0
         for cx, cy, r, src in clusters:
@@ -576,34 +608,25 @@ class BallTracker:
             if score > best_score:
                 best_score = score
                 best = (cx, cy, r, score)
-
-        # Acceptance threshold
         if best is None or best_score < 0.15:
             self.missing_count += 1
             self.conf *= 0.88
             if self.missing_count > self.max_missing:
                 self.conf = 0.0
             return None
-
         cx, cy, r, score = best
-
-        # Update velocity with smoothing
         new_vx = cx - self.cx
         new_vy = cy - self.cy
         self.vx = 0.5 * self.vx + 0.5 * new_vx
         self.vy = 0.5 * self.vy + 0.5 * new_vy
-
-        # Smooth position update (heavier smoothing to reduce jitter)
         self.cx = 0.6 * self.cx + 0.4 * cx
         self.cy = 0.6 * self.cy + 0.4 * cy
         self.radius = (0.6 * self.radius + 0.4 * r) if self.radius > 0 else r
         self.conf = min(1.0, 0.7 * self.conf + 0.55 * score)
         self.missing_count = 0
-
         return (self.cx, self.cy, self.radius, self.conf)
 
     def reset_position(self, cx: float, cy: float) -> None:
-        """Soft reset after a scene change."""
         self.cx = cx
         self.cy = cy
         self.vx = 0.0
@@ -612,16 +635,20 @@ class BallTracker:
 
 
 # ---------------------------------------------------------------------------
-# Smooth Reframer (v2 — overlay-aware, ball-tracking, scene-cut-safe)
+# Smooth reframer
 # ---------------------------------------------------------------------------
 
 class SmoothReframer:
-    """Stable vertical reframer with:
-      - multi-cue focus: faces, motion clusters, saliency, ball tracking
-      - overlay/scorecard detection and exclusion from reframing decisions
-      - optional scorecard compositing into vertical output
-      - scene-change detection with gentle reset
-      - fixed output resolution (target_w x target_h)
+    """
+    Updated v3 logic focused on fixing the *top/bottom experience*:
+    - Original cropped picture never includes the preserved top scorecard strip.
+      This removes the duplicate-scoreboard issue visible in the user's screenshot.
+    - Bottom lower-third compositing is conservative and disabled for large/tall
+      ad-board-like regions.
+    - The play area is rendered into a reserved middle canvas, while the top
+      strip is composited separately at a controlled height.
+    - Y motion is bounded to the play area so the crop does not wander too high
+      into crowd/score graphics or too low into sideline signage.
     """
 
     def __init__(
@@ -639,9 +666,12 @@ class SmoothReframer:
         ball_weight: float = 0.55,
         context_bias: float = 0.20,
         overlay_composite: bool = True,
+        preserve_bottom_overlay: bool = False,
     ):
-        self.src_w, self.src_h = int(src_w), int(src_h)
-        self.target_w, self.target_h = int(target_w), int(target_h)
+        self.src_w = int(src_w)
+        self.src_h = int(src_h)
+        self.target_w = int(target_w)
+        self.target_h = int(target_h)
         self.crop_w, self.crop_h = _vertical_crop_box(src_w, src_h)
         self.max_x = max(0, src_w - self.crop_w)
         self.max_y = max(0, src_h - self.crop_h)
@@ -652,24 +682,21 @@ class SmoothReframer:
         self.ball_weight = float(ball_weight)
         self.context_bias = float(context_bias)
         self.overlay_composite = bool(overlay_composite)
+        self.preserve_bottom_overlay = bool(preserve_bottom_overlay)
         self.sport_profile = (sport_profile or "auto").strip().lower()
 
-        # Sub-components
-        self.face_detector = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
+        self.face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
         self.saliency = None
         try:
             if hasattr(cv2, "saliency"):
                 self.saliency = cv2.saliency.StaticSaliencySpectralResidual_create()
         except Exception:
-            pass
+            self.saliency = None
 
         self.overlay_detector = OverlayDetector(src_w, src_h)
         self.scene_detector = SceneChangeDetector()
         self.ball_tracker = BallTracker(src_w, src_h, sport_profile=self.sport_profile) if ball_tracking else None
 
-        # Smoothing state
         self.smoothed_cx = src_w / 2.0
         self.smoothed_cy = src_h / 2.0
         self.target_cx = self.smoothed_cx
@@ -686,12 +713,9 @@ class SmoothReframer:
         kernel = np.ones((3, 3), np.uint8)
         motion = cv2.morphologyEx(motion, cv2.MORPH_OPEN, kernel, iterations=1)
         motion = cv2.dilate(motion, None, iterations=2)
-
-        # Zero-out overlay regions so they don't create false motion
         excl = self.overlay_detector.exclusion_mask
         if excl is not None:
             motion[excl > 0] = 0
-
         cnts, _ = cv2.findContours(motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         min_area = 0.006 * self.src_w * self.src_h
         boxes: list[tuple[int, int, int, int]] = []
@@ -701,60 +725,81 @@ class SmoothReframer:
                 boxes.append((x, y, w, h))
         return boxes, motion
 
+    def _compose_output(self, play_crop: np.ndarray, top_strip: Optional[np.ndarray], bottom_strip: Optional[np.ndarray]) -> np.ndarray:
+        # Determine reserved bands.
+        top_h = 0
+        if self.overlay_composite and top_strip is not None and top_strip.size:
+            # Compact but readable scoreboard band.
+            strip_h_src = top_strip.shape[0]
+            top_h = int(round(self.target_h * 0.082))
+            if strip_h_src < 0.05 * self.src_h:
+                top_h = int(round(self.target_h * 0.075))
+            top_h = int(_clamp(top_h, 42, int(self.target_h * 0.11)))
+        bottom_h = 0
+        if self.overlay_composite and self.preserve_bottom_overlay and bottom_strip is not None and bottom_strip.size:
+            bottom_h = int(_clamp(int(round(self.target_h * 0.045)), 20, int(self.target_h * 0.07)))
+
+        mid_h = max(1, self.target_h - top_h - bottom_h)
+        output = np.zeros((self.target_h, self.target_w, 3), dtype=np.uint8)
+
+        play_render = _resize_cover(play_crop, self.target_w, mid_h)
+        output[top_h:top_h + mid_h, :] = play_render
+
+        if top_h > 0 and top_strip is not None and top_strip.size:
+            # Keep full scoreboard width visible, but avoid huge stretched look.
+            scoreboard = cv2.resize(top_strip, (self.target_w, top_h), interpolation=cv2.INTER_AREA)
+            output[:top_h, :] = scoreboard
+            # subtle hairline divider for readability
+            cv2.line(output, (0, top_h - 1), (self.target_w - 1, top_h - 1), (10, 10, 10), 1)
+
+        if bottom_h > 0 and bottom_strip is not None and bottom_strip.size:
+            lower = cv2.resize(bottom_strip, (self.target_w, bottom_h), interpolation=cv2.INTER_AREA)
+            output[self.target_h - bottom_h:, :] = lower
+            cv2.line(output, (0, self.target_h - bottom_h), (self.target_w - 1, self.target_h - bottom_h), (10, 10, 10), 1)
+
+        return output
+
     def process(self, frame: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Update overlay detector every frame for stability
-        self.overlay_detector.update(gray)
-
-        # Scene change detection
+        self.overlay_detector.update(frame)
         is_cut = self.scene_detector.check(gray)
         if is_cut:
-            # Gentle reset: move smoothed position halfway to center
             self.smoothed_cx = (self.smoothed_cx + self.src_w / 2.0) / 2.0
             self.smoothed_cy = (self.smoothed_cy + self.src_h / 2.0) / 2.0
             if self.ball_tracker is not None:
                 self.ball_tracker.reset_position(self.src_w / 2.0, self.src_h / 2.0)
 
-        # Analysis (every N frames)
         if self.frame_idx % self.analysis_stride == 0:
             candidates: list[tuple[float, tuple[float, float]]] = []
             excl = self.overlay_detector.exclusion_mask
             play_top, play_bot = self.overlay_detector.get_play_area_bounds()
 
-            # --- Faces ---
+            # Faces only inside play area.
             try:
                 play_gray = gray[play_top:play_bot, :]
-                faces = self.face_detector.detectMultiScale(
-                    play_gray, scaleFactor=1.15, minNeighbors=4, minSize=(32, 32),
-                )
+                faces = self.face_detector.detectMultiScale(play_gray, scaleFactor=1.15, minNeighbors=4, minSize=(32, 32))
             except Exception:
                 faces = []
             for (x, y, w, h) in faces[:3]:
-                # Offset y back to full-frame coordinates
-                candidates.append((0.35, (x + w / 2.0, play_top + y + h / 2.0)))
+                candidates.append((0.30, (x + w / 2.0, play_top + y + h / 2.0)))
 
-            # --- Motion ---
             motion_boxes, motion_mask = self._detect_motion(gray)
             if motion_boxes:
                 x0 = min(p[0] for p in motion_boxes)
                 y0 = min(p[1] for p in motion_boxes)
                 x1 = max(p[0] + p[2] for p in motion_boxes)
                 y1 = max(p[1] + p[3] for p in motion_boxes)
-                candidates.append((0.30, ((x0 + x1) / 2.0, (y0 + y1) / 2.0)))
-                # Strongest single motion region
+                candidates.append((0.34, ((x0 + x1) / 2.0, (y0 + y1) / 2.0)))
                 bx, by, bw, bh = motion_boxes[0]
-                candidates.append((0.15, (bx + bw / 2.0, by + bh / 2.0)))
+                candidates.append((0.16, (bx + bw / 2.0, by + bh / 2.0)))
             else:
                 motion_mask = None
 
-            # --- Saliency ---
             if self.saliency is not None:
                 try:
                     success, sal_map = self.saliency.computeSaliency(frame)
                     if success:
                         sal_map = (sal_map * 255).astype("uint8")
-                        # Zero overlays in saliency
                         if excl is not None:
                             sal_map[excl > 0] = 0
                         _, thresh = cv2.threshold(sal_map, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -763,18 +808,15 @@ class SmoothReframer:
                             c = max(cnts, key=cv2.contourArea)
                             x, y, w, h = cv2.boundingRect(c)
                             if w * h > 0.02 * self.src_w * self.src_h:
-                                candidates.append((0.10, (x + w / 2.0, y + h / 2.0)))
+                                candidates.append((0.08, (x + w / 2.0, y + h / 2.0)))
                 except Exception:
                     pass
 
-            # --- Ball tracking ---
             if self.ball_tracker is not None:
                 ball = self.ball_tracker.update(frame, gray, motion_mask, excl)
                 if ball is not None:
                     bx, by, _br, bconf = ball
-                    effective_weight = self.ball_weight * max(0.25, bconf)
-                    candidates.append((effective_weight, (bx, by)))
-                    # Context around motion to keep players visible
+                    candidates.append((self.ball_weight * max(0.25, bconf), (bx, by)))
                     if motion_boxes:
                         mx0 = min(p[0] for p in motion_boxes)
                         my0 = min(p[1] for p in motion_boxes)
@@ -782,7 +824,6 @@ class SmoothReframer:
                         my1 = max(p[1] + p[3] for p in motion_boxes)
                         candidates.append((self.context_bias, ((mx0 + mx1) / 2.0, (my0 + my1) / 2.0)))
 
-            # --- Compute weighted target ---
             if candidates:
                 ws = sum(w for w, _ in candidates)
                 self.target_cx = sum(cx * w for w, (cx, _) in candidates) / max(ws, 1e-6)
@@ -791,46 +832,49 @@ class SmoothReframer:
                 self.target_cx = self.src_w / 2.0
                 self.target_cy = self.src_h / 2.0
 
+            # Keep target Y inside play area; avoid drifting into top score banner or bottom graphics.
+            y_margin = max(12, int(0.02 * self.src_h))
+            self.target_cy = _clamp(self.target_cy, play_top + y_margin, play_bot - y_margin)
+
         self.prev_gray = gray
 
-        # --- Smooth panning ---
         dx = self.target_cx - self.smoothed_cx
         dy = self.target_cy - self.smoothed_cy
         if abs(dx) < self.deadzone_px:
             dx = 0.0
         if abs(dy) < self.deadzone_px * 0.45:
             dy = 0.0
-
-        # On scene cuts, allow faster repositioning
         alpha = (1.0 - self.smooth_strength) * (3.0 if is_cut else 1.0)
         self.smoothed_cx += max(-self.max_pan_px, min(self.max_pan_px, dx * alpha))
         self.smoothed_cy += max(-(self.max_pan_px * 0.45), min(self.max_pan_px * 0.45, dy * alpha))
 
-        # --- Crop ---
+        # Crop box. Y is constrained to play area so the original crop does not include top/bottom graphics.
+        play_top, play_bot = self.overlay_detector.get_play_area_bounds()
         x0 = int(round(self.smoothed_cx - self.crop_w / 2.0))
-        y0 = int(round(self.smoothed_cy - self.crop_h / 2.0))
         x0 = int(_clamp(x0, 0, self.max_x))
-        y0 = int(_clamp(y0, 0, self.max_y))
+
+        # Crop inside play area as much as possible.
+        play_h = play_bot - play_top
+        if play_h >= self.crop_h:
+            min_y = play_top
+            max_y = play_bot - self.crop_h
+            y0 = int(round(self.smoothed_cy - self.crop_h / 2.0))
+            y0 = int(_clamp(y0, min_y, max_y))
+        else:
+            # If play area is smaller than crop height, still bias crop away from overlays.
+            y0 = int(_clamp(round(self.smoothed_cy - self.crop_h / 2.0), 0, self.max_y))
+            if self.overlay_detector.top_overlay is not None and y0 < play_top:
+                y0 = min(self.max_y, play_top)
+            if self.overlay_detector.bottom_overlay is not None and y0 + self.crop_h > play_bot:
+                y0 = max(0, play_bot - self.crop_h)
 
         crop = frame[y0:y0 + self.crop_h, x0:x0 + self.crop_w]
         if crop.size == 0:
             crop = frame
 
-        output = cv2.resize(crop, (self.target_w, self.target_h), interpolation=cv2.INTER_CUBIC)
-
-        # --- Composite scorecard strip ---
-        if self.overlay_composite:
-            score_strip = self.overlay_detector.extract_scorecard_strip(frame)
-            if score_strip is not None:
-                strip_h_target = max(24, int(self.target_h * 0.065))
-                strip_resized = cv2.resize(score_strip, (self.target_w, strip_h_target), interpolation=cv2.INTER_AREA)
-                output[:strip_h_target, :] = strip_resized
-
-            bottom_strip = self.overlay_detector.extract_bottom_strip(frame)
-            if bottom_strip is not None:
-                bstrip_h_target = max(20, int(self.target_h * 0.05))
-                bstrip_resized = cv2.resize(bottom_strip, (self.target_w, bstrip_h_target), interpolation=cv2.INTER_AREA)
-                output[self.target_h - bstrip_h_target:, :] = bstrip_resized
+        top_strip = self.overlay_detector.extract_top_strip(frame) if self.overlay_composite else None
+        bottom_strip = self.overlay_detector.extract_bottom_strip(frame) if self.overlay_composite else None
+        output = self._compose_output(crop, top_strip, bottom_strip)
 
         self.frame_idx += 1
         return output
@@ -852,6 +896,7 @@ def create_vertical_master(
     sport_profile: str = "auto",
     ball_tracking: bool = True,
     overlay_composite: bool = True,
+    preserve_bottom_overlay: bool = False,
     progress_cb: Optional[Callable[[float, str], None]] = None,
 ):
     cap = cv2.VideoCapture(source_path)
@@ -873,6 +918,7 @@ def create_vertical_master(
         sport_profile=sport_profile,
         ball_tracking=ball_tracking,
         overlay_composite=overlay_composite,
+        preserve_bottom_overlay=preserve_bottom_overlay,
     )
     writer = cv2.VideoWriter(
         output_path,
@@ -929,10 +975,7 @@ class LiveSession:
     error: str = ""
 
 
-def cfstream_config_from_inputs(
-    account_id: str, api_token: str, customer_code: str,
-    prefer_low_latency: bool = False,
-) -> CFStreamConfig:
+def cfstream_config_from_inputs(account_id: str, api_token: str, customer_code: str, prefer_low_latency: bool = False) -> CFStreamConfig:
     if not account_id:
         raise ValueError("Cloudflare account ID is required.")
     if not api_token:
@@ -989,10 +1032,7 @@ def build_public_playback_urls(cfg: CFStreamConfig, uid: str):
     return hls, dash, iframe
 
 
-def build_push_file_command(
-    reframed_mp4: str, rtmps_url: str, stream_key: str,
-    loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS,
-):
+def build_push_file_command(reframed_mp4: str, rtmps_url: str, stream_key: str, loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS):
     target = rtmps_url.rstrip("/") + "/" + stream_key
     fps_int = max(24, min(60, int(round(output_fps or DEFAULT_OUTPUT_FPS))))
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"]
@@ -1018,10 +1058,7 @@ def build_push_file_command(
     return cmd
 
 
-def start_vod_to_live_push(
-    cfg: CFStreamConfig, reframed_mp4: str, asset_name: str,
-    loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS,
-) -> LiveSession:
+def start_vod_to_live_push(cfg: CFStreamConfig, reframed_mp4: str, asset_name: str, loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS) -> LiveSession:
     live_input = create_live_input(cfg, name=safe_token(Path(asset_name).stem))
     uid = live_input["uid"]
     rtmps_url = live_input["rtmps"]["url"]
@@ -1034,9 +1071,7 @@ def start_vod_to_live_push(
     return LiveSession(uid, rtmps_url, stream_key, hls_url, dash_url, iframe_url, cmd, proc, log_path, status="streaming")
 
 
-def build_realtime_rtmps_push_command(
-    target_w: int, target_h: int, fps: float, rtmps_url: str, stream_key: str,
-):
+def build_realtime_rtmps_push_command(target_w: int, target_h: int, fps: float, rtmps_url: str, stream_key: str):
     target = rtmps_url.rstrip("/") + "/" + stream_key
     fps_int = max(24, min(60, int(round(fps or DEFAULT_OUTPUT_FPS))))
     return [
@@ -1093,12 +1128,9 @@ def _make_placeholder_frame(target_w: int, target_h: int, text: str = "Starting 
     frame[:] = (18, 22, 36)
     cv2.rectangle(frame, (0, 0), (target_w, int(target_h * 0.18)), (35, 55, 98), -1)
     cv2.rectangle(frame, (0, int(target_h * 0.82)), (target_w, target_h), (24, 34, 60), -1)
-    cv2.putText(frame, "Vertical stream", (28, max(48, target_h // 10)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(frame, text, (28, target_h // 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (210, 220, 255), 2, cv2.LINE_AA)
-    cv2.putText(frame, "Cloudflare live input priming", (28, target_h // 2 + 44),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 195, 230), 1, cv2.LINE_AA)
+    cv2.putText(frame, "Vertical stream", (28, max(48, target_h // 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, text, (28, target_h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (210, 220, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, "Cloudflare live input priming", (28, target_h // 2 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 195, 230), 1, cv2.LINE_AA)
     return frame
 
 
@@ -1118,12 +1150,21 @@ def _start_output_process(session: LiveSession) -> subprocess.Popen:
 
 
 def _realtime_worker(
-    session: LiveSession, source: str,
-    target_w: int, target_h: int, delay_seconds: float,
-    smooth_strength: float, analysis_stride: int,
-    deadzone_ratio: float, max_pan_ratio: float,
-    loop_file: bool, pace_input: bool,
-    sport_profile: str, ball_tracking: bool, overlay_composite: bool,
+    session: LiveSession,
+    source: str,
+    target_w: int,
+    target_h: int,
+    delay_seconds: float,
+    smooth_strength: float,
+    analysis_stride: int,
+    deadzone_ratio: float,
+    max_pan_ratio: float,
+    loop_file: bool,
+    pace_input: bool,
+    sport_profile: str,
+    ball_tracking: bool,
+    overlay_composite: bool,
+    preserve_bottom_overlay: bool,
 ) -> None:
     session.status = "probing"
     info = probe_source(source)
@@ -1147,8 +1188,9 @@ def _realtime_worker(
         sport_profile=sport_profile,
         ball_tracking=ball_tracking,
         overlay_composite=overlay_composite,
+        preserve_bottom_overlay=preserve_bottom_overlay,
     )
-    buffer: collections.deque = collections.deque(maxlen=max(delay_frames + 240, 600))
+    buffer = collections.deque(maxlen=max(delay_frames + 240, 600))
     placeholder = _make_placeholder_frame(target_w, target_h)
     frame_interval = 1.0 / fps
     placeholder_frames = 0
@@ -1229,9 +1271,6 @@ def _realtime_worker(
                 next_deadline = time.monotonic()
 
             if frames_out % int(max(1.0, fps)) == 0:
-                ball_conf = 0.0
-                if reframer.ball_tracker is not None:
-                    ball_conf = round(reframer.ball_tracker.conf, 3)
                 session.stats.update({
                     "frames_in": frames_in,
                     "frames_out": frames_out,
@@ -1239,7 +1278,7 @@ def _realtime_worker(
                     "delay_seconds": round(delay_frames / max(fps, 1.0), 2),
                     "placeholder_frames": placeholder_frames,
                     "source_stalls": source_stalls,
-                    "ball_confidence": ball_conf,
+                    "ball_confidence": round(reframer.ball_tracker.conf, 3) if reframer.ball_tracker is not None else 0.0,
                     "overlay_top": reframer.overlay_detector.top_overlay is not None,
                     "overlay_bottom": reframer.overlay_detector.bottom_overlay is not None,
                 })
@@ -1266,8 +1305,11 @@ def _realtime_worker(
 
 
 def start_realtime_delayed_vertical_push(
-    cfg: CFStreamConfig, source: str, asset_name: str,
-    target_w: int = DEFAULT_TARGET_W, target_h: int = DEFAULT_TARGET_H,
+    cfg: CFStreamConfig,
+    source: str,
+    asset_name: str,
+    target_w: int = DEFAULT_TARGET_W,
+    target_h: int = DEFAULT_TARGET_H,
     delay_seconds: float = 20.0,
     smooth_strength: float = 0.975,
     analysis_stride: int = 4,
@@ -1278,6 +1320,7 @@ def start_realtime_delayed_vertical_push(
     sport_profile: str = "auto",
     ball_tracking: bool = True,
     overlay_composite: bool = True,
+    preserve_bottom_overlay: bool = False,
 ) -> LiveSession:
     live_input = create_live_input(cfg, name=safe_token(Path(asset_name).stem))
     uid = live_input["uid"]
@@ -1290,9 +1333,21 @@ def start_realtime_delayed_vertical_push(
     worker = threading.Thread(
         target=_realtime_worker,
         args=(
-            session, source, target_w, target_h, delay_seconds,
-            smooth_strength, analysis_stride, deadzone_ratio, max_pan_ratio,
-            loop_file, pace_input, sport_profile, ball_tracking, overlay_composite,
+            session,
+            source,
+            target_w,
+            target_h,
+            delay_seconds,
+            smooth_strength,
+            analysis_stride,
+            deadzone_ratio,
+            max_pan_ratio,
+            loop_file,
+            pace_input,
+            sport_profile,
+            ball_tracking,
+            overlay_composite,
+            preserve_bottom_overlay,
         ),
         daemon=True,
     )
