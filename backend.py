@@ -158,7 +158,7 @@ def _resize_cover(image: np.ndarray, width: int, height: int) -> np.ndarray:
     scale = max(width / max(w, 1), height / max(h, 1))
     nw = max(1, int(round(w * scale)))
     nh = max(1, int(round(h * scale)))
-    resized = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC)
+    resized = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR)
     x0 = max(0, (nw - width) // 2)
     y0 = max(0, (nh - height) // 2)
     return resized[y0:y0 + height, x0:x0 + width]
@@ -618,12 +618,22 @@ class BallTracker:
         cx, cy, r, score = best
         new_vx = cx - self.cx
         new_vy = cy - self.cy
-        self.vx = 0.5 * self.vx + 0.5 * new_vx
-        self.vy = 0.5 * self.vy + 0.5 * new_vy
-        self.cx = 0.6 * self.cx + 0.4 * cx
-        self.cy = 0.6 * self.cy + 0.4 * cy
+        # Sport-specific position smoothing alphas
+        if self.sport == "basketball":
+            pos_alpha = 0.65  # track faster movement
+        elif self.sport == "cricket":
+            pos_alpha = 0.55  # moderate, ball travels in arcs
+        elif self.sport == "soccer":
+            pos_alpha = 0.60  # medium speed
+        else:
+            pos_alpha = 0.60
+        vel_alpha = min(0.7, pos_alpha + 0.1)
+        self.vx = vel_alpha * self.vx + (1.0 - vel_alpha) * new_vx
+        self.vy = vel_alpha * self.vy + (1.0 - vel_alpha) * new_vy
+        self.cx = pos_alpha * self.cx + (1.0 - pos_alpha) * cx
+        self.cy = pos_alpha * self.cy + (1.0 - pos_alpha) * cy
         self.radius = (0.6 * self.radius + 0.4 * r) if self.radius > 0 else r
-        self.conf = min(1.0, 0.7 * self.conf + 0.55 * score)
+        self.conf = min(1.0, 0.7 * self.conf + 0.35 * score)
         self.missing_count = 0
         return (self.cx, self.cy, self.radius, self.conf)
 
@@ -847,7 +857,7 @@ class PanelTracker:
         self._blend_remaining: int = 0
         self._prev_output: Optional[np.ndarray] = None
         # Match gate: two faces are the same if within this many pixels
-        self._match_dist: float = max(src_w, src_h) * 0.18
+        self._match_dist: float = max(src_w, src_h) * 0.12
 
     # ------------------------------------------------------------------
     # Public API
@@ -959,6 +969,19 @@ class PanelTracker:
             [tf for tf in self._tracked if tf.active],
             key=lambda tf: tf.sx,
         )
+
+        # Fallback: if no active faces, center-crop source frame
+        if len(active_faces) == 0:
+            fallback_frame = _resize_cover(source_frame, canvas_w, canvas_h)
+            if self._blend_remaining > 0 and self._prev_output is not None:
+                prev = self._prev_output
+                if prev.shape[:2] == fallback_frame.shape[:2]:
+                    alpha = self._blend_remaining / max(self.blend_frames, 1)
+                    fallback_frame = cv2.addWeighted(prev, alpha, fallback_frame, 1.0 - alpha, 0)
+                self._blend_remaining -= 1
+            self._prev_output = fallback_frame
+            return fallback_frame
+
         n = min(self._active_count, max(1, len(active_faces)))
         cells = _compute_panel_layout(n, canvas_w, canvas_h, gap=gap)
 
@@ -995,7 +1018,10 @@ class PanelTracker:
                 output = cv2.addWeighted(prev, alpha, canvas, 1.0 - alpha, 0)
             self._blend_remaining -= 1
 
-        self._prev_output = output.copy()
+        if self._blend_remaining > 0:
+            self._prev_output = output.copy()
+        else:
+            self._prev_output = output
         return output
 
     # ------------------------------------------------------------------
@@ -1032,7 +1058,7 @@ class PanelTracker:
             crop_h = crop_w / max(cell_ar, 0.01)
 
         # Centre on face with headroom shift
-        cy_shifted = cy - fh_f * 0.25
+        cy_shifted = cy - fh_f * 0.15
         x0 = int(round(cx - crop_w / 2.0))
         y0 = int(round(cy_shifted - crop_h * 0.38))
         x1 = int(round(x0 + crop_w))
@@ -1141,7 +1167,7 @@ class SmoothReframer:
         # Panel discussion mode
         panel_mode: bool = False,
         panel_max_faces: int = 4,
-        panel_detection_stride: int = 2,
+        panel_detection_stride: int = 4,
         panel_gap: int = 4,
         panel_max_missing_frames: int = 24,
         panel_layout_hold_frames: int = 8,
@@ -1207,6 +1233,7 @@ class SmoothReframer:
         self.target_cy = self.smoothed_cy
         self.prev_gray: Optional[np.ndarray] = None
         self.frame_idx = 0
+        self._panel_no_face_count: int = 0
 
     # ------------------------------------------------------------------
     # Internal helpers (unchanged from v3)
@@ -1278,8 +1305,11 @@ class SmoothReframer:
 
         Detects faces in the source frame (at panel_detection_stride cadence),
         updates PanelTracker, then renders the multi-panel layout into a
-        (target_h × target_w) output.  Overlay strips are composited on top
+        (target_h x target_w) output.  Overlay strips are composited on top
         just like the single-crop path.
+
+        If no faces are detected for panel_fallback_frames consecutive frames,
+        falls back to single-crop mode to avoid black-screen output.
         """
         assert self.panel_tracker is not None
 
@@ -1322,6 +1352,19 @@ class SmoothReframer:
             # Non-detection frames: hold positions without penalising faces
             self.panel_tracker.tick_extrapolation()
 
+        # --- Panel fallback: if no active faces for too long, use single-crop ---
+        active_faces = [tf for tf in self.panel_tracker._tracked if tf.active]
+        if len(active_faces) == 0:
+            self._panel_no_face_count += 1
+        else:
+            self._panel_no_face_count = 0
+
+        if self._panel_no_face_count > 45:
+            # Fall back to single-crop to avoid black screen
+            result = self._process_single(frame)
+            self.frame_idx += 1
+            return result
+
         # Determine canvas available for the panel grid (reserve overlay bands)
         top_strip = self.overlay_detector.extract_top_strip(frame) if self.overlay_composite else None
         bottom_strip = self.overlay_detector.extract_bottom_strip(frame) if self.overlay_composite else None
@@ -1359,6 +1402,7 @@ class SmoothReframer:
 
         self.frame_idx += 1
         return output
+
 
     # ------------------------------------------------------------------
     # Standard single-crop processing (v3, unchanged)
@@ -1515,7 +1559,7 @@ def create_vertical_master(
     # Panel mode
     panel_mode: bool = False,
     panel_max_faces: int = 4,
-    panel_detection_stride: int = 2,
+    panel_detection_stride: int = 4,
     panel_gap: int = 4,
     progress_cb: Optional[Callable[[float, str], None]] = None,
 ):
@@ -1791,7 +1835,7 @@ def _realtime_worker(
     preserve_bottom_overlay: bool,
     panel_mode: bool = False,
     panel_max_faces: int = 4,
-    panel_detection_stride: int = 2,
+    panel_detection_stride: int = 4,
     panel_gap: int = 4,
 ) -> None:
     session.status = "probing"
@@ -1945,7 +1989,7 @@ def start_realtime_delayed_vertical_push(
     asset_name: str,
     target_w: int = DEFAULT_TARGET_W,
     target_h: int = DEFAULT_TARGET_H,
-    delay_seconds: float = 20.0,
+    delay_seconds: float = 5.0,
     smooth_strength: float = 0.975,
     analysis_stride: int = 4,
     deadzone_ratio: float = 0.05,
@@ -1958,7 +2002,7 @@ def start_realtime_delayed_vertical_push(
     preserve_bottom_overlay: bool = False,
     panel_mode: bool = False,
     panel_max_faces: int = 4,
-    panel_detection_stride: int = 2,
+    panel_detection_stride: int = 4,
     panel_gap: int = 4,
 ) -> LiveSession:
     live_input = create_live_input(cfg, name=safe_token(Path(asset_name).stem))
