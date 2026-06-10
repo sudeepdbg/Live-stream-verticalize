@@ -804,17 +804,14 @@ class PanelTracker:
     Key design goals
     ────────────────
     - Heavy position smoothing (α = 0.90 / 0.92) to prevent jitter.
-    - Face persistence: a face is not marked inactive until absent for 12
-      consecutive *detection* frames (skip frames do not count).  Hard
-      removal after 24 consecutive detection misses.
-    - Layout hysteresis: the active layout only switches after 8
-      consecutive frames agree on a new count (~0.27 s at 30 fps).
+    - Face persistence: inactive after 12 detection misses; removed after 24.
+      Skip frames use tick_extrapolation() — no penalty.
+    - Layout hysteresis: switches after 8 consecutive frames (~0.27 s @ 30 fps).
     - Consistent left-to-right ordering so panel assignments stay stable.
-    - Transition blending: when layout changes, outputs blend over
-      *blend_frames* frames to avoid a hard cut.
-    - Size filter: faces smaller than 0.2 % of source area are discarded
-      as false positives.
-    - Tracked-list cap: prevents unbounded growth from detection noise.
+    - Transition blending: 10-frame cross-fade on layout change.
+    - Size filter: faces < 0.2 % of source area discarded (catches false positives).
+    - Tracked-list cap prevents unbounded growth from detection noise.
+    - Downscaled detection (0.5×) for low-latency processing.
     """
 
     def __init__(
@@ -902,10 +899,9 @@ class PanelTracker:
             self._next_id += 1
             self._tracked.append(tf)
 
-        # Cap tracked list to prevent unbounded growth from detection noise
+        # Cap tracked list to prevent unbounded growth
         max_tracked = self.max_faces * 3
         if len(self._tracked) > max_tracked:
-            # Keep the most recently active faces, drop oldest inactive ones
             self._tracked.sort(
                 key=lambda tf: (tf.active, -tf.missing_frames), reverse=True
             )
@@ -932,10 +928,9 @@ class PanelTracker:
                 self._blend_remaining = self.blend_frames
 
     def tick_extrapolation(self) -> None:
-        """Called on non-detection (skip) frames.  Smoothly holds tracked
-        positions via EMA WITHOUT incrementing missing_frames or running
-        layout hysteresis.  This prevents detection stride from artificially
-        ageing faces and destabilising the layout count."""
+        """Called on non-detection (skip) frames.  Holds tracked positions
+        via EMA WITHOUT incrementing missing_frames or running layout
+        hysteresis."""
         for tf in self._tracked:
             tf.tick_smooth()
 
@@ -956,7 +951,6 @@ class PanelTracker:
         Returns the composited panel frame (BGR, uint8).
         """
         # Ensure we have a committed count (bootstrap on first call)
-        # Default to single-panel; hysteresis will promote naturally
         if self._active_count == 0:
             self._active_count = 1
 
@@ -973,7 +967,7 @@ class PanelTracker:
         for idx, cell in enumerate(cells):
             if idx < len(active_faces):
                 face = active_faces[idx]
-                crop = self._crop_person(source_frame, face)
+                crop = self._crop_person(source_frame, face, cell.dst_w, cell.dst_h)
             else:
                 # Pad with a black cell if we have fewer faces than cells
                 canvas[
@@ -1008,31 +1002,53 @@ class PanelTracker:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _crop_person(self, frame: np.ndarray, face: _TrackedFace) -> np.ndarray:
+    def _crop_person(
+        self, frame: np.ndarray, face: _TrackedFace,
+        cell_w: int = 0, cell_h: int = 0,
+    ) -> np.ndarray:
         """
-        Expand the face bounding box to capture upper-body context,
-        then return the source crop.
+        Expand the face bounding box to capture upper-body context
+        while matching the destination cell's aspect ratio so that
+        _resize_cover produces a clean fill without heavy letterboxing.
         """
         fh, fw = frame.shape[:2]
         cx, cy = face.sx, face.sy
         fw_f, fh_f = face.sw, face.sh  # smoothed face width/height
 
-        # Expand: 1.6× width, 2.8× height (centred higher to include head + torso)
-        crop_w = fw_f * 1.6
-        crop_h = fh_f * 2.8
-        # Shift centre upwards slightly so forehead is not clipped
-        cy_shifted = cy - fh_f * 0.15
+        # Target AR from destination cell (fall back to 9:16 if unknown)
+        cell_ar = (cell_w / max(cell_h, 1)) if cell_w > 0 and cell_h > 0 else 9.0 / 16.0
 
+        # Generous expansion around the face + a sensible minimum size
+        crop_w = max(fw_f * 3.5, fw * 0.30)
+        crop_h = crop_w / max(cell_ar, 0.01)
+
+        # Cap to 95 % of source dimensions
+        crop_w = min(crop_w, fw * 0.95)
+        crop_h = min(crop_h, fh * 0.95)
+        # Re-enforce AR after capping
+        if crop_w / max(crop_h, 1) > cell_ar:
+            crop_w = crop_h * cell_ar
+        else:
+            crop_h = crop_w / max(cell_ar, 0.01)
+
+        # Centre on face with headroom shift
+        cy_shifted = cy - fh_f * 0.25
         x0 = int(round(cx - crop_w / 2.0))
-        y0 = int(round(cy_shifted - crop_h * 0.35))  # more headroom above
+        y0 = int(round(cy_shifted - crop_h * 0.38))
         x1 = int(round(x0 + crop_w))
         y1 = int(round(y0 + crop_h))
 
-        # Clamp to frame
+        # Shift (not clip) to keep aspect ratio when hitting edges
+        if x0 < 0:
+            x1 -= x0; x0 = 0
+        if y0 < 0:
+            y1 -= y0; y0 = 0
+        if x1 > fw:
+            x0 -= (x1 - fw); x1 = fw
+        if y1 > fh:
+            y0 -= (y1 - fh); y1 = fh
         x0 = max(0, x0)
         y0 = max(0, y0)
-        x1 = min(fw, x1)
-        y1 = min(fh, y1)
 
         if x1 <= x0 or y1 <= y0:
             return frame  # fallback: whole frame
@@ -1093,13 +1109,12 @@ class SmoothReframer:
     ───────────────────
     - Per-face position smoothing: α = 0.90 (position), 0.92 (size).
     - Face persistence: inactive after 12 detection misses; removed after 24.
-      Skip (non-detection) frames use tick_extrapolation() and do NOT
-      penalise tracked faces.
-    - Layout switching: requires 8 consecutive frames of new count (~0.27 s).
+      Skip frames use tick_extrapolation() — no penalty.
+    - Layout switching: 8 consecutive frames (~0.27 s @ 30 fps).
     - Transition blending: 10-frame cross-fade on layout change.
-    - Detection stride: every 2 frames; scaleFactor=1.05, minNeighbors=3
-      for better recall; min face area 0.2 % catches false positives.
-    - Tracked-list cap prevents unbounded growth from detection noise.
+    - Detection runs at 0.5× scale for speed; scaleFactor=1.10, minNeighbors=3.
+    - Cell-aware cropping: _crop_person matches cell aspect ratio for clean fill.
+    - False-positive filter: faces < 0.2 % of source area ignored.
 
     Fallback
     ────────
@@ -1277,17 +1292,29 @@ class SmoothReframer:
             try:
                 # Detect within play area only to avoid scorecard false positives
                 play_gray = gray[play_top:play_bot, :]
-                raw_faces = self.face_detector.detectMultiScale(
-                    play_gray,
-                    scaleFactor=1.05,
-                    minNeighbors=3,
-                    minSize=(36, 36),
+                # Downscale for speed: detect at half resolution
+                det_scale = 0.5
+                small_gray = cv2.resize(
+                    play_gray, None, fx=det_scale, fy=det_scale,
+                    interpolation=cv2.INTER_AREA,
                 )
-                # Translate y back to full-frame coords
+                raw_faces = self.face_detector.detectMultiScale(
+                    small_gray,
+                    scaleFactor=1.10,
+                    minNeighbors=3,
+                    minSize=(18, 18),
+                )
+                # Scale coordinates back and translate y to full-frame coords
+                inv = 1.0 / det_scale
                 adjusted: list[tuple[int, int, int, int]] = []
                 if len(raw_faces):
                     for (x, y, w, h) in raw_faces:
-                        adjusted.append((int(x), int(y + play_top), int(w), int(h)))
+                        adjusted.append((
+                            int(round(x * inv)),
+                            int(round(y * inv) + play_top),
+                            int(round(w * inv)),
+                            int(round(h * inv)),
+                        ))
                 self.panel_tracker.update_detections(adjusted)
             except Exception:
                 self.panel_tracker.tick_extrapolation()
