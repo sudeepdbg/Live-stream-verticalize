@@ -1710,7 +1710,7 @@ def build_push_file_command(reframed_mp4: str, rtmps_url: str, stream_key: str, 
         "-re", "-i", reframed_mp4,
         "-c:v", "libx264", "-preset", "veryfast",
         "-pix_fmt", "yuv420p",
-        "-vsync", "cfr",
+        "-fps_mode", "cfr",
         "-r", str(fps_int),
         "-b:v", DEFAULT_VIDEO_BITRATE,
         "-maxrate", DEFAULT_MAXRATE,
@@ -1748,10 +1748,10 @@ def build_realtime_rtmps_push_command(target_w: int, target_h: int, fps: float, 
         "-s", f"{target_w}x{target_h}",
         "-r", str(fps_int), "-i", "-",
         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
-        "-shortest", "-map", "0:v:0", "-map", "1:a:0",
+        "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
         "-pix_fmt", "yuv420p",
-        "-vsync", "cfr",
+        "-fps_mode", "cfr",
         "-r", str(fps_int),
         "-b:v", DEFAULT_VIDEO_BITRATE,
         "-maxrate", DEFAULT_MAXRATE,
@@ -1787,7 +1787,7 @@ def _build_ingest_command(source: str, fps: float, pace_input: bool, loop_file: 
     )
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
     cmd += _source_input_args(source, pace_input=pace_input, loop_file=loop_file)
-    cmd += ["-an", "-vf", vf, "-pix_fmt", "bgr24", "-f", "rawvideo", "-"]
+    cmd += ["-an", "-vf", vf, "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"]
     return cmd
 
 
