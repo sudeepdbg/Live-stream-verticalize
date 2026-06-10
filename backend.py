@@ -686,8 +686,17 @@ class _TrackedFace:
         """Called when the face was not detected this frame; hold position."""
         self.missing_frames += 1
         # Gradually reduce active status after threshold
-        if self.missing_frames > 6:
+        if self.missing_frames > 12:
             self.active = False
+
+    def tick_smooth(self) -> None:
+        """Re-apply EMA with current raw values — holds position steady
+        WITHOUT incrementing missing_frames.  Used on non-detection frames
+        so that skip-frame stride does not penalise tracked faces."""
+        self.sx = self._pos_alpha * self.sx + (1.0 - self._pos_alpha) * self.raw_x
+        self.sy = self._pos_alpha * self.sy + (1.0 - self._pos_alpha) * self.raw_y
+        self.sw = self._size_alpha * self.sw + (1.0 - self._size_alpha) * self.raw_w
+        self.sh = self._size_alpha * self.sh + (1.0 - self._size_alpha) * self.raw_h
 
 
 def _face_centre(tf: _TrackedFace) -> tuple[float, float]:
@@ -795,15 +804,17 @@ class PanelTracker:
     Key design goals
     ────────────────
     - Heavy position smoothing (α = 0.90 / 0.92) to prevent jitter.
-    - Face persistence: a face is not discarded until it has been absent for
-      *max_missing_frames* consecutive frames.
-    - Layout hysteresis: the active layout only switches after *layout_hold_frames*
-      consecutive frames agree on a new count.
+    - Face persistence: a face is not marked inactive until absent for 12
+      consecutive *detection* frames (skip frames do not count).  Hard
+      removal after 24 consecutive detection misses.
+    - Layout hysteresis: the active layout only switches after 8
+      consecutive frames agree on a new count (~0.27 s at 30 fps).
     - Consistent left-to-right ordering so panel assignments stay stable.
     - Transition blending: when layout changes, outputs blend over
       *blend_frames* frames to avoid a hard cut.
-    - Size filter: faces smaller than *min_face_area_ratio* of the source image
-      are discarded as false positives.
+    - Size filter: faces smaller than 0.2 % of source area are discarded
+      as false positives.
+    - Tracked-list cap: prevents unbounded growth from detection noise.
     """
 
     def __init__(
@@ -811,8 +822,8 @@ class PanelTracker:
         src_w: int,
         src_h: int,
         max_faces: int = 4,
-        max_missing_frames: int = 18,
-        layout_hold_frames: int = 25,
+        max_missing_frames: int = 24,
+        layout_hold_frames: int = 8,
         blend_frames: int = 10,
         min_face_area_ratio: float = 0.004,
         pos_alpha: float = 0.90,
@@ -839,7 +850,7 @@ class PanelTracker:
         self._blend_remaining: int = 0
         self._prev_output: Optional[np.ndarray] = None
         # Match gate: two faces are the same if within this many pixels
-        self._match_dist: float = max(src_w, src_h) * 0.25
+        self._match_dist: float = max(src_w, src_h) * 0.18
 
     # ------------------------------------------------------------------
     # Public API
@@ -891,6 +902,15 @@ class PanelTracker:
             self._next_id += 1
             self._tracked.append(tf)
 
+        # Cap tracked list to prevent unbounded growth from detection noise
+        max_tracked = self.max_faces * 3
+        if len(self._tracked) > max_tracked:
+            # Keep the most recently active faces, drop oldest inactive ones
+            self._tracked.sort(
+                key=lambda tf: (tf.active, -tf.missing_frames), reverse=True
+            )
+            self._tracked = self._tracked[: self.max_faces * 2]
+
         # Prune faces absent too long
         self._tracked = [
             tf for tf in self._tracked
@@ -911,6 +931,14 @@ class PanelTracker:
                 self._active_count = current_n
                 self._blend_remaining = self.blend_frames
 
+    def tick_extrapolation(self) -> None:
+        """Called on non-detection (skip) frames.  Smoothly holds tracked
+        positions via EMA WITHOUT incrementing missing_frames or running
+        layout hysteresis.  This prevents detection stride from artificially
+        ageing faces and destabilising the layout count."""
+        for tf in self._tracked:
+            tf.tick_smooth()
+
     def render(
         self,
         source_frame: np.ndarray,
@@ -928,9 +956,9 @@ class PanelTracker:
         Returns the composited panel frame (BGR, uint8).
         """
         # Ensure we have a committed count (bootstrap on first call)
+        # Default to single-panel; hysteresis will promote naturally
         if self._active_count == 0:
-            visible = [tf for tf in self._tracked if tf.active]
-            self._active_count = max(1, min(len(visible), self.max_faces))
+            self._active_count = 1
 
         # Sort active faces left-to-right (stable panel assignment)
         active_faces = sorted(
@@ -1064,12 +1092,14 @@ class SmoothReframer:
     Smoothness strategy
     ───────────────────
     - Per-face position smoothing: α = 0.90 (position), 0.92 (size).
-    - Face persistence: absent for up to 18 frames before removal.
-    - Layout switching: requires 25 consecutive frames of new count.
+    - Face persistence: inactive after 12 detection misses; removed after 24.
+      Skip (non-detection) frames use tick_extrapolation() and do NOT
+      penalise tracked faces.
+    - Layout switching: requires 8 consecutive frames of new count (~0.27 s).
     - Transition blending: 10-frame cross-fade on layout change.
-    - Detection stride: every 2 frames to keep per-person tracking accurate
-      while relying on smoothing to fill the gaps.
-    - False-positive filter: faces smaller than 0.4 % of source area ignored.
+    - Detection stride: every 2 frames; scaleFactor=1.05, minNeighbors=3
+      for better recall; min face area 0.2 % catches false positives.
+    - Tracked-list cap prevents unbounded growth from detection noise.
 
     Fallback
     ────────
@@ -1098,10 +1128,10 @@ class SmoothReframer:
         panel_max_faces: int = 4,
         panel_detection_stride: int = 2,
         panel_gap: int = 4,
-        panel_max_missing_frames: int = 18,
-        panel_layout_hold_frames: int = 25,
+        panel_max_missing_frames: int = 24,
+        panel_layout_hold_frames: int = 8,
         panel_blend_frames: int = 10,
-        panel_min_face_area_ratio: float = 0.004,
+        panel_min_face_area_ratio: float = 0.002,
         panel_pos_alpha: float = 0.90,
         panel_size_alpha: float = 0.92,
     ):
@@ -1249,8 +1279,8 @@ class SmoothReframer:
                 play_gray = gray[play_top:play_bot, :]
                 raw_faces = self.face_detector.detectMultiScale(
                     play_gray,
-                    scaleFactor=1.12,
-                    minNeighbors=4,
+                    scaleFactor=1.05,
+                    minNeighbors=3,
                     minSize=(36, 36),
                 )
                 # Translate y back to full-frame coords
@@ -1260,10 +1290,10 @@ class SmoothReframer:
                         adjusted.append((int(x), int(y + play_top), int(w), int(h)))
                 self.panel_tracker.update_detections(adjusted)
             except Exception:
-                self.panel_tracker.update_detections([])
+                self.panel_tracker.tick_extrapolation()
         else:
-            # Even on non-detection frames, tick extrapolation
-            self.panel_tracker.update_detections([])
+            # Non-detection frames: hold positions without penalising faces
+            self.panel_tracker.tick_extrapolation()
 
         # Determine canvas available for the panel grid (reserve overlay bands)
         top_strip = self.overlay_detector.extract_top_strip(frame) if self.overlay_composite else None
