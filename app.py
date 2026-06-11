@@ -39,7 +39,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── Session state defaults ───────────────────────────────────────────────────
+# -- Session state defaults ------------------------------------------------
 for key, value in {
     "input_path": None,
     "meta": None,
@@ -60,7 +60,7 @@ if ls is not None and not all(hasattr(ls, a) for a in ["uid", "hls_url", "iframe
     st.session_state.live_session = None
     ls = None
 
-# ── Hero ─────────────────────────────────────────────────────────────────────
+# -- Hero ------------------------------------------------------------------
 st.markdown(
     """
     <div class='hero'>
@@ -68,10 +68,10 @@ st.markdown(
                   align-items:flex-start; flex-wrap:wrap;'>
         <div>
           <div style='font-size:1.85rem; font-weight:800; margin-bottom:4px;'>
-            Dual Flow Vertical Live → Cloudflare Stream
+            Dual Flow Vertical Live &rarr; Cloudflare Stream
           </div>
           <div style='font-size:.98rem; color:#cbd5e1;'>
-            Supports VOD → Live and delayed realtime. RTMP / SRT / URL sources handled in
+            Supports VOD &rarr; Live and delayed realtime. RTMP / SRT / URL sources handled in
             realtime mode. Panel discussion mode splits multi-person frames into a 9:16 grid.
           </div>
         </div>
@@ -93,7 +93,7 @@ if not backend.ffmpeg_ok():
     st.error("FFmpeg / ffprobe not found. Add ffmpeg to your runtime and redeploy.")
     st.stop()
 
-# ── Section 1: Cloudflare credentials (persisted in session_state) ────────────
+# -- Section 1: Cloudflare credentials (persisted) -------------------------
 st.subheader("1) Cloudflare Stream credentials")
 
 creds_set = bool(
@@ -103,9 +103,10 @@ creds_set = bool(
 )
 
 if creds_set:
+    masked = st.session_state.cf_account_id[-6:] if len(st.session_state.cf_account_id) > 6 else "***"
     st.markdown(
-        "<span class='chip-ok'>✓ Credentials saved</span>"
-        f"<span class='chip'>Account: ...{st.session_state.cf_account_id[-6:]}</span>",
+        f"<span class='chip-ok'>&#10003; Credentials saved</span>"
+        f"<span class='chip'>Account: ...{masked}</span>",
         unsafe_allow_html=True,
     )
 
@@ -137,14 +138,10 @@ with st.expander(creds_label, expanded=not creds_set):
             key="_cf_ll_input",
         )
     # Persist whenever values change
-    if _acc != st.session_state.cf_account_id:
-        st.session_state.cf_account_id = _acc
-    if _tok != st.session_state.cf_api_token:
-        st.session_state.cf_api_token = _tok
-    if _code != st.session_state.cf_customer_code:
-        st.session_state.cf_customer_code = _code
-    if _ll != st.session_state.cf_low_latency:
-        st.session_state.cf_low_latency = _ll
+    st.session_state.cf_account_id = _acc
+    st.session_state.cf_api_token = _tok
+    st.session_state.cf_customer_code = _code
+    st.session_state.cf_low_latency = _ll
 
 account_id = st.session_state.cf_account_id
 api_token = st.session_state.cf_api_token
@@ -164,12 +161,12 @@ if account_id and api_token and customer_code:
 else:
     st.warning("Fill in Account ID, Stream API token, and customer code to continue.")
 
-# ── Section 2: Source & workflow ──────────────────────────────────────────────
+# -- Section 2: Source & workflow -------------------------------------------
 st.subheader("2) Workflow and source")
 workflow = st.radio(
     "Workflow",
     [
-        "VOD → Live (full-file verticalize first)",
+        "VOD -> Live (full-file verticalize first)",
         "Delayed realtime (frame-by-frame then delay buffer)",
     ],
     horizontal=True,
@@ -191,7 +188,7 @@ if source_kind == "Upload file":
     if upl:
         if getattr(upl, "size", 0) > backend.MAX_UPLOAD_MB * 1024 * 1024:
             st.error(
-                f"File is {upl.size / (1024*1024):.1f} MB — keep it ≤ {backend.MAX_UPLOAD_MB} MB."
+                f"File is {upl.size / (1024*1024):.1f} MB -- keep it <= {backend.MAX_UPLOAD_MB} MB."
             )
             st.stop()
         suffix = os.path.splitext(upl.name)[-1].lower()
@@ -215,14 +212,14 @@ else:
         placeholder="/mount/src/... or https://...",
     )
 
-# ── Section 3: Reframing settings ────────────────────────────────────────────
+# -- Section 3: Reframing settings -----------------------------------------
 st.subheader("3) Reframing settings")
 
 col_res, col_delay = st.columns(2)
 with col_res:
     target_w = st.selectbox("Vertical output width", [360, 540, 720], index=1)
     target_h = int(round(target_w * 16 / 9))
-    st.caption(f"Output: {target_w} × {target_h}")
+    st.caption(f"Output: {target_w} x {target_h}")
 with col_delay:
     delay_seconds = st.slider("Output delay (seconds)", 5, 30, 20, 1)
     loop_file = st.checkbox("Loop file source when it ends", value=True)
@@ -256,7 +253,7 @@ with col_m3:
     preserve_bottom_overlay = st.checkbox("Preserve bottom overlay", value=False,
         help="Reserve a band at the bottom for lower-thirds/tickers.")
 
-# ── Panel discussion mode ─────────────────────────────────────────────────────
+# -- Panel discussion mode -------------------------------------------------
 st.markdown("**Panel discussion mode**")
 panel_mode = st.checkbox(
     "Enable panel mode",
@@ -291,8 +288,8 @@ if panel_mode:
             help="Pixel gap between panel cells.",
         )
     st.caption(
-        "Smoothing: position α=0.90 · size α=0.92 · layout switch: 15 frames · "
-        "face persistence: 24 frames · transition blend: 10 frames · "
+        "Smoothing: position alpha=0.90 | size alpha=0.92 | layout switch: 15 frames | "
+        "face persistence: 24 frames | transition blend: 10 frames | "
         "Haar frontal + profile cascade with NMS"
     )
     if ball_tracking:
@@ -302,7 +299,7 @@ if panel_mode:
         )
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ── Source metadata ───────────────────────────────────────────────────────────
+# -- Source metadata -------------------------------------------------------
 if source_value and source_kind in ("Upload file", "Local path / arbitrary URL") and os.path.exists(str(source_value)):
     st.session_state.meta = backend.probe_source(str(source_value))
 elif source_value and isinstance(source_value, str) and source_value.lower().startswith(
@@ -317,18 +314,18 @@ elif source_value and isinstance(source_value, str) and source_value.lower().sta
 if st.session_state.meta:
     meta = st.session_state.meta
     ma, mb, mc = st.columns(3)
-    ma.metric("Source resolution", f"{int(meta.get('width', 0))}×{int(meta.get('height', 0))}")
+    ma.metric("Source resolution", f"{int(meta.get('width', 0))}x{int(meta.get('height', 0))}")
     mb.metric("FPS", f"{meta.get('fps', 0)}")
     mc.metric("Duration", f"{float(meta.get('duration', 0.0)):.1f}s")
 
-# ── Section 4: Actions ────────────────────────────────────────────────────────
+# -- Section 4: Actions ----------------------------------------------------
 progress_bar = st.progress(0.0, text="Waiting")
 
-if workflow == "VOD → Live (full-file verticalize first)":
-    st.markdown("### 4A) VOD → Live")
+if workflow == "VOD -> Live (full-file verticalize first)":
+    st.markdown("### 4A) VOD -> Live")
     if source_kind in ("RTMP URL", "SRT URL"):
         st.warning(
-            "VOD → Live is intended for file-like sources. "
+            "VOD -> Live is intended for file-like sources. "
             "Switch to Delayed realtime for RTMP/SRT URLs."
         )
 
@@ -369,7 +366,7 @@ if workflow == "VOD → Live (full-file verticalize first)":
         st.video(st.session_state.reframed_path)
 
     if st.button(
-        "Start VOD → Live push",
+        "Start VOD -> Live push",
         disabled=not (cf_cfg and st.session_state.reframed_path),
     ):
         if st.session_state.live_session:
@@ -381,12 +378,12 @@ if workflow == "VOD → Live (full-file verticalize first)":
             loop_input=loop_file,
         )
         st.session_state.live_session = session
-        st.success("VOD → Live push started.")
+        st.success("VOD -> Live push started.")
 
 else:
     st.markdown("### 4B) Delayed realtime")
     st.caption(
-        "Horizontal file / RTMP / SRT → frame-by-frame vertical output with ~20–25 s delay. "
+        "Horizontal file / RTMP / SRT -> frame-by-frame vertical output with ~20-25 s delay. "
         "Startup placeholder frames are sent immediately so Cloudflare does not stall."
     )
 
@@ -419,7 +416,7 @@ else:
         st.session_state.live_session = session
         st.success("Delayed realtime worker started.")
 
-# ── Stop / auto-refresh controls ─────────────────────────────────────────────
+# -- Stop / auto-refresh controls -----------------------------------------
 left_action, right_action = st.columns([1, 1])
 with left_action:
     if st.button(
@@ -433,7 +430,7 @@ with left_action:
 with right_action:
     auto_refresh = st.checkbox("Auto-refresh session status", value=True)
 
-# ── Section 5: Live session status & playback ─────────────────────────────────
+# -- Section 5: Live session status & playback -----------------------------
 if st.session_state.live_session:
     session = st.session_state.live_session
     st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -459,36 +456,36 @@ if st.session_state.live_session:
     session_status = getattr(session, "status", "unknown")
     session_error = getattr(session, "error", "")
 
-    # ── Primary metrics row ──
+    # -- Primary metrics row --
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Pipeline status", session_status)
     m2.metric("Working source", stats.get("working_resolution", "-"))
     m3.metric("Delay frames", stats.get("delay_frames", "-"))
     m4.metric("Frames out", stats.get("frames_out", 0))
 
-    # ── Secondary metrics row ──
+    # -- Secondary metrics row --
     m5, m6, m7, m8 = st.columns(4)
     m5.metric("Frames in", stats.get("frames_in", 0))
     m6.metric("Buffer len", stats.get("buffer_len", 0))
     m7.metric("Placeholder frames", stats.get("placeholder_frames", 0))
     m8.metric("Source stalls", stats.get("source_stalls", 0))
 
-    # ── Panel + detection row ──
+    # -- Panel + detection row --
     m9, m10, m11, m12 = st.columns(4)
     panel_faces = stats.get("panel_active_faces", None)
     panel_mode_active = stats.get("panel_mode", False)
     m9.metric(
         "Panel faces",
-        panel_faces if panel_faces is not None else "—",
-        help="Active tracked faces in panel mode (— when panel mode is off).",
+        panel_faces if panel_faces is not None else "---",
+        help="Active tracked faces in panel mode (--- when panel mode is off).",
     )
     m10.metric("Ball confidence", f"{stats.get('ball_confidence', 0.0):.2f}")
     overlay_top = stats.get("overlay_top", False)
     overlay_bot = stats.get("overlay_bottom", False)
-    m11.metric("Top overlay", "✓" if overlay_top else "✗")
-    m12.metric("Bottom overlay", "✓" if overlay_bot else "✗")
+    m11.metric("Top overlay", "Y" if overlay_top else "N")
+    m12.metric("Bottom overlay", "Y" if overlay_bot else "N")
 
-    # ── Status banners ──
+    # -- Status banners --
     if session_error:
         st.error(session_error)
 
@@ -519,36 +516,27 @@ if st.session_state.live_session:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── In-app playback using st.html (replaces deprecated st.components.v1.html) ──
+    # -- In-app playback using st.iframe (replaces deprecated components.html) --
     st.subheader("5) In-app playback")
     iframe_url = getattr(session, "iframe_url", "")
     if iframe_url:
-        iframe_html = (
-            '<div style="max-width:380px;margin:0 auto;">'
-            + f'<iframe src="{iframe_url}" '
-            + 'style="border:none;width:100%;height:760px;'
-            + 'border-radius:16px;overflow:hidden;" '
-            + 'allow="accelerometer; gyroscope; autoplay; encrypted-media; picture-in-picture;" '
-            + 'allowfullscreen="true"></iframe>'
-            + "</div>"
-        )
-        st.html(iframe_html)
+        st.iframe(iframe_url, height=760)
 
     if auto_refresh:
         time.sleep(3)
         st.rerun()
 
-# ── Footer ────────────────────────────────────────────────────────────────────
+# -- Footer ----------------------------------------------------------------
 st.divider()
-st.markdown("### What\'s included")
+st.markdown("### What's included")
 st.markdown(
-    "- **Workflow switch** — VOD→Live or delayed realtime\n"
-    "- **Source-type switch** — file upload, RTMP, SRT, local path / URL\n"
-    "- **Panel discussion mode** — 1-up / 2-up / 3-up / 4-up auto-layout with jitter-free tracking\n"
-    "- **Sport profiles** — auto / soccer / basketball / cricket with ball tracking\n"
-    "- **Overlay composite** — preserves top scorecard and optional bottom lower-third\n"
-    "- **Cloudflare startup priming** — placeholder frames avoid 'stream not started' errors\n"
-    "- **Stale session protection** — safe across Streamlit redeploys\n"
-    "- **Persistent credentials** — Cloudflare keys saved in session, edit anytime\n"
-    "- **Full stats dashboard** — faces, ball confidence, overlays, buffer, stalls"
+    "- **Workflow switch** -- VOD->Live or delayed realtime\n"
+    "- **Source-type switch** -- file upload, RTMP, SRT, local path / URL\n"
+    "- **Panel discussion mode** -- 1-up / 2-up / 3-up / 4-up auto-layout with jitter-free tracking\n"
+    "- **Sport profiles** -- auto / soccer / basketball / cricket with ball tracking\n"
+    "- **Overlay composite** -- preserves top scorecard and optional bottom lower-third\n"
+    "- **Cloudflare startup priming** -- placeholder frames avoid 'stream not started' errors\n"
+    "- **Stale session protection** -- safe across Streamlit redeploys\n"
+    "- **Persistent credentials** -- Cloudflare keys saved in session, edit anytime\n"
+    "- **Full stats dashboard** -- faces, ball confidence, overlays, buffer, stalls"
 )
