@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import collections
 import json
 import math
@@ -646,7 +647,7 @@ class BallTracker:
 
 
 # ---------------------------------------------------------------------------
-# Panel discussion mode
+# Panel discussion mode (finetuned v5)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -693,7 +694,6 @@ class _TrackedFace:
     def extrapolate(self) -> None:
         """Called when the face was not detected this frame; hold position."""
         self.missing_frames += 1
-        # Gradually reduce active status after threshold
         if self.missing_frames > 12:
             self.active = False
 
@@ -763,16 +763,8 @@ def _compute_panel_layout(
     gap: int = 4,
 ) -> list[_PanelCell]:
     """
-    Return a list of *PanelCell* for *n* participants (1-4) inside a
+    Return a list of PanelCell for n participants (1-4) inside a
     canvas of (canvas_w x canvas_h).
-
-    Layout rules
-    ------------
-    1  ->  single full-canvas cell
-    2  ->  stacked vertically, two equal rows
-    3  ->  top row: one wide cell; bottom row: two equal cells
-    4  ->  2 x 2 grid
-    5+ ->  capped to 4 (2 x 2 grid)
     """
     n = max(1, min(n, 4))
     cells: list[_PanelCell] = []
@@ -789,9 +781,9 @@ def _compute_panel_layout(
         top_h = (canvas_h - gap) // 2
         bot_h = canvas_h - top_h - gap
         col_w = (canvas_w - gap) // 2
-        cells.append(_PanelCell(0, 0, canvas_w, top_h))                             # top: single wide
-        cells.append(_PanelCell(0, top_h + gap, col_w, bot_h))                      # bottom-left
-        cells.append(_PanelCell(col_w + gap, top_h + gap, canvas_w - col_w - gap, bot_h))  # bottom-right
+        cells.append(_PanelCell(0, 0, canvas_w, top_h))
+        cells.append(_PanelCell(0, top_h + gap, col_w, bot_h))
+        cells.append(_PanelCell(col_w + gap, top_h + gap, canvas_w - col_w - gap, bot_h))
 
     else:  # 4
         row_h = (canvas_h - gap) // 2
@@ -806,22 +798,14 @@ def _compute_panel_layout(
 
 class PanelTracker:
     """
-    Maintains a temporally-stable list of up to *max_faces* tracked faces for
-    panel-discussion layouts.
-
-    Key design goals (finetuned v4)
-    -------------------------------
-    - Heavy position smoothing (alpha = 0.90 / 0.92) to prevent jitter.
-    - Face persistence: inactive after 12 detection misses; removed after 24.
-      Skip frames use tick_extrapolation() -- no penalty.
-    - Layout hysteresis: switches after 15 consecutive frames (~0.5 s @ 30 fps).
-    - Consistent left-to-right ordering so panel assignments stay stable.
-    - Transition blending: 10-frame cross-fade on layout change.
-    - Size filter: faces < 0.12 % of source area discarded (catches false positives).
-    - Face size normalization: balanced zoom across panels.
-    - Tracked-list cap prevents unbounded growth from detection noise.
-    - Haar frontal + profile cascade for better face coverage.
-    - Pre-allocated canvas buffer for low-latency rendering.
+    Finetuned v5 PanelTracker with:
+    - Haar frontal + profile cascade with NMS
+    - layout_hold_frames=15 for stable layout
+    - min_face_area_ratio=0.0012 for small face recall
+    - match_dist=0.18 for robust tracking
+    - Face size normalization via zoom_factor
+    - Pre-allocated canvas buffer
+    - AR-safe _crop_person with trim clamp
     """
 
     def __init__(
@@ -848,17 +832,12 @@ class PanelTracker:
 
         self._tracked: list[_TrackedFace] = []
         self._next_id: int = 0
-        # Current *committed* face count driving the layout
         self._active_count: int = 0
-        # Candidate count that must persist for layout_hold_frames before committing
         self._candidate_count: int = 0
         self._candidate_hold: int = 0
-        # Blend state
         self._blend_remaining: int = 0
         self._prev_output: Optional[np.ndarray] = None
-        # Match gate: wider gate for head turns / shifts
         self._match_dist: float = max(src_w, src_h) * 0.18
-        # Pre-allocated canvas buffer for zero-copy rendering
         self._canvas_buffer: Optional[np.ndarray] = None
 
         # Face detectors: Haar frontal + profile
@@ -878,17 +857,46 @@ class PanelTracker:
             pass
 
     # ------------------------------------------------------------------
-    # Face detection
+    # Face detection with NMS (P1 fix)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _nms_faces(faces: list[tuple[int, int, int, int]], iou_thresh: float = 0.4) -> list[tuple[int, int, int, int]]:
+        """Non-maximum suppression: merge overlapping detections."""
+        if len(faces) <= 1:
+            return faces
+        # Sort by area descending (keep larger detections)
+        boxes = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+        keep: list[tuple[int, int, int, int]] = []
+        used = [False] * len(boxes)
+        for i in range(len(boxes)):
+            if used[i]:
+                continue
+            keep.append(boxes[i])
+            used[i] = True
+            x1, y1, w1, h1 = boxes[i]
+            for j in range(i + 1, len(boxes)):
+                if used[j]:
+                    continue
+                x2, y2, w2, h2 = boxes[j]
+                # Compute IoU
+                ix0 = max(x1, x2)
+                iy0 = max(y1, y2)
+                ix1 = min(x1 + w1, x2 + w2)
+                iy1 = min(y1 + h1, y2 + h2)
+                inter = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+                union = w1 * h1 + w2 * h2 - inter
+                if union > 0 and inter / union > iou_thresh:
+                    used[j] = True  # suppress this detection
+        return keep
+
     def detect_faces(self, frame: np.ndarray, gray: np.ndarray) -> list[tuple[int, int, int, int]]:
-        """Detect faces using Haar frontal + profile cascades.
-        Returns list of (x, y, w, h) in source-frame coordinates."""
+        """Detect faces using Haar frontal + profile cascades with NMS merge."""
         faces: list[tuple[int, int, int, int]] = []
         if self.face_detector is not None:
             try:
                 detected = self.face_detector.detectMultiScale(
-                    gray, scaleFactor=1.08, minNeighbors=2, minSize=(24, 24)
+                    gray, scaleFactor=1.06, minNeighbors=2, minSize=(24, 24)
                 )
                 if len(detected):
                     faces.extend([(int(x), int(y), int(w), int(h)) for (x, y, w, h) in detected])
@@ -897,13 +905,14 @@ class PanelTracker:
         if self.profile_detector is not None:
             try:
                 detected = self.profile_detector.detectMultiScale(
-                    gray, scaleFactor=1.08, minNeighbors=2, minSize=(24, 24)
+                    gray, scaleFactor=1.06, minNeighbors=2, minSize=(24, 24)
                 )
                 if len(detected):
                     faces.extend([(int(x), int(y), int(w), int(h)) for (x, y, w, h) in detected])
             except Exception:
                 pass
-        return faces
+        # NMS to merge overlapping frontal + profile detections
+        return self._nms_faces(faces, iou_thresh=0.4)
 
     # ------------------------------------------------------------------
     # Public API
@@ -913,17 +922,12 @@ class PanelTracker:
         self,
         raw_faces: list[tuple[int, int, int, int]],
     ) -> None:
-        """
-        Ingest a new list of (x, y, w, h) face detections and update tracking.
-        Call this every frame (or every few frames if you stride detection).
-        """
-        # Filter tiny detections (likely false positives)
+        """Ingest face detections and update tracking."""
         faces: list[tuple[float, float, float, float]] = [
             (float(x), float(y), float(w), float(h))
             for (x, y, w, h) in raw_faces
             if w * h >= self.min_face_area
         ]
-        # Cap to max_faces (keep largest)
         if len(faces) > self.max_faces:
             faces.sort(key=lambda f: f[2] * f[3], reverse=True)
             faces = faces[:self.max_faces]
@@ -932,16 +936,13 @@ class PanelTracker:
             self._tracked, faces, self._match_dist
         )
 
-        # Update matched faces
         for ti, di in matched.items():
             dx, dy, dw, dh = faces[di]
             self._tracked[ti].update(dx + dw / 2.0, dy + dh / 2.0, dw, dh)
 
-        # Extrapolate unmatched tracked faces
         for ti in unmatched_t:
             self._tracked[ti].extrapolate()
 
-        # Spawn new tracked faces for unmatched detections
         for di in unmatched_d:
             dx, dy, dw, dh = faces[di]
             cx, cy = dx + dw / 2.0, dy + dh / 2.0
@@ -955,7 +956,6 @@ class PanelTracker:
             self._next_id += 1
             self._tracked.append(tf)
 
-        # Cap tracked list to prevent unbounded growth
         max_tracked = self.max_faces * 3
         if len(self._tracked) > max_tracked:
             self._tracked.sort(
@@ -963,13 +963,11 @@ class PanelTracker:
             )
             self._tracked = self._tracked[: self.max_faces * 2]
 
-        # Prune faces absent too long
         self._tracked = [
             tf for tf in self._tracked
             if tf.missing_frames <= self.max_missing_frames
         ]
 
-        # Update layout with hysteresis
         visible = [tf for tf in self._tracked if tf.active]
         current_n = max(1, min(len(visible), self.max_faces))
         if current_n != self._candidate_count:
@@ -984,9 +982,7 @@ class PanelTracker:
                 self._blend_remaining = self.blend_frames
 
     def tick_extrapolation(self) -> None:
-        """Called on non-detection (skip) frames.  Holds tracked positions
-        via EMA WITHOUT incrementing missing_frames or running layout
-        hysteresis."""
+        """Hold tracked positions via EMA without penalising faces."""
         for tf in self._tracked:
             tf.tick_smooth()
 
@@ -997,27 +993,15 @@ class PanelTracker:
         canvas_h: int,
         gap: int = 4,
     ) -> np.ndarray:
-        """
-        Render the panel layout onto a (canvas_h x canvas_w) output.
-
-        Each face gets a cell sized according to _compute_panel_layout.
-        The source crop for each person expands the face box to capture
-        upper-body context before resizing to the cell.
-        Face size normalization ensures balanced framing across panels.
-
-        Returns the composited panel frame (BGR, uint8).
-        """
-        # Ensure we have a committed count (bootstrap on first call)
+        """Render panel layout with face size normalization."""
         if self._active_count == 0:
             self._active_count = 1
 
-        # Sort active faces left-to-right (stable panel assignment)
         active_faces = sorted(
             [tf for tf in self._tracked if tf.active],
             key=lambda tf: tf.sx,
         )
 
-        # Fallback: if no active faces, center-crop source frame
         if len(active_faces) == 0:
             fallback_frame = _resize_cover(source_frame, canvas_w, canvas_h)
             if self._blend_remaining > 0 and self._prev_output is not None:
@@ -1032,43 +1016,38 @@ class PanelTracker:
         n = min(self._active_count, max(1, len(active_faces)))
         cells = _compute_panel_layout(n, canvas_w, canvas_h, gap=gap)
 
-        # Reuse canvas buffer if possible (zero-allocation optimization)
+        # Reuse canvas buffer
         if self._canvas_buffer is None or self._canvas_buffer.shape != (canvas_h, canvas_w, 3):
             self._canvas_buffer = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
         else:
             self._canvas_buffer[:] = 0
         canvas = self._canvas_buffer
 
-        # Compute normalized face sizes for balanced framing across panels
+        # Face size normalization for balanced framing
         face_sizes = [f.sw * f.sh for f in active_faces[:n]]
         avg_size = sum(face_sizes) / max(len(face_sizes), 1)
 
         for idx, cell in enumerate(cells):
             if idx < len(active_faces):
                 face = active_faces[idx]
-                # Normalize zoom: larger faces get tighter crop, smaller get wider
                 size_ratio = math.sqrt((face.sw * face.sh) / max(avg_size, 1.0))
                 zoom_factor = _clamp(1.0 / max(size_ratio, 0.5), 0.7, 1.4)
                 crop = self._crop_person(source_frame, face, cell.dst_w, cell.dst_h, zoom_factor)
             else:
-                # Pad with a black cell if we have fewer faces than cells
                 canvas[
                     cell.dst_y: cell.dst_y + cell.dst_h,
                     cell.dst_x: cell.dst_x + cell.dst_w,
                 ] = 0
                 continue
 
-            # Resize crop to cell dimensions (cover-fill)
             rendered = _resize_cover(crop, cell.dst_w, cell.dst_h)
             canvas[
                 cell.dst_y: cell.dst_y + cell.dst_h,
                 cell.dst_x: cell.dst_x + cell.dst_w,
             ] = rendered
 
-        # Subtle gap lines between cells for polish
         self._draw_dividers(canvas, cells, gap)
 
-        # Blend with previous output during layout transitions
         output = canvas
         if self._blend_remaining > 0 and self._prev_output is not None:
             prev = self._prev_output
@@ -1077,7 +1056,7 @@ class PanelTracker:
                 output = cv2.addWeighted(prev, alpha, canvas, 1.0 - alpha, 0)
             self._blend_remaining -= 1
 
-        # Conditional copy: only copy during blend (efficiency)
+        # Conditional copy: only during blend
         if self._blend_remaining > 0:
             self._prev_output = output.copy()
         else:
@@ -1085,7 +1064,7 @@ class PanelTracker:
         return output
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Helpers (P0 fixes: crop framing + AR trim clamp)
     # ------------------------------------------------------------------
 
     def _crop_person(
@@ -1094,29 +1073,25 @@ class PanelTracker:
         zoom_factor: float = 1.0,
     ) -> np.ndarray:
         """
-        Expand the face bounding box to capture upper-body context
-        while matching the destination cell's aspect ratio so that
-        _resize_cover produces a clean fill without heavy letterboxing.
-
-        zoom_factor normalizes crop size across faces of different scales
-        so one panelist does not dominate while another is tiny.
-
-        AR is re-enforced after edge clamping to prevent distortion.
+        P0 FIXED: Proper face framing + safe AR trim clamp.
+        - Tighter crop (3.0x) to show face, not torso
+        - Higher headroom (0.35 offset, 0.42 placement)
+        - AR trim clamped to prevent y1 < y0 crash -> no more duplicate frames
         """
         fh, fw = frame.shape[:2]
         cx, cy = face.sx, face.sy
-        fw_f, fh_f = face.sw, face.sh  # smoothed face width/height
+        fw_f, fh_f = face.sw, face.sh
 
-        # Target AR from destination cell (fall back to 9:16 if unknown)
+        # Target AR from destination cell
         cell_ar = (cell_w / max(cell_h, 1)) if cell_w > 0 and cell_h > 0 else 9.0 / 16.0
 
-        # Face-relative sizing with zoom normalization
-        base_crop_w = fw_f * 3.5 * zoom_factor
-        min_crop_w = fw_f * 2.5  # minimum to show shoulders
+        # P0 FIX: Tighter crop (3.0x, was 3.5x) to show face not torso
+        base_crop_w = fw_f * 3.0 * zoom_factor
+        min_crop_w = fw_f * 2.5
         crop_w = max(base_crop_w, min_crop_w)
         crop_h = crop_w / max(cell_ar, 0.01)
 
-        # Cap to 95 % of source dimensions
+        # Cap to 95% of source dimensions
         crop_w = min(crop_w, fw * 0.95)
         crop_h = min(crop_h, fh * 0.95)
         # Re-enforce AR after capping
@@ -1125,14 +1100,14 @@ class PanelTracker:
         else:
             crop_h = crop_w / max(cell_ar, 0.01)
 
-        # Centre on face with headroom shift
-        cy_shifted = cy - fh_f * 0.25
+        # P0 FIX: Higher headroom (0.35 offset, was 0.25; 0.42 placement, was 0.38)
+        cy_shifted = cy - fh_f * 0.35
         x0 = int(round(cx - crop_w / 2.0))
-        y0 = int(round(cy_shifted - crop_h * 0.38))
+        y0 = int(round(cy_shifted - crop_h * 0.42))
         x1 = int(round(x0 + crop_w))
         y1 = int(round(y0 + crop_h))
 
-        # Shift (not clip) to keep aspect ratio when hitting edges
+        # Shift (not clip) to keep AR when hitting edges
         if x0 < 0:
             x1 -= x0; x0 = 0
         if y0 < 0:
@@ -1144,16 +1119,20 @@ class PanelTracker:
         x0 = max(0, x0)
         y0 = max(0, y0)
 
-        # Re-enforce AR after edge clamping to prevent distortion
+        # P0 FIX: AR re-enforcement with SAFE trim clamp
         actual_w = x1 - x0
         actual_h = y1 - y0
         if actual_w > 0 and actual_h > 0:
             actual_ar = actual_w / actual_h
             if actual_ar > cell_ar * 1.02:
+                # Too wide -> trim width
                 trim = int((actual_w - actual_h * cell_ar) / 2)
+                trim = max(0, min(trim, (actual_w // 2) - 5))
                 x0 += trim; x1 -= trim
             elif actual_ar < cell_ar * 0.98:
+                # Too tall -> trim height (THIS was causing the crash)
                 trim = int((actual_h - actual_w / cell_ar) / 2)
+                trim = max(0, min(trim, (actual_h // 2) - 5))
                 y0 += trim; y1 -= trim
 
         # Final safety
@@ -1173,7 +1152,6 @@ class PanelTracker:
         if gap < 2:
             return
         h, w = canvas.shape[:2]
-        # Collect unique horizontal and vertical boundaries
         xs: set[int] = set()
         ys: set[int] = set()
         for c in cells:
@@ -1202,39 +1180,20 @@ class PanelTracker:
 
 
 # ---------------------------------------------------------------------------
-# Smooth reframer
+# Smooth reframer (finetuned v5)
 # ---------------------------------------------------------------------------
 
 class SmoothReframer:
     """
-    Finetuned v4 -- adds optional **panel discussion mode** on top of the
-    existing single-crop reframer.
+    Finetuned v5 -- panel discussion mode with P0/P1 fixes.
 
-    Panel mode (``panel_mode=True``)
-    --------------------------------
-    When enabled, up to *panel_max_faces* participants are detected and each
-    gets their own cropped sub-frame inside the 9:16 canvas.  Layouts switch
-    between 1-up / 2-up / 3-up / 4-up automatically based on how many faces
-    are stably tracked (with hysteresis to prevent flickering).
-
-    Smoothness strategy (finetuned)
-    -------------------------------
-    - Per-face position smoothing: alpha = 0.90 (position), 0.92 (size).
-    - Face persistence: inactive after 12 detection misses; removed after 24.
-      Skip frames use tick_extrapolation() -- no penalty.
-    - Layout switching: 15 consecutive frames (~0.5 s @ 30 fps).
-    - Transition blending: 10-frame cross-fade on layout change.
-    - Haar frontal + profile cascade detection on full frame.
-    - Cell-aware cropping: _crop_person matches cell aspect ratio for clean fill.
-    - Face size normalization: balanced zoom across panels.
-    - False-positive filter: faces < 0.12 % of source area ignored.
-    - Strided overlay detection in panel mode for latency.
-    - Pre-allocated buffers to reduce GC pressure.
-
-    Fallback
-    --------
-    If panel_mode is False, or if no faces are detected for an extended
-    period, processing falls back to the standard single-crop behaviour.
+    Key fixes over v4:
+    - _crop_person AR trim clamp (prevents duplicate-frame bug)
+    - Tighter crop framing (face visible, not torso)
+    - NMS for frontal+profile cascade merge
+    - Center-point overlay filtering
+    - Debug logging every 30 frames
+    - Fallback threshold 90 frames (3 seconds)
     """
 
     def __init__(
@@ -1308,7 +1267,7 @@ class SmoothReframer:
         else:
             self.ball_tracker = BallTracker(src_w, src_h, sport_profile=self.sport_profile) if ball_tracking else None
 
-        # Panel tracker (only instantiated when panel_mode is True)
+        # Panel tracker
         self.panel_tracker: Optional[PanelTracker] = None
         if self.panel_mode:
             self.panel_tracker = PanelTracker(
@@ -1330,12 +1289,10 @@ class SmoothReframer:
         self.prev_gray: Optional[np.ndarray] = None
         self.frame_idx = 0
         self._panel_no_face_count: int = 0
-
-        # Pre-allocated output buffer for panel mode
         self._panel_output_buffer: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------
-    # Internal helpers (unchanged from v3)
+    # Internal helpers
     # ------------------------------------------------------------------
 
     def _detect_motion(self, gray: np.ndarray) -> tuple[list[tuple[int, int, int, int]], Optional[np.ndarray]]:
@@ -1395,66 +1352,67 @@ class SmoothReframer:
         return output
 
     # ------------------------------------------------------------------
-    # Panel mode processing (finetuned v4)
+    # Panel mode processing (v5 with P0+P1 fixes)
     # ------------------------------------------------------------------
 
     def _process_panel(self, frame: np.ndarray) -> np.ndarray:
         """
-        Panel-mode branch of process().
-
-        Detects faces on full frame (at panel_detection_stride cadence),
-        filters out faces inside overlay bands, updates PanelTracker,
-        then renders the multi-panel layout into a (target_h x target_w)
-        output.  Overlay strips are composited on top.
-
-        Falls back to single-crop after 45 consecutive no-face frames.
+        Panel-mode with full-frame detection, center-point overlay filter,
+        NMS merge, debug logging, and safe fallback.
         """
         assert self.panel_tracker is not None
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Strided overlay detection for performance
+        # Strided overlay detection
         if self.frame_idx % self.overlay_stride == 0:
             self.overlay_detector.update(frame)
         play_top, play_bot = self.overlay_detector.get_play_area_bounds()
 
-        # Face detection on full frame with overlay filtering
+        # Face detection on full frame with overlay center-point filtering
         if self.frame_idx % self.panel_detection_stride == 0:
             try:
                 raw_faces = self.panel_tracker.detect_faces(frame, gray)
 
-                # Filter out faces that are COMPLETELY inside overlay bands
+                # P1 FIX: Center-point overlay filter (not edge-based)
                 adjusted: list[tuple[int, int, int, int]] = []
                 top_ol = self.overlay_detector.top_overlay
                 bot_ol = self.overlay_detector.bottom_overlay
 
                 for (x, y, w, h) in raw_faces:
-                    face_bottom = y + h
-                    face_top = y
-                    in_top = top_ol is not None and face_bottom <= top_ol[1]
-                    in_bot = bot_ol is not None and face_top >= bot_ol[0]
+                    face_cy = y + h / 2.0
+                    in_top = top_ol is not None and face_cy < top_ol[1]
+                    in_bot = bot_ol is not None and face_cy > bot_ol[0]
                     if not (in_top or in_bot):
                         adjusted.append((x, y, w, h))
 
                 self.panel_tracker.update_detections(adjusted)
-            except Exception:
+
+                # P1 FIX: Debug logging every 30 frames
+                active_tracked = [tf for tf in self.panel_tracker._tracked if tf.active]
+                if self.frame_idx % 30 == 0:
+                    print(f"[PanelDebug] frame={self.frame_idx} raw={len(raw_faces)} "
+                          f"filtered={len(adjusted)} active={len(active_tracked)} "
+                          f"layout={self.panel_tracker.active_count}")
+
+            except Exception as e:
+                if self.frame_idx % 30 == 0:
+                    print(f"[PanelDebug] frame={self.frame_idx} detection_error={e}")
                 self.panel_tracker.tick_extrapolation()
         else:
-            # Non-detection frames: hold positions without penalising faces
             self.panel_tracker.tick_extrapolation()
 
-        # --- Panel fallback: if no active faces for too long, use single-crop ---
+        # Panel fallback: 90 frames (3 seconds) instead of 45
         active_faces = [tf for tf in self.panel_tracker._tracked if tf.active]
         if len(active_faces) == 0:
             self._panel_no_face_count += 1
         else:
             self._panel_no_face_count = 0
 
-        if self._panel_no_face_count > 45:
-            # Fall back to single-crop to avoid black screen
+        if self._panel_no_face_count > 90:
             return self._process_single(frame)
 
-        # Determine canvas available for the panel grid (reserve overlay bands)
+        # Determine canvas available for the panel grid
         top_strip = self.overlay_detector.extract_top_strip(frame) if self.overlay_composite else None
         bottom_strip = self.overlay_detector.extract_bottom_strip(frame) if self.overlay_composite else None
 
@@ -1467,7 +1425,6 @@ class SmoothReframer:
 
         panel_canvas_h = max(1, self.target_h - top_h - bottom_h)
 
-        # Render panel grid into the middle band
         panel_frame = self.panel_tracker.render(
             source_frame=frame,
             canvas_w=self.target_w,
@@ -1475,7 +1432,7 @@ class SmoothReframer:
             gap=self.panel_gap,
         )
 
-        # Reuse output buffer instead of allocating every frame
+        # Reuse output buffer
         if self._panel_output_buffer is None or self._panel_output_buffer.shape != (self.target_h, self.target_w, 3):
             self._panel_output_buffer = np.zeros((self.target_h, self.target_w, 3), dtype=np.uint8)
         else:
@@ -1495,7 +1452,6 @@ class SmoothReframer:
             cv2.line(output, (0, self.target_h - bottom_h), (self.target_w - 1, self.target_h - bottom_h), (10, 10, 10), 1)
 
         return output
-
 
     # ------------------------------------------------------------------
     # Standard single-crop processing (v3, unchanged)
@@ -1621,8 +1577,7 @@ class SmoothReframer:
     def process(self, frame: np.ndarray) -> np.ndarray:
         """
         Process one frame and return the 9:16 output.
-
-        Routes to panel mode or single-crop mode based on ``self.panel_mode``.
+        Routes to panel mode or single-crop mode based on self.panel_mode.
         """
         # Increment BEFORE branching so both paths see correct frame_idx
         self.frame_idx += 1
