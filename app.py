@@ -1,15 +1,19 @@
 from __future__ import annotations
-
+import json
 import os
 import tempfile
 import time
+from collections import deque
+from typing import Any
 
+import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 import backend
 
 st.set_page_config(
-    page_title="Dual Flow Vertical Live → Cloudflare Stream",
+    page_title="Dual Flow Vertical Live  Cloudflare Stream",
     page_icon="📱",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -32,12 +36,344 @@ st.markdown(
       .chip-ok {display:inline-block; padding:6px 12px; border-radius:999px; font-size:.78rem;
              border:1px solid rgba(34,197,94,.35); background:rgba(34,197,94,.10); color:#4ade80;
              margin-right:6px; margin-top:6px;}
+      .chip-warn {display:inline-block; padding:6px 12px; border-radius:999px; font-size:.78rem;
+             border:1px solid rgba(245,158,11,.35); background:rgba(245,158,11,.10); color:#fbbf24;
+             margin-right:6px; margin-top:6px;}
+      .chip-bad {display:inline-block; padding:6px 12px; border-radius:999px; font-size:.78rem;
+             border:1px solid rgba(239,68,68,.35); background:rgba(239,68,68,.10); color:#f87171;
+             margin-right:6px; margin-top:6px;}
       .panel-box {border:1px solid rgba(99,102,241,.35); border-radius:14px; padding:14px 16px;
                   background:rgba(99,102,241,.06); margin-top:8px;}
+      .mini-box {border:1px solid rgba(148,163,184,.18); border-radius:14px; padding:12px 14px;
+                 background:rgba(2,6,23,.20);}
+      .tiny {font-size:.82rem; color:#94a3b8;}
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _num(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None or v == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _fmt_ms(v: Any) -> str:
+    if v is None:
+        return "-"
+    return f"{_num(v):.1f} ms"
+
+
+def _fmt_pct(v: Any) -> str:
+    if v is None:
+        return "-"
+    return f"{_num(v):.1f}%"
+
+
+def _fmt_sec(v: Any) -> str:
+    if v is None:
+        return "-"
+    return f"{_num(v):.2f}s"
+
+
+def _health_chip_html(label: str, level: str = "ok") -> str:
+    klass = {
+        "ok": "chip-ok",
+        "warn": "chip-warn",
+        "bad": "chip-bad",
+        "neutral": "chip",
+    }.get(level, "chip")
+    return f"<span class='{klass}'>{label}</span>"
+
+
+def _analytics_log_tail(path: str, max_lines: int = 40) -> str:
+    raw = backend.read_log_tail(path, max_chars=50000)
+    if not raw:
+        return ""
+    lines = [ln for ln in raw.splitlines() if ln.startswith("[ANALYTICS]")]
+    return "\n".join(lines[-max_lines:])
+
+
+def _append_snapshot_from_session(session) -> None:
+    if not session:
+        return
+    uid = getattr(session, "uid", "unknown") or "unknown"
+    stats = getattr(session, "stats", {}) or {}
+
+    if st.session_state.analytics_uid != uid:
+        st.session_state.analytics_uid = uid
+        st.session_state.analytics_history = []
+        st.session_state.analytics_seen_keys = set()
+
+    ts_ms = _int(stats.get("updated_at_ms") or int(time.time() * 1000))
+    dedupe_key = (
+        uid,
+        ts_ms,
+        _int(stats.get("frames_out", 0)),
+        _int(stats.get("frames_in", 0)),
+        str(getattr(session, "status", "unknown")),
+    )
+    if dedupe_key in st.session_state.analytics_seen_keys:
+        return
+
+    snap = {
+        "ts_ms": ts_ms,
+        "time": time.strftime("%H:%M:%S", time.localtime(ts_ms / 1000.0)),
+        "status": getattr(session, "status", "unknown"),
+        "frames_in": _int(stats.get("frames_in", 0)),
+        "frames_out": _int(stats.get("frames_out", 0)),
+        "frames_processed": _int(stats.get("frames_processed", 0)),
+        "buffer_len": _int(stats.get("buffer_len", 0)),
+        "buffer_fill_pct": _num(stats.get("buffer_fill_pct", 0)),
+        "buffer_seconds": _num(stats.get("buffer_seconds", 0)),
+        "placeholder_frames": _int(stats.get("placeholder_frames", 0)),
+        "source_stalls": _int(stats.get("source_stalls", 0)),
+        "output_underruns": _int(stats.get("output_underruns", 0)),
+        "input_drop_count": _int(stats.get("input_drop_count", 0)),
+        "ingest_fps_1s": _num(stats.get("ingest_fps_1s", 0)),
+        "process_fps_1s": _num(stats.get("process_fps_1s", 0)),
+        "output_fps_1s": _num(stats.get("output_fps_1s", 0)),
+        "avg_process_ms": _num(stats.get("avg_process_ms", 0)),
+        "p95_process_ms": _num(stats.get("p95_process_ms", 0)),
+        "avg_output_write_ms": _num(stats.get("avg_output_write_ms", 0)),
+        "p95_output_write_ms": _num(stats.get("p95_output_write_ms", 0)),
+        "avg_ingest_read_ms": _num(stats.get("avg_ingest_read_ms", 0)),
+        "p95_ingest_read_ms": _num(stats.get("p95_ingest_read_ms", 0)),
+        "avg_schedule_drift_ms": _num(stats.get("avg_schedule_drift_ms", 0)),
+        "p95_schedule_drift_ms": _num(stats.get("p95_schedule_drift_ms", 0)),
+        "ball_confidence": _num(stats.get("ball_confidence", 0)),
+        "panel_active_faces": _int(stats.get("panel_active_faces", 0)),
+        "panel_detector": stats.get("panel_detector", "-"),
+        "ffmpeg_alive": bool(stats.get("ffmpeg_alive", False)),
+        "ingest_alive": bool(stats.get("ingest_alive", False)),
+    }
+    st.session_state.analytics_history.append(snap)
+    if len(st.session_state.analytics_history) > 300:
+        st.session_state.analytics_history = st.session_state.analytics_history[-300:]
+    st.session_state.analytics_seen_keys.add(dedupe_key)
+    if len(st.session_state.analytics_seen_keys) > 500:
+        st.session_state.analytics_seen_keys = set(list(st.session_state.analytics_seen_keys)[-300:])
+
+
+def _render_stream_health(stats: dict, session_status: str) -> None:
+    fps_target = _num(stats.get("fps", backend.DEFAULT_OUTPUT_FPS), backend.DEFAULT_OUTPUT_FPS)
+    p95_proc = _num(stats.get("p95_process_ms", 0))
+    p95_write = _num(stats.get("p95_output_write_ms", 0))
+    p95_read = _num(stats.get("p95_ingest_read_ms", 0))
+    p95_drift = _num(stats.get("p95_schedule_drift_ms", 0))
+    output_fps = _num(stats.get("output_fps_1s", 0))
+    buffer_fill = _num(stats.get("buffer_fill_pct", 0))
+    underruns = _int(stats.get("output_underruns", 0))
+    stalls = _int(stats.get("source_stalls", 0))
+    drops = _int(stats.get("input_drop_count", 0))
+
+    chips = []
+    if session_status == "streaming":
+        chips.append(_health_chip_html("Streaming", "ok"))
+    elif session_status in {"buffering", "connecting_source", "priming_output"}:
+        chips.append(_health_chip_html(session_status.replace("_", " ").title(), "warn"))
+    else:
+        chips.append(_health_chip_html(session_status.replace("_", " ").title(), "bad"))
+
+    if p95_proc > (1000.0 / max(fps_target, 1.0)) * 0.9:
+        chips.append(_health_chip_html("Processing bottleneck", "bad"))
+    elif p95_proc > (1000.0 / max(fps_target, 1.0)) * 0.65:
+        chips.append(_health_chip_html("Processing close to limit", "warn"))
+    else:
+        chips.append(_health_chip_html("Processing healthy", "ok"))
+
+    if output_fps < fps_target * 0.90:
+        chips.append(_health_chip_html("Output FPS low", "bad"))
+    elif output_fps < fps_target * 0.97:
+        chips.append(_health_chip_html("Output FPS slightly low", "warn"))
+    else:
+        chips.append(_health_chip_html("Output cadence healthy", "ok"))
+
+    if p95_write > 20:
+        chips.append(_health_chip_html("Encoder / RTMPS backpressure", "bad"))
+    elif p95_write > 10:
+        chips.append(_health_chip_html("Output write elevated", "warn"))
+    else:
+        chips.append(_health_chip_html("Output write healthy", "ok"))
+
+    if p95_read > 40 or stalls > 0:
+        chips.append(_health_chip_html("Source ingest unstable", "bad" if stalls > 0 else "warn"))
+    else:
+        chips.append(_health_chip_html("Source ingest healthy", "ok"))
+
+    if buffer_fill < 10 and underruns > 0:
+        chips.append(_health_chip_html("Buffer starvation", "bad"))
+    elif buffer_fill > 85 and drops > 0:
+        chips.append(_health_chip_html("Buffer pressure high", "warn"))
+    else:
+        chips.append(_health_chip_html("Buffer stable", "ok"))
+
+    if p95_drift > 20:
+        chips.append(_health_chip_html("Scheduler drift high", "warn"))
+    else:
+        chips.append(_health_chip_html("Scheduler drift normal", "ok"))
+
+    st.markdown("".join(chips), unsafe_allow_html=True)
+
+    guidance = []
+    if p95_proc > 28:
+        guidance.append("**Processing is the bottleneck**: reduce analysis stride, disable ball tracking for non-sports, or lower working resolution if needed.")
+    if p95_write > 15:
+        guidance.append("**Encoder / network push is slowing writes**: lower bitrate further or move to `superfast` preset if this persists.")
+    if output_fps < fps_target * 0.9:
+        guidance.append("**Output FPS is below target**: check both `p95_process_ms` and `p95_output_write_ms` to see whether CV or encode/push is the limiter.")
+    if buffer_fill < 10 and underruns > 0:
+        guidance.append("**Buffer is starving**: source is not arriving steadily enough or processing is not keeping up. This directly maps to visible buffering/live instability.")
+    if stalls > 0:
+        guidance.append("**Source stalls detected**: verify RTMP/SRT source stability, reconnect behavior, and network health on the ingest side.")
+    if not guidance:
+        guidance.append("Pipeline looks broadly healthy. If player buffering still occurs, the next lever to test is bitrate/profile tuning on the output stream and player/network conditions.")
+
+    for tip in guidance[:4]:
+        st.info(tip)
+
+
+def _render_analytics_section(session) -> None:
+    stats = getattr(session, "stats", {}) or {}
+    history = st.session_state.analytics_history
+    status = getattr(session, "status", "unknown")
+
+    st.markdown("### 6) Analytics & tuning")
+    _render_stream_health(stats, status)
+
+    row1 = st.columns(4)
+    row1[0].metric("Output FPS (1s)", f"{_num(stats.get('output_fps_1s', 0)):.2f}")
+    row1[1].metric("Process FPS (1s)", f"{_num(stats.get('process_fps_1s', 0)):.2f}")
+    row1[2].metric("Ingest FPS (1s)", f"{_num(stats.get('ingest_fps_1s', 0)):.2f}")
+    row1[3].metric("Target FPS", f"{_num(stats.get('fps', backend.DEFAULT_OUTPUT_FPS)):.2f}")
+
+    row2 = st.columns(4)
+    row2[0].metric("Avg process", _fmt_ms(stats.get("avg_process_ms")))
+    row2[1].metric("P95 process", _fmt_ms(stats.get("p95_process_ms")))
+    row2[2].metric("Avg output write", _fmt_ms(stats.get("avg_output_write_ms")))
+    row2[3].metric("P95 output write", _fmt_ms(stats.get("p95_output_write_ms")))
+
+    row3 = st.columns(4)
+    row3[0].metric("Avg ingest read", _fmt_ms(stats.get("avg_ingest_read_ms")))
+    row3[1].metric("P95 ingest read", _fmt_ms(stats.get("p95_ingest_read_ms")))
+    row3[2].metric("Avg scheduler drift", _fmt_ms(stats.get("avg_schedule_drift_ms")))
+    row3[3].metric("P95 scheduler drift", _fmt_ms(stats.get("p95_schedule_drift_ms")))
+
+    row4 = st.columns(4)
+    row4[0].metric("Buffer fill", _fmt_pct(stats.get("buffer_fill_pct")))
+    row4[1].metric("Buffer seconds", _fmt_sec(stats.get("buffer_seconds")))
+    row4[2].metric("Target delay", _fmt_sec(stats.get("target_delay_seconds") or stats.get("delay_seconds_configured")))
+    row4[3].metric("Output underruns", _int(stats.get("output_underruns", 0)))
+
+    row5 = st.columns(4)
+    row5[0].metric("Startup  source frame", _fmt_ms(stats.get("startup_ms_to_first_source_frame")))
+    row5[1].metric("Startup  first live frame", _fmt_ms(stats.get("startup_ms_to_first_live_frame")))
+    row5[2].metric("Input drops", _int(stats.get("input_drop_count", 0)))
+    row5[3].metric("Write failures", _int(stats.get("output_write_failures", 0)))
+
+    row6 = st.columns(4)
+    row6[0].metric("FFmpeg alive", "Yes" if stats.get("ffmpeg_alive", False) else "No")
+    row6[1].metric("Ingest alive", "Yes" if stats.get("ingest_alive", False) else "No")
+    row6[2].metric("FFmpeg rc", stats.get("ffmpeg_returncode", "-"))
+    row6[3].metric("Ingest rc", stats.get("ingest_returncode", "-"))
+
+    if history:
+        df = pd.DataFrame(history)
+        tabs = st.tabs([
+            "Pipeline charts",
+            "Buffer & timing",
+            "Detection / content",
+            "Raw stats",
+            "Analytics log",
+        ])
+
+        with tabs[0]:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**FPS trend**")
+                st.line_chart(df.set_index("time")[["ingest_fps_1s", "process_fps_1s", "output_fps_1s"]], height=260)
+            with c2:
+                st.markdown("**Process vs output-write latency**")
+                st.line_chart(df.set_index("time")[["avg_process_ms", "p95_process_ms", "avg_output_write_ms", "p95_output_write_ms"]], height=260)
+
+        with tabs[1]:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Buffer trend**")
+                st.line_chart(df.set_index("time")[["buffer_len", "buffer_fill_pct", "buffer_seconds"]], height=260)
+            with c2:
+                st.markdown("**Ingest read + scheduler drift**")
+                st.line_chart(df.set_index("time")[["avg_ingest_read_ms", "p95_ingest_read_ms", "avg_schedule_drift_ms", "p95_schedule_drift_ms"]], height=260)
+
+            c3, c4 = st.columns(2)
+            with c3:
+                latest = df.iloc[-1]
+                st.markdown("**Current counters**")
+                st.markdown(
+                    f"<div class='mini-box'>"
+                    f"<div><b>Placeholder frames:</b> {_int(latest.get('placeholder_frames', 0))}</div>"
+                    f"<div><b>Source stalls:</b> {_int(latest.get('source_stalls', 0))}</div>"
+                    f"<div><b>Output underruns:</b> {_int(latest.get('output_underruns', 0))}</div>"
+                    f"<div><b>Input drops:</b> {_int(latest.get('input_drop_count', 0))}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            with c4:
+                st.markdown("**Interpretation**")
+                st.caption(
+                    "Low buffer fill + rising underruns = starvation. High process p95 = CV bottleneck. High output-write p95 = encoder / RTMPS push bottleneck."
+                )
+
+        with tabs[2]:
+            c1, c2 = st.columns(2)
+            with c1:
+                show_cols = [c for c in ["ball_confidence", "panel_active_faces"] if c in df.columns]
+                if show_cols:
+                    st.markdown("**Content detection trend**")
+                    st.line_chart(df.set_index("time")[show_cols], height=260)
+            with c2:
+                latest = df.iloc[-1]
+                st.markdown("**Latest detection state**")
+                st.markdown(
+                    f"<div class='mini-box'>"
+                    f"<div><b>Ball confidence:</b> {_num(latest.get('ball_confidence', 0)):.2f}</div>"
+                    f"<div><b>Panel active faces:</b> {_int(latest.get('panel_active_faces', 0))}</div>"
+                    f"<div><b>Panel detector:</b> {latest.get('panel_detector', '-')}</div>"
+                    f"<div><b>FFmpeg alive:</b> {'Yes' if bool(latest.get('ffmpeg_alive', False)) else 'No'}</div>"
+                    f"<div><b>Ingest alive:</b> {'Yes' if bool(latest.get('ingest_alive', False)) else 'No'}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+        with tabs[3]:
+            st.dataframe(df.tail(60), use_container_width=True, hide_index=True)
+            with st.expander("Current stats JSON"):
+                st.json(stats)
+
+        with tabs[4]:
+            log_path = getattr(session, "log_path", "")
+            analytics_only = _analytics_log_tail(log_path)
+            if analytics_only:
+                st.code(analytics_only, language="json")
+            else:
+                st.caption("No analytics lines written yet.")
+
 
 # -- Session state defaults ------------------------------------------------
 for key, value in {
@@ -45,11 +381,13 @@ for key, value in {
     "meta": None,
     "reframed_path": None,
     "live_session": None,
-    # Persisted Cloudflare credentials
     "cf_account_id": os.getenv("CLOUDFLARE_ACCOUNT_ID", ""),
     "cf_api_token": os.getenv("CLOUDFLARE_STREAM_API_TOKEN", ""),
     "cf_customer_code": os.getenv("CLOUDFLARE_STREAM_CUSTOMER_CODE", ""),
     "cf_low_latency": False,
+    "analytics_history": [],
+    "analytics_uid": None,
+    "analytics_seen_keys": set(),
 }.items():
     if key not in st.session_state:
         st.session_state[key] = value
@@ -68,10 +406,10 @@ st.markdown(
                   align-items:flex-start; flex-wrap:wrap;'>
         <div>
           <div style='font-size:1.85rem; font-weight:800; margin-bottom:4px;'>
-            Dual Flow Vertical Live &rarr; Cloudflare Stream
+            Dual Flow Vertical Live → Cloudflare Stream
           </div>
           <div style='font-size:.98rem; color:#cbd5e1;'>
-            Supports VOD &rarr; Live and delayed realtime. RTMP / SRT / URL sources handled in
+            Supports VOD → Live and delayed realtime. RTMP / SRT / URL sources handled in
             realtime mode. Panel discussion mode splits multi-person frames into a 9:16 grid.
           </div>
         </div>
@@ -81,7 +419,7 @@ st.markdown(
           <span class='chip'>panel discussion mode</span>
           <span class='chip'>sport profiles</span>
           <span class='chip'>placeholder priming</span>
-          <span class='chip'>shared playback section</span>
+          <span class='chip'>analytics dashboard</span>
         </div>
       </div>
     </div>
@@ -105,7 +443,7 @@ creds_set = bool(
 if creds_set:
     masked = st.session_state.cf_account_id[-6:] if len(st.session_state.cf_account_id) > 6 else "***"
     st.markdown(
-        f"<span class='chip-ok'>&#10003; Credentials saved</span>"
+        f"<span class='chip-ok'>✓ Credentials saved</span>"
         f"<span class='chip'>Account: ...{masked}</span>",
         unsafe_allow_html=True,
     )
@@ -137,7 +475,6 @@ with st.expander(creds_label, expanded=not creds_set):
             value=st.session_state.cf_low_latency,
             key="_cf_ll_input",
         )
-    # Persist whenever values change
     st.session_state.cf_account_id = _acc
     st.session_state.cf_api_token = _tok
     st.session_state.cf_customer_code = _code
@@ -245,13 +582,22 @@ with col_m1:
         help="Tunes ball colour and motion heuristics. Use 'auto' for non-sport content.",
     )
 with col_m2:
-    ball_tracking = st.checkbox("Ball tracking", value=True,
-        help="Disable for non-sport or panel content to reduce false positives.")
-    overlay_composite = st.checkbox("Overlay composite", value=True,
-        help="Detect and preserve top scorecard / bottom lower-third strips.")
+    ball_tracking = st.checkbox(
+        "Ball tracking",
+        value=True,
+        help="Disable for non-sport or panel content to reduce false positives.",
+    )
+    overlay_composite = st.checkbox(
+        "Overlay composite",
+        value=True,
+        help="Detect and preserve top scorecard / bottom lower-third strips.",
+    )
 with col_m3:
-    preserve_bottom_overlay = st.checkbox("Preserve bottom overlay", value=False,
-        help="Reserve a band at the bottom for lower-thirds/tickers.")
+    preserve_bottom_overlay = st.checkbox(
+        "Preserve bottom overlay",
+        value=False,
+        help="Reserve a band at the bottom for lower-thirds/tickers.",
+    )
 
 # -- Panel discussion mode -------------------------------------------------
 st.markdown("**Panel discussion mode**")
@@ -289,8 +635,7 @@ if panel_mode:
         )
     st.caption(
         "Smoothing: position alpha=0.90 | size alpha=0.92 | layout switch: 15 frames | "
-        "face persistence: 24 frames | transition blend: 10 frames | "
-        "Haar frontal + profile cascade with NMS"
+        "face persistence: 24 frames | transition blend: 10 frames | MediaPipe/Haar fallback"
     )
     if ball_tracking:
         st.warning(
@@ -426,6 +771,9 @@ with left_action:
         if cf_cfg and st.session_state.live_session:
             backend.stop_live_session(cf_cfg, st.session_state.live_session)
         st.session_state.live_session = None
+        st.session_state.analytics_uid = None
+        st.session_state.analytics_history = []
+        st.session_state.analytics_seen_keys = set()
         st.info("Current live session stopped and Cloudflare input disabled.")
 with right_action:
     auto_refresh = st.checkbox("Auto-refresh session status", value=True)
@@ -433,6 +781,8 @@ with right_action:
 # -- Section 5: Live session status & playback -----------------------------
 if st.session_state.live_session:
     session = st.session_state.live_session
+    _append_snapshot_from_session(session)
+
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("**Shared Cloudflare playback section**")
     st.caption(f"Live input UID: {getattr(session, 'uid', '-')}")
@@ -456,21 +806,18 @@ if st.session_state.live_session:
     session_status = getattr(session, "status", "unknown")
     session_error = getattr(session, "error", "")
 
-    # -- Primary metrics row --
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Pipeline status", session_status)
     m2.metric("Working source", stats.get("working_resolution", "-"))
     m3.metric("Delay frames", stats.get("delay_frames", "-"))
     m4.metric("Frames out", stats.get("frames_out", 0))
 
-    # -- Secondary metrics row --
     m5, m6, m7, m8 = st.columns(4)
     m5.metric("Frames in", stats.get("frames_in", 0))
     m6.metric("Buffer len", stats.get("buffer_len", 0))
     m7.metric("Placeholder frames", stats.get("placeholder_frames", 0))
     m8.metric("Source stalls", stats.get("source_stalls", 0))
 
-    # -- Panel + detection row --
     m9, m10, m11, m12 = st.columns(4)
     panel_faces = stats.get("panel_active_faces", None)
     panel_mode_active = stats.get("panel_mode", False)
@@ -479,13 +826,12 @@ if st.session_state.live_session:
         panel_faces if panel_faces is not None else "---",
         help="Active tracked faces in panel mode (--- when panel mode is off).",
     )
-    m10.metric("Ball confidence", f"{stats.get('ball_confidence', 0.0):.2f}")
+    m10.metric("Ball confidence", f"{_num(stats.get('ball_confidence', 0.0)):.2f}")
     overlay_top = stats.get("overlay_top", False)
     overlay_bot = stats.get("overlay_bottom", False)
     m11.metric("Top overlay", "Y" if overlay_top else "N")
     m12.metric("Bottom overlay", "Y" if overlay_bot else "N")
 
-    # -- Status banners --
     if session_error:
         st.error(session_error)
 
@@ -498,14 +844,14 @@ if st.session_state.live_session:
         mode_label = "panel" if panel_mode_active else "single-crop"
         st.success(f"Actively pushing frames to Cloudflare ({mode_label} mode).")
     elif session_status in {
-        "ffmpeg_pipe_broken", "worker_error", "ffmpeg_start_failed", "source_ended"
+        "ffmpeg_pipe_broken", "worker_error", "ffmpeg_start_failed", "source_ended", "ffmpeg_exited"
     }:
-        st.error("Worker hit an error or source ended. Check the FFmpeg log below.")
+        st.error("Worker hit an error or source ended. Check the FFmpeg log and analytics below.")
 
     with st.expander(
         "FFmpeg push log",
         expanded=session_status in {
-            "ffmpeg_pipe_broken", "worker_error", "ffmpeg_start_failed", "source_ended"
+            "ffmpeg_pipe_broken", "worker_error", "ffmpeg_start_failed", "source_ended", "ffmpeg_exited"
         },
     ):
         log_path = getattr(session, "log_path", "")
@@ -516,11 +862,12 @@ if st.session_state.live_session:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # -- In-app playback using st.iframe (replaces deprecated components.html) --
-    st.subheader("5) In-app playback")
+    _render_analytics_section(session)
+
+    st.subheader("7) In-app playback")
     iframe_url = getattr(session, "iframe_url", "")
     if iframe_url:
-        st.iframe(iframe_url, height=760)
+        components.iframe(iframe_url, height=760, scrolling=True)
 
     if auto_refresh:
         time.sleep(3)
@@ -538,5 +885,5 @@ st.markdown(
     "- **Cloudflare startup priming** -- placeholder frames avoid 'stream not started' errors\n"
     "- **Stale session protection** -- safe across Streamlit redeploys\n"
     "- **Persistent credentials** -- Cloudflare keys saved in session, edit anytime\n"
-    "- **Full stats dashboard** -- faces, ball confidence, overlays, buffer, stalls"
+    "- **Analytics dashboard** -- FPS, p95 timings, buffer health, startup latency, raw stats, analytics log"
 )
