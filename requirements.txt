@@ -5,6 +5,7 @@ pandas>=2.0.0
 plotly>=5.0.0
 opencv-contrib-python-headless>=4.9.0
 numpy>=1.26.0
+mediapipe>=0.10.21
 
 # Optional AI features (uncomment if needed)
 # realesrgan-pytorch>=0.3.0
