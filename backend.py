@@ -839,6 +839,25 @@ class PanelTracker:
             )
         except Exception:
             pass
+        # MediaPipe face detector: panel mode primary detector, Haar fallback
+        self.use_mediapipe = True
+        self._mp_face = None
+        self._mp_available = False
+        self.detector_backend_name = "haar"
+        try:
+            import mediapipe as mp  # lazy optional dependency
+            self._mp = mp
+            self._mp_face = mp.solutions.face_detection.FaceDetection(
+                model_selection=0,
+                min_detection_confidence=0.60,
+            )
+            self._mp_available = True
+            self.detector_backend_name = "mediapipe"
+        except Exception:
+            self._mp = None
+            self._mp_face = None
+            self._mp_available = False
+            self.detector_backend_name = "haar"
 
     # ------------------------------------------------------------------
     # Face detection with NMS (P1 fix)
@@ -877,27 +896,68 @@ class PanelTracker:
 
     def detect_faces(self, frame: np.ndarray, gray: np.ndarray) -> list[tuple[int, int, int, int]]:
         """
-        v6: Detect at half resolution with strict filtering.
-        - Half-res detection (4x faster)
-        - minNeighbors=5 (rejects isolated false positives)
-        - minSize=(48,48) at full-res (24x24 at half-res)
-        - AR filter: real faces are roughly square (0.65-1.5 w/h ratio)
+        MediaPipe primary detector for panel mode, Haar fallback.
+        - MediaPipe is used only here for studio/news/talk panel layouts
+        - Haar remains as fallback if MediaPipe is unavailable or returns nothing
         """
+        # ---- MediaPipe primary path ----
+        if self.use_mediapipe and self._mp_available and self._mp_face is not None:
+            try:
+                h, w = frame.shape[:2]
+                det_scale = 1.0
+                if w > 960:
+                    det_scale = 960.0 / w
+                if det_scale < 1.0:
+                    small = cv2.resize(frame, (int(round(w * det_scale)), int(round(h * det_scale))), interpolation=cv2.INTER_AREA)
+                else:
+                    small = frame
+                rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                res = self._mp_face.process(rgb)
+                mp_faces: list[tuple[int, int, int, int]] = []
+                sh, sw = small.shape[:2]
+                inv = 1.0 / det_scale
+                if res and res.detections:
+                    for det in res.detections:
+                        score = float(det.score[0]) if getattr(det, 'score', None) else 0.0
+                        if score < 0.60:
+                            continue
+                        rb = det.location_data.relative_bounding_box
+                        x = int(round(rb.xmin * sw * inv))
+                        y = int(round(rb.ymin * sh * inv))
+                        ww = int(round(rb.width * sw * inv))
+                        hh = int(round(rb.height * sh * inv))
+                        if ww <= 0 or hh <= 0:
+                            continue
+                        # clamp to frame
+                        x = max(0, min(x, w - 1))
+                        y = max(0, min(y, h - 1))
+                        ww = min(ww, w - x)
+                        hh = min(hh, h - y)
+                        if ww < 48 or hh < 48:
+                            continue
+                        ar = ww / max(hh, 1)
+                        if 0.60 <= ar <= 1.60:
+                            mp_faces.append((x, y, ww, hh))
+                if mp_faces:
+                    self.detector_backend_name = "mediapipe"
+                    return self._nms_faces(mp_faces, iou_thresh=0.35)
+            except Exception:
+                # fall through to Haar fallback
+                pass
+
+        # ---- Haar fallback path (strict, half-res) ----
         det_scale = 0.5
         small_gray = cv2.resize(gray, None, fx=det_scale, fy=det_scale, interpolation=cv2.INTER_AREA)
         inv = 1.0 / det_scale
-        min_sz = (24, 24)  # = (48,48) at full-res
-
-        raw: list[tuple[int, int, int, int]] = []
-
+        min_sz = (24, 24)  # => 48x48 at full res
+        faces: list[tuple[int, int, int, int]] = []
         if self.face_detector is not None:
             try:
                 detected = self.face_detector.detectMultiScale(
                     small_gray, scaleFactor=1.10, minNeighbors=5, minSize=min_sz
                 )
                 if len(detected):
-                    raw.extend([(int(x * inv), int(y * inv), int(w * inv), int(h * inv))
-                                for (x, y, w, h) in detected])
+                    faces.extend([(int(x * inv), int(y * inv), int(w * inv), int(h * inv)) for (x, y, w, h) in detected])
             except Exception:
                 pass
         if self.profile_detector is not None:
@@ -906,17 +966,15 @@ class PanelTracker:
                     small_gray, scaleFactor=1.10, minNeighbors=5, minSize=min_sz
                 )
                 if len(detected):
-                    raw.extend([(int(x * inv), int(y * inv), int(w * inv), int(h * inv))
-                                for (x, y, w, h) in detected])
+                    faces.extend([(int(x * inv), int(y * inv), int(w * inv), int(h * inv)) for (x, y, w, h) in detected])
             except Exception:
                 pass
-
         filtered: list[tuple[int, int, int, int]] = []
-        for (x, y, w, h) in raw:
+        for (x, y, w, h) in faces:
             ar = w / max(h, 1)
             if 0.65 <= ar <= 1.50:
                 filtered.append((x, y, w, h))
-
+        self.detector_backend_name = "haar"
         return self._nms_faces(filtered, iou_thresh=0.4)
 
     # ------------------------------------------------------------------
@@ -1147,7 +1205,7 @@ class PanelTracker:
         y1 = max(y0 + 1, min(y1, fh))
 
         if x1 <= x0 or y1 <= y0:
-            # v6 smart fallback — center crop at cell AR instead of full-frame
+            # smart fallback — center crop at cell AR instead of whole frame
             c_w = int(fw * 0.45)
             c_h = int(c_w / max(cell_ar, 0.01))
             c_h = min(c_h, fh)
@@ -1402,7 +1460,7 @@ class SmoothReframer:
                 # P1 FIX: Debug logging every 30 frames
                 active_tracked = [tf for tf in self.panel_tracker._tracked if tf.active]
                 if self.frame_idx % 30 == 0:
-                    print(f"[PanelDebug] frame={self.frame_idx} raw={len(raw_faces)} "
+                    print(f"[PanelDebug] frame={self.frame_idx} backend={self.panel_tracker.detector_backend_name} raw={len(raw_faces)} "
                           f"filtered={len(adjusted)} active={len(active_tracked)} "
                           f"layout={self.panel_tracker.active_count}")
 
@@ -1836,7 +1894,9 @@ def _build_ingest_command(source: str, fps: float, pace_input: bool, loop_file: 
         f"pad={WORKING_INPUT_W}:{WORKING_INPUT_H}:(ow-iw)/2:(oh-ih)/2:black"
     )
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
-    cmd += _source_input_args(source, pace_input=pace_input, loop_file=loop_file)
+    # for local file sources, skip -re so delay buffer fills quickly
+    effective_pace = pace_input if is_network_source(source) else False
+    cmd += _source_input_args(source, pace_input=effective_pace, loop_file=loop_file)
     cmd += ["-an", "-vf", vf, "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"]
     return cmd
 
@@ -1929,7 +1989,7 @@ def _realtime_worker(
     session.status = "priming_output"
     try:
         if session.proc.stdin:
-            prime = min(45, int(fps * 1.5))
+            prime = min(15, max(1, int(fps * 0.5)))
             for _ in range(prime):
                 if session.stop_event.is_set():
                     break
@@ -1963,8 +2023,7 @@ def _realtime_worker(
                     frames_in += 1
 
             frame_to_write = None
-            buffer_start_threshold = min(90, delay_frames)  # start after ~3s, not full delay
-            if len(buffer) >= buffer_start_threshold:
+            if len(buffer) >= delay_frames:
                 session.status = "streaming"
                 frame_to_write = buffer.popleft()
             elif not source_ended:
@@ -2007,6 +2066,7 @@ def _realtime_worker(
                     "overlay_top": reframer.overlay_detector.top_overlay is not None,
                     "overlay_bottom": reframer.overlay_detector.bottom_overlay is not None,
                     "panel_active_faces": panel_count,
+                    "panel_detector": getattr(reframer.panel_tracker, "detector_backend_name", "haar") if reframer.panel_tracker else "-",
                 })
     except Exception as exc:
         print(f"[WORKER CRASH] {exc}", flush=True)  # ADD THIS
