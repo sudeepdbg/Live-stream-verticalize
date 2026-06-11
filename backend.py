@@ -42,7 +42,7 @@ def ffmpeg_ok() -> bool:
 
 def safe_token(value: str) -> str:
     value = value or "stream"
-    return re.sub(r"[^A-Za-z0-9._-]+", "", value).strip(".-") or "stream"
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-") or "stream"
 
 def is_network_source(source: str) -> bool:
     s = (source or " ").lower().strip()
@@ -874,29 +874,50 @@ class PanelTracker:
                     used[j] = True  # suppress this detection
         return keep
 
+
     def detect_faces(self, frame: np.ndarray, gray: np.ndarray) -> list[tuple[int, int, int, int]]:
-        """Detect faces using Haar frontal + profile cascades with NMS merge."""
-        faces: list[tuple[int, int, int, int]] = []
+        """
+        v6: Detect at half resolution with strict filtering.
+        - Half-res detection (4x faster)
+        - minNeighbors=5 (rejects isolated false positives)
+        - minSize=(48,48) at full-res (24x24 at half-res)
+        - AR filter: real faces are roughly square (0.65-1.5 w/h ratio)
+        """
+        det_scale = 0.5
+        small_gray = cv2.resize(gray, None, fx=det_scale, fy=det_scale, interpolation=cv2.INTER_AREA)
+        inv = 1.0 / det_scale
+        min_sz = (24, 24)  # = (48,48) at full-res
+
+        raw: list[tuple[int, int, int, int]] = []
+
         if self.face_detector is not None:
             try:
                 detected = self.face_detector.detectMultiScale(
-                    gray, scaleFactor=1.06, minNeighbors=2, minSize=(24, 24)
+                    small_gray, scaleFactor=1.10, minNeighbors=5, minSize=min_sz
                 )
                 if len(detected):
-                    faces.extend([(int(x), int(y), int(w), int(h)) for (x, y, w, h) in detected])
+                    raw.extend([(int(x * inv), int(y * inv), int(w * inv), int(h * inv))
+                                for (x, y, w, h) in detected])
             except Exception:
                 pass
         if self.profile_detector is not None:
             try:
                 detected = self.profile_detector.detectMultiScale(
-                    gray, scaleFactor=1.06, minNeighbors=2, minSize=(24, 24)
+                    small_gray, scaleFactor=1.10, minNeighbors=5, minSize=min_sz
                 )
                 if len(detected):
-                    faces.extend([(int(x), int(y), int(w), int(h)) for (x, y, w, h) in detected])
+                    raw.extend([(int(x * inv), int(y * inv), int(w * inv), int(h * inv))
+                                for (x, y, w, h) in detected])
             except Exception:
                 pass
-        # NMS to merge overlapping frontal + profile detections
-        return self._nms_faces(faces, iou_thresh=0.4)
+
+        filtered: list[tuple[int, int, int, int]] = []
+        for (x, y, w, h) in raw:
+            ar = w / max(h, 1)
+            if 0.65 <= ar <= 1.50:
+                filtered.append((x, y, w, h))
+
+        return self._nms_faces(filtered, iou_thresh=0.4)
 
     # ------------------------------------------------------------------
     # Public API
@@ -1126,7 +1147,16 @@ class PanelTracker:
         y1 = max(y0 + 1, min(y1, fh))
 
         if x1 <= x0 or y1 <= y0:
-            return frame  # fallback: whole frame
+            # v6 smart fallback — center crop at cell AR instead of full-frame
+            c_w = int(fw * 0.45)
+            c_h = int(c_w / max(cell_ar, 0.01))
+            c_h = min(c_h, fh)
+            c_w = int(c_h * cell_ar)
+            c_x0 = max(0, int(cx - c_w / 2))
+            c_y0 = max(0, int(cy - c_h / 2))
+            c_x0 = min(c_x0, max(0, fw - c_w))
+            c_y0 = min(c_y0, max(0, fh - c_h))
+            return frame[c_y0:c_y0 + c_h, c_x0:c_x0 + c_w]
 
         return frame[y0:y1, x0:x1]
 
@@ -1725,7 +1755,7 @@ def build_public_playback_urls(cfg: CFStreamConfig, uid: str):
 def build_push_file_command(reframed_mp4: str, rtmps_url: str, stream_key: str, loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS):
     target = rtmps_url.rstrip("/") + "/" + stream_key
     fps_int = max(24, min(60, int(round(output_fps or DEFAULT_OUTPUT_FPS))))
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-y"]
     if loop_input:
         cmd += ["-stream_loop", "-1"]
     cmd += [
@@ -1764,7 +1794,7 @@ def build_realtime_rtmps_push_command(target_w: int, target_h: int, fps: float, 
     target = rtmps_url.rstrip("/") + "/" + stream_key
     fps_int = max(24, min(60, int(round(fps or DEFAULT_OUTPUT_FPS))))
     return [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+        "ffmpeg", "-hide_banner", "-loglevel", "info", "-y",
         "-f", "rawvideo", "-pix_fmt", "bgr24",
         "-s", f"{target_w}x{target_h}",
         "-r", str(fps_int), "-i", "-",
@@ -1801,9 +1831,9 @@ def _read_exact(stream, nbytes: int) -> bytes:
 def _build_ingest_command(source: str, fps: float, pace_input: bool, loop_file: bool) -> list[str]:
     fps_int = max(24, min(60, int(round(fps or DEFAULT_OUTPUT_FPS))))
     vf = (
-        f"fps={fps_int}, "
-        f"scale={WORKING_INPUT_W}:{WORKING_INPUT_H}:force_original_aspect_ratio=decrease, "
-        f"pad={WORKING_INPUT_W}:{WORKING_INPUT_H}:(ow-iw)/2:(oh-ih)/2:black "
+        f"fps={fps_int},"
+        f"scale={WORKING_INPUT_W}:{WORKING_INPUT_H}:force_original_aspect_ratio=decrease,"
+        f"pad={WORKING_INPUT_W}:{WORKING_INPUT_H}:(ow-iw)/2:(oh-ih)/2:black"
     )
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
     cmd += _source_input_args(source, pace_input=pace_input, loop_file=loop_file)
@@ -1899,7 +1929,7 @@ def _realtime_worker(
     session.status = "priming_output"
     try:
         if session.proc.stdin:
-            prime = int(max(1.0, min(delay_seconds / 2.0, 3.0)) * fps)
+            prime = min(45, int(fps * 1.5))
             for _ in range(prime):
                 if session.stop_event.is_set():
                     break
@@ -1933,7 +1963,8 @@ def _realtime_worker(
                     frames_in += 1
 
             frame_to_write = None
-            if len(buffer) >= delay_frames:
+            buffer_start_threshold = min(90, delay_frames)  # start after ~3s, not full delay
+            if len(buffer) >= buffer_start_threshold:
                 session.status = "streaming"
                 frame_to_write = buffer.popleft()
             elif not source_ended:
