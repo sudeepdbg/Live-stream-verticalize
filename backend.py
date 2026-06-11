@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import collections
 import json
 import math
@@ -13,7 +12,6 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
-
 import cv2
 import numpy as np
 
@@ -31,11 +29,9 @@ DEFAULT_VIDEO_BITRATE = "3500k"
 DEFAULT_MAXRATE = "3500k"
 DEFAULT_BUFSIZE = "7000k"
 
-
 # ---------------------------------------------------------------------------
 # Basic utilities
 # ---------------------------------------------------------------------------
-
 def ffmpeg_ok() -> bool:
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=5)
@@ -44,16 +40,13 @@ def ffmpeg_ok() -> bool:
     except Exception:
         return False
 
-
 def safe_token(value: str) -> str:
     value = value or "stream"
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-") or "stream"
-
+    return re.sub(r"[^A-Za-z0-9._-]+", "", value).strip(".-") or "stream"
 
 def is_network_source(source: str) -> bool:
-    s = (source or "").lower().strip()
+    s = (source or " ").lower().strip()
     return s.startswith(("rtmp://", "rtmps://", "srt://", "udp://", "tcp://", "http://", "https://"))
-
 
 def _source_input_args(source: str, pace_input: bool = False, loop_file: bool = False) -> list[str]:
     args: list[str] = [
@@ -67,11 +60,10 @@ def _source_input_args(source: str, pace_input: bool = False, loop_file: bool = 
         args += ["-re"]
     if is_network_source(source):
         args += ["-rw_timeout", "15000000"]
-        if source.lower().startswith(("http://", "https://")):
-            args += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"]
+    if source.lower().startswith(("http://", "https://")):
+        args += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"]
     args += ["-i", source]
     return args
-
 
 def _safe_json_loads(text: str) -> dict:
     try:
@@ -79,7 +71,6 @@ def _safe_json_loads(text: str) -> dict:
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
         return {}
-
 
 def _ffprobe_json(source: str, timeout: int = 30) -> dict:
     cmd = [
@@ -89,7 +80,6 @@ def _ffprobe_json(source: str, timeout: int = 30) -> dict:
     ]
     out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=timeout)
     return _safe_json_loads(out)
-
 
 def probe_source(source: str) -> dict:
     res = {"duration": 0.0, "width": 0, "height": 0, "fps": 0.0, "vcodec": "unknown"}
@@ -111,6 +101,7 @@ def probe_source(source: str) -> dict:
                 break
     except Exception:
         pass
+
     if (res["width"] <= 0 or res["height"] <= 0 or res["fps"] <= 0) and not is_network_source(source):
         cap = None
         try:
@@ -127,13 +118,14 @@ def probe_source(source: str) -> dict:
         finally:
             if cap is not None:
                 cap.release()
+
     if res["width"] <= 0 or res["height"] <= 0:
         if is_network_source(source):
             res["width"], res["height"] = WORKING_INPUT_W, WORKING_INPUT_H
+
     if res["fps"] <= 0:
         res["fps"] = PLACEHOLDER_FPS
     return res
-
 
 def _vertical_crop_box(src_w: int, src_h: int) -> tuple[int, int]:
     if src_w / max(src_h, 1) >= 9 / 16:
@@ -146,10 +138,8 @@ def _vertical_crop_box(src_w: int, src_h: int) -> tuple[int, int]:
     crop_h = max(32, crop_h - (crop_h % 2))
     return crop_w, crop_h
 
-
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
-
 
 def _resize_cover(image: np.ndarray, width: int, height: int) -> np.ndarray:
     if image is None or image.size == 0 or width <= 0 or height <= 0:
@@ -163,15 +153,12 @@ def _resize_cover(image: np.ndarray, width: int, height: int) -> np.ndarray:
     y0 = max(0, (nh - height) // 2)
     return resized[y0:y0 + height, x0:x0 + width]
 
-
 # ---------------------------------------------------------------------------
 # Overlay / scorecard logic
 # ---------------------------------------------------------------------------
-
 class OverlayDetector:
     """
-    Detects *broadcast graphics* at top and bottom.
-
+    Detects broadcast graphics at top and bottom.
     Key refinement vs the previous version:
     - Finds the actual vertical boundary row-by-row instead of assuming the
       entire scan band is overlay.
@@ -362,11 +349,9 @@ class OverlayDetector:
         strip = frame_bgr[y0:y1]
         return strip.copy() if strip.size else None
 
-
 # ---------------------------------------------------------------------------
 # Scene change detector
 # ---------------------------------------------------------------------------
-
 class SceneChangeDetector:
     def __init__(self, hist_diff_thresh: float = 0.55, pixel_diff_thresh: float = 45.0, cooldown_frames: int = 8):
         self.hist_diff_thresh = hist_diff_thresh
@@ -395,11 +380,9 @@ class SceneChangeDetector:
         self.prev_gray = gray.copy()
         return is_cut
 
-
 # ---------------------------------------------------------------------------
 # Ball tracker
 # ---------------------------------------------------------------------------
-
 class BallTracker:
     def __init__(self, src_w: int, src_h: int, sport_profile: str = "auto"):
         self.src_w = int(src_w)
@@ -528,6 +511,7 @@ class BallTracker:
                     color_score = 0.5
             else:
                 color_score = 0.3 if mv >= 150 else 0.0
+
         motion_score = 0.0
         if motion_mask is not None:
             mr = max(5, int(radius * 2.0))
@@ -538,14 +522,18 @@ class BallTracker:
             mp = motion_mask[my0:my1, mx0:mx1]
             if mp.size > 0:
                 motion_score = float(np.count_nonzero(mp)) / float(mp.size)
+
         pred_x = self.cx + self.vx
         pred_y = self.cy + self.vy
         dist = math.hypot(cx - pred_x, cy - pred_y)
         proximity_score = max(0.0, 1.0 - dist / self.gate_radius)
+
         expected_r = (self.min_r + self.max_r) / 2.0
         size_dev = abs(radius - expected_r) / max(expected_r, 1.0)
         size_score = max(0.0, 1.0 - size_dev)
+
         source_bonus = 0.15 if source == "multi" else 0.0
+
         if self.sport == "cricket":
             score = 0.25 * color_score + 0.25 * motion_score + 0.25 * proximity_score + 0.15 * size_score + 0.10 * source_bonus
         elif self.sport == "basketball":
@@ -562,6 +550,7 @@ class BallTracker:
         if exclusion_mask is not None:
             det_gray[exclusion_mask > 0] = 0
         field_mask = self._build_field_mask(hsv)
+
         raw_candidates: list[tuple[float, float, float, str]] = []
         for cx, cy, r in self._candidates_hough(det_gray):
             raw_candidates.append((cx, cy, r, "hough"))
@@ -569,6 +558,7 @@ class BallTracker:
             raw_candidates.append((cx, cy, r, "contour"))
         for cx, cy, r in self._candidates_color_blob(hsv, field_mask):
             raw_candidates.append((cx, cy, r, "color"))
+
         if exclusion_mask is not None:
             filtered = []
             for cx, cy, r, src in raw_candidates:
@@ -576,6 +566,7 @@ class BallTracker:
                 if 0 <= iy < self.src_h and 0 <= ix < self.src_w and exclusion_mask[iy, ix] == 0:
                     filtered.append((cx, cy, r, src))
             raw_candidates = filtered
+
         clusters: list[tuple[float, float, float, str]] = []
         used = [False] * len(raw_candidates)
         merge_dist = max(self.max_r * 2.5, 20.0)
@@ -602,6 +593,7 @@ class BallTracker:
             avg_r = sum(group_r) / len(group_r)
             src_tag = "multi" if len(sources) > 1 else list(sources)[0]
             clusters.append((avg_cx, avg_cy, avg_r, src_tag))
+
         best: Optional[tuple[float, float, float, float]] = None
         best_score = -1.0
         for cx, cy, r, src in clusters:
@@ -609,15 +601,18 @@ class BallTracker:
             if score > best_score:
                 best_score = score
                 best = (cx, cy, r, score)
+
         if best is None or best_score < 0.15:
             self.missing_count += 1
             self.conf *= 0.88
             if self.missing_count > self.max_missing:
                 self.conf = 0.0
             return None
+
         cx, cy, r, score = best
         new_vx = cx - self.cx
         new_vy = cy - self.cy
+
         # Sport-specific position smoothing alphas
         if self.sport == "basketball":
             pos_alpha = 0.65  # track faster movement
@@ -628,6 +623,7 @@ class BallTracker:
         else:
             pos_alpha = 0.60
         vel_alpha = min(0.7, pos_alpha + 0.1)
+
         self.vx = vel_alpha * self.vx + (1.0 - vel_alpha) * new_vx
         self.vy = vel_alpha * self.vy + (1.0 - vel_alpha) * new_vy
         self.cx = pos_alpha * self.cx + (1.0 - pos_alpha) * cx
@@ -644,12 +640,9 @@ class BallTracker:
         self.vy = 0.0
         self.conf *= 0.3
 
-
-
 # ---------------------------------------------------------------------------
 # Panel discussion mode (finetuned v5)
 # ---------------------------------------------------------------------------
-
 @dataclass
 class _TrackedFace:
     """
@@ -671,9 +664,8 @@ class _TrackedFace:
     missing_frames: int = 0
     # Whether this face contributed to the last rendered output
     active: bool = True
-
     # Smoothing alphas - aggressive to minimise jitter
-    _pos_alpha: float = 0.90   # keep 90 % of old position per frame
+    _pos_alpha: float = 0.90   # keep 90% of old position per frame
     _size_alpha: float = 0.92  # even more conservative on size
 
     def update(self, det_x: float, det_y: float, det_w: float, det_h: float) -> None:
@@ -706,10 +698,8 @@ class _TrackedFace:
         self.sw = self._size_alpha * self.sw + (1.0 - self._size_alpha) * self.raw_w
         self.sh = self._size_alpha * self.sh + (1.0 - self._size_alpha) * self.raw_h
 
-
 def _face_centre(tf: _TrackedFace) -> tuple[float, float]:
     return tf.sx, tf.sy
-
 
 def _match_faces_to_detections(
     tracked: list[_TrackedFace],
@@ -718,7 +708,6 @@ def _match_faces_to_detections(
 ) -> tuple[dict[int, int], list[int], list[int]]:
     """
     Simple greedy nearest-neighbour matching (O(n^2) -- fine for <=8 faces).
-
     Returns:
         matched   -- {tracked_idx: det_idx}
         unmatched_tracked -- tracked indices with no detection
@@ -746,7 +735,6 @@ def _match_faces_to_detections(
     unmatched_det = [di for di in range(len(detections)) if di not in used_det]
     return matched, unmatched_tracked, unmatched_det
 
-
 @dataclass
 class _PanelCell:
     """Canvas destination rectangle for one panel."""
@@ -754,7 +742,6 @@ class _PanelCell:
     dst_y: int   # top edge on output canvas
     dst_w: int   # width on output canvas
     dst_h: int   # height on output canvas
-
 
 def _compute_panel_layout(
     n: int,
@@ -768,7 +755,6 @@ def _compute_panel_layout(
     """
     n = max(1, min(n, 4))
     cells: list[_PanelCell] = []
-
     if n == 1:
         cells.append(_PanelCell(0, 0, canvas_w, canvas_h))
 
@@ -795,7 +781,6 @@ def _compute_panel_layout(
 
     return cells
 
-
 class PanelTracker:
     """
     Finetuned v5 PanelTracker with:
@@ -807,7 +792,6 @@ class PanelTracker:
     - Pre-allocated canvas buffer
     - AR-safe _crop_person with trim clamp
     """
-
     def __init__(
         self,
         src_w: int,
@@ -961,7 +945,7 @@ class PanelTracker:
             self._tracked.sort(
                 key=lambda tf: (tf.active, -tf.missing_frames), reverse=True
             )
-            self._tracked = self._tracked[: self.max_faces * 2]
+            self._tracked = self._tracked[:self.max_faces * 2]
 
         self._tracked = [
             tf for tf in self._tracked
@@ -1035,7 +1019,7 @@ class PanelTracker:
                 crop = self._crop_person(source_frame, face, cell.dst_w, cell.dst_h, zoom_factor)
             else:
                 canvas[
-                    cell.dst_y: cell.dst_y + cell.dst_h,
+                    cell.dst_y : cell.dst_y + cell.dst_h,
                     cell.dst_x: cell.dst_x + cell.dst_w,
                 ] = 0
                 continue
@@ -1178,15 +1162,12 @@ class PanelTracker:
     def tracked_faces(self) -> list[_TrackedFace]:
         return list(self._tracked)
 
-
 # ---------------------------------------------------------------------------
 # Smooth reframer (finetuned v5)
 # ---------------------------------------------------------------------------
-
 class SmoothReframer:
     """
     Finetuned v5 -- panel discussion mode with P0/P1 fixes.
-
     Key fixes over v4:
     - _crop_person AR trim clamp (prevents duplicate-frame bug)
     - Tighter crop framing (face visible, not torso)
@@ -1591,7 +1572,6 @@ class SmoothReframer:
 # ---------------------------------------------------------------------------
 # Offline vertical master generation
 # ---------------------------------------------------------------------------
-
 def create_vertical_master(
     source_path: str,
     output_path: str,
@@ -1622,6 +1602,7 @@ def create_vertical_master(
     if src_w <= 0 or src_h <= 0:
         cap.release()
         return False, "Invalid source dimensions"
+
     reframer = SmoothReframer(
         src_w, src_h, target_w, target_h,
         smooth_strength=smooth_strength,
@@ -1646,6 +1627,7 @@ def create_vertical_master(
     if not writer.isOpened():
         cap.release()
         return False, "Could not create output file"
+
     idx = 0
     try:
         while True:
@@ -1661,18 +1643,15 @@ def create_vertical_master(
         writer.release()
     return True, "Done"
 
-
 # ---------------------------------------------------------------------------
 # Cloudflare Stream live push helpers
 # ---------------------------------------------------------------------------
-
 @dataclass
 class CFStreamConfig:
     account_id: str
     api_token: str
     customer_code: str
     prefer_low_latency: bool = False
-
 
 @dataclass
 class LiveSession:
@@ -1691,7 +1670,6 @@ class LiveSession:
     stats: dict = field(default_factory=dict)
     error: str = ""
 
-
 def cfstream_config_from_inputs(account_id: str, api_token: str, customer_code: str, prefer_low_latency: bool = False) -> CFStreamConfig:
     if not account_id:
         raise ValueError("Cloudflare account ID is required.")
@@ -1701,7 +1679,6 @@ def cfstream_config_from_inputs(account_id: str, api_token: str, customer_code: 
         raise ValueError("Cloudflare customer code is required.")
     code = customer_code.strip().replace("customer-", "").replace(".cloudflarestream.com", "").strip("/")
     return CFStreamConfig(account_id.strip(), api_token.strip(), code, bool(prefer_low_latency))
-
 
 def _cf_api_request(cfg: CFStreamConfig, method: str, path: str, payload: Optional[dict] = None):
     url = f"https://api.cloudflare.com/client/v4{path}"
@@ -1723,7 +1700,6 @@ def _cf_api_request(cfg: CFStreamConfig, method: str, path: str, payload: Option
             parsed = {"success": False, "errors": [{"message": body}]}
         return exc.code, parsed
 
-
 def create_live_input(cfg: CFStreamConfig, name: str, recording_mode: str = "automatic") -> dict:
     payload = {
         "meta": {"name": name},
@@ -1736,10 +1712,8 @@ def create_live_input(cfg: CFStreamConfig, name: str, recording_mode: str = "aut
         raise RuntimeError(f"Create live input failed: {parsed}")
     return parsed["result"]
 
-
 def disable_live_input(cfg: CFStreamConfig, uid: str) -> None:
     _cf_api_request(cfg, "PUT", f"/accounts/{cfg.account_id}/stream/live_inputs/{uid}", {"enabled": False})
-
 
 def build_public_playback_urls(cfg: CFStreamConfig, uid: str):
     base = f"https://customer-{cfg.customer_code}.cloudflarestream.com/{uid}"
@@ -1747,7 +1721,6 @@ def build_public_playback_urls(cfg: CFStreamConfig, uid: str):
     dash = f"{base}/manifest/video.mpd"
     iframe = f"{base}/iframe?autoplay=true&muted=true&controls=true&preload=metadata"
     return hls, dash, iframe
-
 
 def build_push_file_command(reframed_mp4: str, rtmps_url: str, stream_key: str, loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS):
     target = rtmps_url.rstrip("/") + "/" + stream_key
@@ -1770,10 +1743,10 @@ def build_push_file_command(reframed_mp4: str, rtmps_url: str, stream_key: str, 
         "-profile:v", "high",
         "-x264-params", f"nal-hrd=cbr:force-cfr=1:scenecut=0:keyint={fps_int * 2}:min-keyint={fps_int * 2}",
         "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+        "-flvflags", "no_duration_filesize",
         "-f", "flv", target,
     ]
     return cmd
-
 
 def start_vod_to_live_push(cfg: CFStreamConfig, reframed_mp4: str, asset_name: str, loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS) -> LiveSession:
     live_input = create_live_input(cfg, name=safe_token(Path(asset_name).stem))
@@ -1786,7 +1759,6 @@ def start_vod_to_live_push(cfg: CFStreamConfig, reframed_mp4: str, asset_name: s
     log_fp = open(log_path, "w", encoding="utf-8")
     proc = subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT, text=True)
     return LiveSession(uid, rtmps_url, stream_key, hls_url, dash_url, iframe_url, cmd, proc, log_path, status="streaming")
-
 
 def build_realtime_rtmps_push_command(target_w: int, target_h: int, fps: float, rtmps_url: str, stream_key: str):
     target = rtmps_url.rstrip("/") + "/" + stream_key
@@ -1811,9 +1783,9 @@ def build_realtime_rtmps_push_command(target_w: int, target_h: int, fps: float, 
         "-profile:v", "high",
         "-x264-params", f"nal-hrd=cbr:force-cfr=1:scenecut=0:keyint={fps_int * 2}:min-keyint={fps_int * 2}",
         "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+        "-flvflags", "no_duration_filesize",
         "-f", "flv", target,
     ]
-
 
 def _read_exact(stream, nbytes: int) -> bytes:
     chunks = []
@@ -1826,19 +1798,17 @@ def _read_exact(stream, nbytes: int) -> bytes:
         remaining -= len(data)
     return b"".join(chunks)
 
-
 def _build_ingest_command(source: str, fps: float, pace_input: bool, loop_file: bool) -> list[str]:
     fps_int = max(24, min(60, int(round(fps or DEFAULT_OUTPUT_FPS))))
     vf = (
-        f"fps={fps_int},"
-        f"scale={WORKING_INPUT_W}:{WORKING_INPUT_H}:force_original_aspect_ratio=decrease,"
-        f"pad={WORKING_INPUT_W}:{WORKING_INPUT_H}:(ow-iw)/2:(oh-ih)/2:black"
+        f"fps={fps_int}, "
+        f"scale={WORKING_INPUT_W}:{WORKING_INPUT_H}:force_original_aspect_ratio=decrease, "
+        f"pad={WORKING_INPUT_W}:{WORKING_INPUT_H}:(ow-iw)/2:(oh-ih)/2:black "
     )
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
     cmd += _source_input_args(source, pace_input=pace_input, loop_file=loop_file)
     cmd += ["-an", "-vf", vf, "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"]
     return cmd
-
 
 def _make_placeholder_frame(target_w: int, target_h: int, text: str = "Starting stream...") -> np.ndarray:
     frame = np.zeros((target_h, target_w, 3), dtype=np.uint8)
@@ -1850,7 +1820,6 @@ def _make_placeholder_frame(target_w: int, target_h: int, text: str = "Starting 
     cv2.putText(frame, "Cloudflare live input priming", (28, target_h // 2 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 195, 230), 1, cv2.LINE_AA)
     return frame
 
-
 def _open_ingest_process(source: str, fps: float, pace_input: bool, loop_file: bool, log_path: str) -> subprocess.Popen:
     cmd = _build_ingest_command(source, fps=fps, pace_input=pace_input, loop_file=loop_file)
     log_fp = open(log_path, "a", encoding="utf-8")
@@ -1858,13 +1827,11 @@ def _open_ingest_process(source: str, fps: float, pace_input: bool, loop_file: b
     log_fp.flush()
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log_fp, bufsize=0)
 
-
 def _start_output_process(session: LiveSession) -> subprocess.Popen:
     log_fp = open(session.log_path, "a", encoding="utf-8")
     log_fp.write("\n=== PUSH CMD ===\n" + " ".join(session.ffmpeg_cmd) + "\n")
     log_fp.flush()
     return subprocess.Popen(session.ffmpeg_cmd, stdin=subprocess.PIPE, stdout=log_fp, stderr=subprocess.STDOUT, bufsize=0)
-
 
 def _realtime_worker(
     session: LiveSession,
@@ -2011,6 +1978,7 @@ def _realtime_worker(
                     "panel_active_faces": panel_count,
                 })
     except Exception as exc:
+        print(f"[WORKER CRASH] {exc}", flush=True)  # ADD THIS
         session.status = "worker_error"
         session.error = str(exc)
     finally:
@@ -2030,7 +1998,6 @@ def _realtime_worker(
             pass
         if session.status not in {"ffmpeg_pipe_broken", "worker_error", "ffmpeg_start_failed", "source_ended"}:
             session.status = "stopped"
-
 
 def start_realtime_delayed_vertical_push(
     cfg: CFStreamConfig,
@@ -2091,7 +2058,6 @@ def start_realtime_delayed_vertical_push(
     worker.start()
     return session
 
-
 def stop_live_session(cfg: CFStreamConfig, session: Optional[LiveSession]) -> None:
     if not session:
         return
@@ -2114,7 +2080,6 @@ def stop_live_session(cfg: CFStreamConfig, session: Optional[LiveSession]) -> No
         disable_live_input(cfg, session.uid)
     except Exception:
         pass
-
 
 def read_log_tail(path: str, max_chars: int = 12000) -> str:
     try:
