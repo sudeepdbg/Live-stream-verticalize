@@ -5,7 +5,6 @@ import tempfile
 import time
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 import backend
 
@@ -30,6 +29,9 @@ st.markdown(
       .chip {display:inline-block; padding:6px 12px; border-radius:999px; font-size:.78rem;
              border:1px solid rgba(148,163,184,.25); background:#0f172a; color:#cbd5e1;
              margin-right:6px; margin-top:6px;}
+      .chip-ok {display:inline-block; padding:6px 12px; border-radius:999px; font-size:.78rem;
+             border:1px solid rgba(34,197,94,.35); background:rgba(34,197,94,.10); color:#4ade80;
+             margin-right:6px; margin-top:6px;}
       .panel-box {border:1px solid rgba(99,102,241,.35); border-radius:14px; padding:14px 16px;
                   background:rgba(99,102,241,.06); margin-top:8px;}
     </style>
@@ -43,6 +45,11 @@ for key, value in {
     "meta": None,
     "reframed_path": None,
     "live_session": None,
+    # Persisted Cloudflare credentials
+    "cf_account_id": os.getenv("CLOUDFLARE_ACCOUNT_ID", ""),
+    "cf_api_token": os.getenv("CLOUDFLARE_STREAM_API_TOKEN", ""),
+    "cf_customer_code": os.getenv("CLOUDFLARE_STREAM_CUSTOMER_CODE", ""),
+    "cf_low_latency": False,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = value
@@ -86,26 +93,63 @@ if not backend.ffmpeg_ok():
     st.error("FFmpeg / ffprobe not found. Add ffmpeg to your runtime and redeploy.")
     st.stop()
 
-# ── Section 1: Cloudflare credentials ────────────────────────────────────────
+# ── Section 1: Cloudflare credentials (persisted in session_state) ────────────
 st.subheader("1) Cloudflare Stream credentials")
-left_cf, right_cf = st.columns(2)
-with left_cf:
-    account_id = st.text_input(
-        "Cloudflare account ID",
-        value=os.getenv("CLOUDFLARE_ACCOUNT_ID", ""),
+
+creds_set = bool(
+    st.session_state.cf_account_id
+    and st.session_state.cf_api_token
+    and st.session_state.cf_customer_code
+)
+
+if creds_set:
+    st.markdown(
+        "<span class='chip-ok'>✓ Credentials saved</span>"
+        f"<span class='chip'>Account: ...{st.session_state.cf_account_id[-6:]}</span>",
+        unsafe_allow_html=True,
     )
-    api_token = st.text_input(
-        "Cloudflare Stream API token",
-        value=os.getenv("CLOUDFLARE_STREAM_API_TOKEN", ""),
-        type="password",
-    )
-with right_cf:
-    customer_code = st.text_input(
-        "Cloudflare Stream customer code",
-        value=os.getenv("CLOUDFLARE_STREAM_CUSTOMER_CODE", ""),
-        help="Enter only the code, not the full domain.",
-    )
-    prefer_low_latency = st.checkbox("Prefer LL-HLS where available", value=False)
+
+creds_label = "Edit credentials" if creds_set else "Enter credentials"
+with st.expander(creds_label, expanded=not creds_set):
+    left_cf, right_cf = st.columns(2)
+    with left_cf:
+        _acc = st.text_input(
+            "Cloudflare account ID",
+            value=st.session_state.cf_account_id,
+            key="_cf_acc_input",
+        )
+        _tok = st.text_input(
+            "Cloudflare Stream API token",
+            value=st.session_state.cf_api_token,
+            type="password",
+            key="_cf_tok_input",
+        )
+    with right_cf:
+        _code = st.text_input(
+            "Cloudflare Stream customer code",
+            value=st.session_state.cf_customer_code,
+            help="Enter only the code, not the full domain.",
+            key="_cf_code_input",
+        )
+        _ll = st.checkbox(
+            "Prefer LL-HLS where available",
+            value=st.session_state.cf_low_latency,
+            key="_cf_ll_input",
+        )
+    # Persist whenever values change
+    if _acc != st.session_state.cf_account_id:
+        st.session_state.cf_account_id = _acc
+    if _tok != st.session_state.cf_api_token:
+        st.session_state.cf_api_token = _tok
+    if _code != st.session_state.cf_customer_code:
+        st.session_state.cf_customer_code = _code
+    if _ll != st.session_state.cf_low_latency:
+        st.session_state.cf_low_latency = _ll
+
+account_id = st.session_state.cf_account_id
+api_token = st.session_state.cf_api_token
+customer_code = st.session_state.cf_customer_code
+prefer_low_latency = st.session_state.cf_low_latency
 
 cf_cfg = None
 if account_id and api_token and customer_code:
@@ -113,7 +157,8 @@ if account_id and api_token and customer_code:
         cf_cfg = backend.cfstream_config_from_inputs(
             account_id, api_token, customer_code, prefer_low_latency
         )
-        st.success("Cloudflare Stream configuration looks valid.")
+        if not creds_set:
+            st.success("Cloudflare Stream configuration looks valid.")
     except Exception as exc:
         st.error(str(exc))
 else:
@@ -246,8 +291,9 @@ if panel_mode:
             help="Pixel gap between panel cells.",
         )
     st.caption(
-        "Smoothing: position α=0.90 · size α=0.92 · layout switch: 25 frames · "
-        "face persistence: 18 frames · transition blend: 10 frames"
+        "Smoothing: position α=0.90 · size α=0.92 · layout switch: 15 frames · "
+        "face persistence: 24 frames · transition blend: 10 frames · "
+        "Haar frontal + profile cascade with NMS"
     )
     if ball_tracking:
         st.warning(
@@ -473,19 +519,20 @@ if st.session_state.live_session:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # ── In-app playback using st.html (replaces deprecated st.components.v1.html) ──
     st.subheader("5) In-app playback")
     iframe_url = getattr(session, "iframe_url", "")
     if iframe_url:
         iframe_html = (
-            '<div style="position:relative;padding-top:177.78%;max-width:360px;margin:0 auto;">'
+            '<div style="max-width:380px;margin:0 auto;">'
             + f'<iframe src="{iframe_url}" '
-            + 'style="border:none;position:absolute;top:0;left:0;height:100%;width:100%;'
+            + 'style="border:none;width:100%;height:760px;'
             + 'border-radius:16px;overflow:hidden;" '
             + 'allow="accelerometer; gyroscope; autoplay; encrypted-media; picture-in-picture;" '
             + 'allowfullscreen="true"></iframe>'
             + "</div>"
         )
-        components.html(iframe_html, height=760, scrolling=False)
+        st.html(iframe_html)
 
     if auto_refresh:
         time.sleep(3)
@@ -493,7 +540,7 @@ if st.session_state.live_session:
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.divider()
-st.markdown("### What's included")
+st.markdown("### What\'s included")
 st.markdown(
     "- **Workflow switch** — VOD→Live or delayed realtime\n"
     "- **Source-type switch** — file upload, RTMP, SRT, local path / URL\n"
@@ -502,5 +549,6 @@ st.markdown(
     "- **Overlay composite** — preserves top scorecard and optional bottom lower-third\n"
     "- **Cloudflare startup priming** — placeholder frames avoid 'stream not started' errors\n"
     "- **Stale session protection** — safe across Streamlit redeploys\n"
+    "- **Persistent credentials** — Cloudflare keys saved in session, edit anytime\n"
     "- **Full stats dashboard** — faces, ball confidence, overlays, buffer, stalls"
 )
