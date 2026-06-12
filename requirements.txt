@@ -1,12 +1,15 @@
-streamlit>=1.35.0
-pandas>=2.0.0
+streamlit==1.35.0
+pandas>=2.0.0,<3.0.0
+plotly>=5.0.0,<6.0.0
 
-# Optional enhancements
-plotly>=5.0.0
-opencv-contrib-python-headless>=4.9.0
-numpy>=1.26.0
-mediapipe>=0.10.21
+numpy>=1.26.0,<2.0.0
+opencv-contrib-python-headless==4.10.0.84
+mediapipe==0.10.21
 
+# Optional AI features
+# realesrgan-pytorch>=0.3.0
+# onnxruntime>=1.16.0
+# onnxruntime-gpu>=1.16.0
 # Optional AI features (uncomment if needed)
 # realesrgan-pytorch>=0.3.0
 # onnxruntime>=1.16.0
