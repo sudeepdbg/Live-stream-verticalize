@@ -1,27 +1,4 @@
-
 from __future__ import annotations
-
-"""
-backend.py
-Production-ready vertical live/VOD reframer backend.
-
-What this file includes
------------------------
-- Stable FFmpeg ingest/output helpers
-- Live Cloudflare Stream push helpers
-- Time-based buffering with drift control
-- Auto mode detection (panel vs sports vs single-subject)
-- MediaPipe face detection for panel mode with Haar fallback
-- Ball tracking tuned for basketball / cricket / soccer
-- Scoreboard-safe cropping with top/bottom overlay preservation
-- Analytics for tuning latency / drops / detector health
-
-Notes
------
-- MediaPipe is optional. If unavailable, the code automatically falls back to Haar.
-- This file is intentionally self-contained and safe to import in Streamlit / server apps.
-"""
-
 import collections
 import contextlib
 import json
@@ -29,8 +6,6 @@ import logging
 import math
 import os
 import re
-import shutil
-import signal
 import subprocess
 import tempfile
 import threading
@@ -39,22 +14,13 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
-
+from typing import Callable, Optional
 import cv2
 import numpy as np
 
-try:
-    import mediapipe as mp  # type: ignore
-    MEDIAPIPE_AVAILABLE = True
-except Exception:
-    mp = None
-    MEDIAPIPE_AVAILABLE = False
-
 # ---------------------------------------------------------------------------
-# Logging
+# Logging & OpenCV optimization
 # ---------------------------------------------------------------------------
-
 logger = logging.getLogger("backend")
 if not logger.handlers:
     _handler = logging.StreamHandler()
@@ -71,28 +37,21 @@ except Exception:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
 DEFAULT_TARGET_W = 540
 DEFAULT_TARGET_H = 960
 MAX_UPLOAD_MB = 400
-WORKING_INPUT_W = 960
-WORKING_INPUT_H = 540
+WORKING_INPUT_W = 1280
+WORKING_INPUT_H = 720
 PLACEHOLDER_FPS = 30.0
 DEFAULT_OUTPUT_FPS = 30.0
 DEFAULT_VIDEO_BITRATE = "3500k"
 DEFAULT_MAXRATE = "3500k"
 DEFAULT_BUFSIZE = "7000k"
-DEFAULT_AUDIO_BITRATE = "128k"
-DEFAULT_GOP_SEC = 2
-MAX_BUFFER_SECONDS = 2.0
-AUTO_MODE_PROBE_FRAMES = 45
-AUTO_MODE_PANEL_MIN_FACES = 2
-AUTO_MODE_PANEL_RATIO = 0.55
+MAX_BUFFER_SECONDS = 2.0          # ← NEW: cap realtime buffer to prevent drift
 
 # ---------------------------------------------------------------------------
 # Basic utilities
 # ---------------------------------------------------------------------------
-
 def ffmpeg_ok() -> bool:
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=5)
@@ -101,19 +60,16 @@ def ffmpeg_ok() -> bool:
     except Exception:
         return False
 
-
 def safe_token(value: str) -> str:
     value = value or "stream"
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-") or "stream"
 
-
 def is_network_source(source: str) -> bool:
-    s = (source or "").lower().strip()
+    s = (source or " ").lower().strip()
     return s.startswith(("rtmp://", "rtmps://", "srt://", "udp://", "tcp://", "http://", "https://"))
 
-
-def _source_input_args(source: str, pace_input: bool = False, loop_file: bool = False) -> List[str]:
-    args: List[str] = [
+def _source_input_args(source: str, pace_input: bool = False, loop_file: bool = False) -> list[str]:
+    args: list[str] = [
         "-fflags", "+genpts+discardcorrupt",
         "-analyzeduration", "20000000",
         "-probesize", "20000000",
@@ -129,14 +85,12 @@ def _source_input_args(source: str, pace_input: bool = False, loop_file: bool = 
     args += ["-i", source]
     return args
 
-
 def _safe_json_loads(text: str) -> dict:
     try:
         parsed = json.loads(text)
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
         return {}
-
 
 def _ffprobe_json(source: str, timeout: int = 30) -> dict:
     cmd = [
@@ -147,9 +101,8 @@ def _ffprobe_json(source: str, timeout: int = 30) -> dict:
     out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=timeout)
     return _safe_json_loads(out)
 
-
 def probe_source(source: str) -> dict:
-    res = {"duration": 0.0, "width": 0, "height": 0, "fps": 0.0, "vcodec": "unknown", "has_audio": False}
+    res = {"duration": 0.0, "width": 0, "height": 0, "fps": 0.0, "vcodec": "unknown"}
     try:
         data = _ffprobe_json(source, timeout=35 if is_network_source(source) else 20)
         fmt = data.get("format", {}) if isinstance(data, dict) else {}
@@ -165,14 +118,36 @@ def probe_source(source: str) -> dict:
                     res["fps"] = round(n / d, 3) if d else 0.0
                 except Exception:
                     pass
-            elif stream.get("codec_type") == "audio":
-                res["has_audio"] = True
+                break
     except Exception:
         pass
+
+    if (res["width"] <= 0 or res["height"] <= 0 or res["fps"] <= 0) and not is_network_source(source):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(source)
+            if cap.isOpened():
+                res["width"] = res["width"] or int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                res["height"] = res["height"] or int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                res["fps"] = res["fps"] or float(cap.get(cv2.CAP_PROP_FPS) or 0)
+                fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                if not res["duration"] and fc > 0 and res["fps"] > 0:
+                    res["duration"] = fc / res["fps"]
+        except Exception:
+            pass
+        finally:
+            if cap is not None:
+                cap.release()
+
+    if res["width"] <= 0 or res["height"] <= 0:
+        if is_network_source(source):
+            res["width"], res["height"] = WORKING_INPUT_W, WORKING_INPUT_H
+
+    if res["fps"] <= 0:
+        res["fps"] = PLACEHOLDER_FPS
     return res
 
-
-def _vertical_crop_box(src_w: int, src_h: int) -> Tuple[int, int]:
+def _vertical_crop_box(src_w: int, src_h: int) -> tuple[int, int]:
     if src_w / max(src_h, 1) >= 9 / 16:
         crop_h = src_h
         crop_w = int(round(src_h * 9 / 16))
@@ -183,10 +158,8 @@ def _vertical_crop_box(src_w: int, src_h: int) -> Tuple[int, int]:
     crop_h = max(32, crop_h - (crop_h % 2))
     return crop_w, crop_h
 
-
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
-
 
 def _resize_cover(image: np.ndarray, width: int, height: int) -> np.ndarray:
     if image is None or image.size == 0 or width <= 0 or height <= 0:
@@ -200,52 +173,207 @@ def _resize_cover(image: np.ndarray, width: int, height: int) -> np.ndarray:
     y0 = max(0, (nh - height) // 2)
     return resized[y0:y0 + height, x0:x0 + width]
 
-
 # ---------------------------------------------------------------------------
 # Overlay / scorecard logic
 # ---------------------------------------------------------------------------
-
 class OverlayDetector:
-    """Detects stable top and bottom broadcast graphics / scoreboards."""
+    """
+    Detects broadcast graphics at top and bottom.
 
-    def __init__(self, stability_frames: int = 8, score_thresh: float = 0.08):
-        self.stability_frames = max(2, stability_frames)
-        self.score_thresh = score_thresh
-        self.top_ratio = 0.0
-        self.bottom_ratio = 0.0
-        self._top_scores: Deque[float] = collections.deque(maxlen=stability_frames)
-        self._bottom_scores: Deque[float] = collections.deque(maxlen=stability_frames)
-        self._prev_gray: Optional[np.ndarray] = None
+    FIX-O1: Warmup now uses a fast-init phase (first warmup_frames frames update avg
+    with alpha=0.5 instead of 0.93) so the running average represents the overlay
+    background rather than frame-0 content. False positives on first ~30 frames
+    are suppressed by requiring warmup to complete before any detection fires.
 
-    @staticmethod
-    def _band_score(gray: np.ndarray, y1: int, y2: int) -> float:
-        roi = gray[y1:y2, :]
-        if roi.size == 0:
-            return 0.0
-        edges = cv2.Canny(roi, 60, 160)
-        edge_density = float(edges.mean()) / 255.0
-        row_var = float(np.std(np.mean(roi, axis=1))) / 255.0
-        return 0.6 * edge_density + 0.4 * row_var
+    FIX-O2: Added `min_stable_ratio` guard so that a row must be stable across at
+    least 60% of recent frames before being accepted as overlay, preventing sideline
+    ads and pitch-edge content from being promoted.
+    """
 
-    def update(self, frame: np.ndarray) -> Tuple[float, float]:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        h = gray.shape[0]
-        top_band = max(16, int(h * 0.14))
-        bottom_band = max(16, int(h * 0.18))
-        top_score = self._band_score(gray, 0, top_band)
-        bottom_score = self._band_score(gray, h - bottom_band, h)
-        self._top_scores.append(top_score)
-        self._bottom_scores.append(bottom_score)
-        self.top_ratio = 0.14 if (len(self._top_scores) == self.stability_frames and np.mean(self._top_scores) >= self.score_thresh) else self.top_ratio * 0.9
-        self.bottom_ratio = 0.18 if (len(self._bottom_scores) == self.stability_frames and np.mean(self._bottom_scores) >= self.score_thresh) else self.bottom_ratio * 0.9
-        self._prev_gray = gray
-        return self.top_ratio, self.bottom_ratio
+    def __init__(
+        self,
+        src_w: int,
+        src_h: int,
+        top_scan_ratio: float = 0.18,
+        bottom_scan_ratio: float = 0.14,
+        warmup_frames: int = 18,
+        stable_diff_threshold: float = 11.0,
+        row_text_threshold: float = 0.018,
+        overlay_hold_frames: int = 10,
+    ):
+        self.src_w = int(src_w)
+        self.src_h = int(src_h)
+        self.top_scan_h = max(24, int(round(src_h * top_scan_ratio)))
+        self.bottom_scan_h = max(24, int(round(src_h * bottom_scan_ratio)))
+        self.warmup_frames = max(4, int(warmup_frames))
+        self.stable_diff_threshold = float(stable_diff_threshold)
+        self.row_text_threshold = float(row_text_threshold)
+        self.overlay_hold_frames = max(1, int(overlay_hold_frames))
 
+        self.top_avg: Optional[np.ndarray] = None
+        self.bottom_avg: Optional[np.ndarray] = None
+        self.frame_count = 0
+
+        self.top_overlay: Optional[tuple[int, int]] = None
+        self.bottom_overlay: Optional[tuple[int, int]] = None
+        self.top_hold = 0
+        self.bottom_hold = 0
+
+        self.exclusion_mask = np.zeros((self.src_h, self.src_w), dtype=np.uint8)
+
+    def _row_edge_density(self, gray_patch: np.ndarray) -> np.ndarray:
+        edges = cv2.Canny(gray_patch, 60, 180)
+        return edges.mean(axis=1) / 255.0
+
+    def _row_sat_mean(self, bgr_patch: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(bgr_patch, cv2.COLOR_BGR2HSV)
+        return hsv[:, :, 1].mean(axis=1) / 255.0
+
+    def _row_green_ratio(self, bgr_patch: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(bgr_patch, cv2.COLOR_BGR2HSV)
+        green = cv2.inRange(hsv, np.array([30, 30, 25], dtype=np.uint8), np.array([90, 255, 255], dtype=np.uint8))
+        return (green > 0).mean(axis=1)
+
+    def _detect_overlay_range(self, current_bgr: np.ndarray, avg_bgr: np.ndarray, *, top: bool) -> Optional[tuple[int, int]]:
+        curr_gray = cv2.cvtColor(current_bgr, cv2.COLOR_BGR2GRAY)
+        avg_gray = cv2.cvtColor(np.clip(avg_bgr, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        diff = np.abs(curr_gray.astype(np.float32) - avg_gray.astype(np.float32))
+        row_diff = diff.mean(axis=1)
+        row_edges = self._row_edge_density(curr_gray)
+        row_sat = self._row_sat_mean(current_bgr)
+        row_green = self._row_green_ratio(current_bgr)
+
+        stable = row_diff < self.stable_diff_threshold
+        texty = row_edges > self.row_text_threshold
+        colorful = row_sat > 0.10
+        not_field = row_green < 0.28
+
+        if top:
+            active = stable & texty & (colorful | not_field)
+        else:
+            active = stable & texty & colorful & not_field
+
+        if active.any():
+            kernel = np.ones(5, dtype=np.uint8)
+            active_u8 = np.convolve(active.astype(np.uint8), kernel, mode='same') > 1
+        else:
+            active_u8 = active
+
+        idx = np.where(active_u8)[0]
+        if idx.size == 0:
+            return None
+
+        runs = []
+        start = idx[0]
+        prev = idx[0]
+        for v in idx[1:]:
+            if v == prev + 1:
+                prev = v
+            else:
+                runs.append((start, prev + 1))
+                start = v
+                prev = v
+        runs.append((start, prev + 1))
+        runs.sort(key=lambda x: (x[1] - x[0]), reverse=True)
+        y0, y1 = runs[0]
+        band_h = y1 - y0
+
+        if top:
+            if y0 > int(0.06 * current_bgr.shape[0]):
+                return None
+            if band_h < 12:
+                return None
+            y0 = max(0, y0 - 6)
+            y1 = min(current_bgr.shape[0], y1 + 6)
+            if (y1 - y0) > int(0.16 * self.src_h):
+                y1 = y0 + int(0.16 * self.src_h)
+            return (y0, y1)
+
+        if band_h < 10:
+            return None
+        if band_h > int(0.065 * self.src_h):
+            return None
+        if y1 < int(0.50 * current_bgr.shape[0]):
+            return None
+        y0 = max(0, y0 - 4)
+        y1 = min(current_bgr.shape[0], y1 + 4)
+        return (y0, y1)
+
+    def update(self, frame_bgr: np.ndarray) -> None:
+        self.frame_count += 1
+
+        top_patch = frame_bgr[:self.top_scan_h].astype(np.float32)
+        bot_patch = frame_bgr[self.src_h - self.bottom_scan_h:].astype(np.float32)
+
+        if self.top_avg is None:
+            self.top_avg = top_patch.copy()
+            self.bottom_avg = bot_patch.copy()
+            return
+
+        if self.frame_count <= self.warmup_frames:
+            alpha = 0.60
+        else:
+            alpha = 0.93
+
+        self.top_avg = alpha * self.top_avg + (1.0 - alpha) * top_patch
+        self.bottom_avg = alpha * self.bottom_avg + (1.0 - alpha) * bot_patch
+
+        if self.frame_count >= self.warmup_frames:
+            top_range = self._detect_overlay_range(frame_bgr[:self.top_scan_h], self.top_avg, top=True)
+            bot_local = self._detect_overlay_range(frame_bgr[self.src_h - self.bottom_scan_h:], self.bottom_avg, top=False)
+            bot_range = None
+            if bot_local is not None:
+                bot_range = (self.src_h - self.bottom_scan_h + bot_local[0], self.src_h - self.bottom_scan_h + bot_local[1])
+
+            if top_range is not None:
+                self.top_overlay = top_range
+                self.top_hold = self.overlay_hold_frames
+            elif self.top_hold > 0:
+                self.top_hold -= 1
+            else:
+                self.top_overlay = None
+
+            if bot_range is not None:
+                self.bottom_overlay = bot_range
+                self.bottom_hold = self.overlay_hold_frames
+            elif self.bottom_hold > 0:
+                self.bottom_hold -= 1
+            else:
+                self.bottom_overlay = None
+
+        self.exclusion_mask[:] = 0
+        if self.top_overlay is not None:
+            self.exclusion_mask[self.top_overlay[0]:self.top_overlay[1], :] = 255
+        if self.bottom_overlay is not None:
+            self.exclusion_mask[self.bottom_overlay[0]:self.bottom_overlay[1], :] = 255
+
+    def get_play_area_bounds(self) -> tuple[int, int]:
+        top_y = self.top_overlay[1] if self.top_overlay is not None else 0
+        bot_y = self.bottom_overlay[0] if self.bottom_overlay is not None else self.src_h
+        top_y = min(self.src_h - 32, top_y + 6)
+        bot_y = max(32, bot_y - 6)
+        if bot_y <= top_y + 32:
+            top_y = 0
+            bot_y = self.src_h
+        return top_y, bot_y
+
+    def extract_top_strip(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
+        if self.top_overlay is None:
+            return None
+        y0, y1 = self.top_overlay
+        strip = frame_bgr[y0:y1]
+        return strip.copy() if strip.size else None
+
+    def extract_bottom_strip(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
+        if self.bottom_overlay is None:
+            return None
+        y0, y1 = self.bottom_overlay
+        strip = frame_bgr[y0:y1]
+        return strip.copy() if strip.size else None
 
 # ---------------------------------------------------------------------------
 # Scene change detector
 # ---------------------------------------------------------------------------
-
 class SceneChangeDetector:
     def __init__(self, hist_diff_thresh: float = 0.55, pixel_diff_thresh: float = 45.0, cooldown_frames: int = 8):
         self.hist_diff_thresh = hist_diff_thresh
@@ -255,252 +383,386 @@ class SceneChangeDetector:
         self.prev_gray: Optional[np.ndarray] = None
         self.cooldown = 0
 
-    def update(self, frame: np.ndarray) -> bool:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        hist = cv2.calcHist([gray], [0], None, [64], [0, 256])
-        hist = cv2.normalize(hist, hist).flatten()
-        if self.prev_gray is None:
-            self.prev_gray = gray.copy()
-            self.prev_hist = hist
-            return False
+    def check(self, gray: np.ndarray) -> bool:
         if self.cooldown > 0:
             self.cooldown -= 1
-        pix = float(cv2.absdiff(gray, self.prev_gray).mean())
-        hist_corr = float(cv2.compareHist(self.prev_hist.astype(np.float32), hist.astype(np.float32), cv2.HISTCMP_CORREL))
-        cut = (pix >= self.pixel_diff_thresh or hist_corr <= self.hist_diff_thresh) and self.cooldown == 0
-        if cut:
-            self.cooldown = self.cooldown_frames
-        self.prev_gray = gray.copy()
+        hist = cv2.calcHist([gray], [0], None, [64], [0, 256])
+        cv2.normalize(hist, hist)
+        is_cut = False
+        if self.prev_hist is not None and self.cooldown <= 0:
+            corr = float(cv2.compareHist(self.prev_hist, hist, cv2.HISTCMP_CORREL))
+            hist_diff = 1.0 - corr
+            mean_pixel_diff = 0.0
+            if self.prev_gray is not None:
+                mean_pixel_diff = float(np.mean(cv2.absdiff(gray, self.prev_gray)))
+            if hist_diff > self.hist_diff_thresh and mean_pixel_diff > self.pixel_diff_thresh:
+                is_cut = True
+                self.cooldown = self.cooldown_frames
         self.prev_hist = hist
-        return cut
-
+        self.prev_gray = gray.copy()
+        return is_cut
 
 # ---------------------------------------------------------------------------
-# Ball tracker (basketball / cricket / soccer tuned)
+# Ball tracker
 # ---------------------------------------------------------------------------
-
-@dataclass
-class BallObservation:
-    center: Tuple[float, float]
-    radius: float
-    confidence: float
-    source: str
-
-
 class BallTracker:
-    """Hybrid tracker: Hough + morphology + color + Kalman-style smoothing."""
+    """
+    FIX-B1: vel_alpha is now always LESS than pos_alpha (vel_alpha = pos_alpha * 0.8).
+    FIX-B3: Gate radius tightened from 0.35*src_w to 0.18*src_w.
+    FIX-B5: First accepted detection initialises conf to 0.40 instead of near-zero.
+    FIX-B6: Hough param2 raised from 15 -> 28 (sport-specific).
+    """
 
-    SPORT_HINTS = {
-        "basketball": {
-            "hsv_ranges": [((5, 80, 80), (25, 255, 255)), ((0, 0, 180), (180, 50, 255))],
-            "min_r": 4,
-            "max_r": 18,
-            "speed_gate": 170,
-        },
-        "cricket": {
-            "hsv_ranges": [((0, 0, 180), (180, 55, 255)), ((0, 60, 60), (12, 255, 255))],
-            "min_r": 2,
-            "max_r": 10,
-            "speed_gate": 240,
-        },
-        "soccer": {
-            "hsv_ranges": [((0, 0, 170), (180, 60, 255)), ((25, 40, 40), (95, 255, 255))],
-            "min_r": 4,
-            "max_r": 22,
-            "speed_gate": 220,
-        },
-        "auto": {
-            "hsv_ranges": [((0, 0, 175), (180, 65, 255)), ((5, 80, 80), (25, 255, 255)), ((25, 40, 40), (95, 255, 255))],
-            "min_r": 3,
-            "max_r": 22,
-            "speed_gate": 220,
-        },
-    }
-
-    def __init__(self, sport_profile: str = "auto", pos_alpha: float = 0.35):
-        self.sport_profile = sport_profile if sport_profile in self.SPORT_HINTS else "auto"
-        self.pos_alpha = pos_alpha
-        self.vel_alpha = pos_alpha * 0.8
-        self.center: Optional[Tuple[float, float]] = None
-        self.velocity: Tuple[float, float] = (0.0, 0.0)
-        self.radius: float = 0.0
-        self.lost_frames = 0
-        self.max_lost = 18
-        self.last_source = "none"
-        self.last_conf = 0.0
-
-    def reset(self) -> None:
-        self.center = None
-        self.velocity = (0.0, 0.0)
+    def __init__(self, src_w: int, src_h: int, sport_profile: str = "auto"):
+        self.src_w = int(src_w)
+        self.src_h = int(src_h)
+        self.sport = (sport_profile or "auto").strip().lower()
+        if self.sport not in {"basketball", "cricket", "soccer"}:
+            self.sport = "generic"
+        self.cx = src_w / 2.0
+        self.cy = src_h / 2.0
         self.radius = 0.0
-        self.lost_frames = 0
-        self.last_source = "none"
-        self.last_conf = 0.0
+        self.conf = 0.0
+        self.vx = 0.0
+        self.vy = 0.0
+        self.missing_count = 0
+        self.max_missing = 12
+        min_dim = min(src_w, src_h)
+        self.min_r = max(3, int(round(min_dim * 0.006)))
+        self.max_r = max(self.min_r + 4, int(round(min_dim * 0.038)))
+        self.gate_radius = max(self.src_w * 0.18, 40.0)
+        self._hough_param2 = {"basketball": 32, "cricket": 32, "soccer": 26}.get(self.sport, 24)
+        self._first_detection = True
 
-    def _search_window(self, frame: np.ndarray) -> Tuple[np.ndarray, int, int]:
-        h, w = frame.shape[:2]
-        if self.center is None:
-            return frame, 0, 0
-        cx, cy = self.center
-        gate = max(100, int(self.SPORT_HINTS[self.sport_profile]["speed_gate"]))
-        x1 = max(0, int(cx - gate))
-        y1 = max(0, int(cy - gate))
-        x2 = min(w, int(cx + gate))
-        y2 = min(h, int(cy + gate))
-        roi = frame[y1:y2, x1:x2]
-        return (roi if roi.size else frame), x1, y1
+    def _build_field_mask(self, hsv: np.ndarray) -> Optional[np.ndarray]:
+        if self.sport not in {"soccer", "cricket"}:
+            return None
+        lower_green = np.array([30, 30, 30], dtype=np.uint8)
+        upper_green = np.array([85, 255, 255], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower_green, upper_green)
+        kernel = np.ones((7, 7), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.dilate(mask, kernel, iterations=3)
+        return mask
 
-    def _detect_color_blob(self, frame: np.ndarray) -> Optional[BallObservation]:
-        params = self.SPORT_HINTS[self.sport_profile]
-        roi, ox, oy = self._search_window(frame)
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for lo, hi in params["hsv_ranges"]:
-            mask = cv2.bitwise_or(mask, cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8)))
-        mask = cv2.GaussianBlur(mask, (5, 5), 0)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        best = None
-        best_score = -1.0
+    def _candidates_hough(self, gray: np.ndarray) -> list[tuple[float, float, float]]:
+        blurred = cv2.GaussianBlur(gray, (7, 7), 1.5)
+        circles = cv2.HoughCircles(
+            blurred, cv2.HOUGH_GRADIENT, dp=1.2,
+            minDist=max(16, int(min(self.src_w, self.src_h) * 0.035)),
+            param1=110,
+            param2=self._hough_param2,
+            minRadius=self.min_r, maxRadius=self.max_r,
+        )
+        if circles is None:
+            return []
+        return [(float(c[0]), float(c[1]), float(c[2])) for c in circles[0][:25]]
+
+    def _candidates_contour(self, gray: np.ndarray, field_mask: Optional[np.ndarray]) -> list[tuple[float, float, float]]:
+        blurred = cv2.GaussianBlur(gray, (5, 5), 1.0)
+        edges = cv2.Canny(blurred, 50, 150)
+        if field_mask is not None:
+            edges = cv2.bitwise_and(edges, field_mask)
+        kernel = np.ones((3, 3), np.uint8)
+        edges = cv2.dilate(edges, kernel, iterations=1)
+        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        results: list[tuple[float, float, float]] = []
         for c in cnts:
             area = cv2.contourArea(c)
-            if area < 18:
-                continue
-            (x, y), r = cv2.minEnclosingCircle(c)
-            if r < params["min_r"] or r > params["max_r"]:
-                continue
-            circularity = 0.0
             peri = cv2.arcLength(c, True)
-            if peri > 0:
-                circularity = (4 * math.pi * area) / (peri * peri)
-            score = 0.55 * circularity + 0.45 * min(area / 250.0, 1.0)
-            if self.center is not None:
-                pred = (self.center[0] + self.velocity[0], self.center[1] + self.velocity[1])
-                dist = math.hypot((ox + x) - pred[0], (oy + y) - pred[1])
-                score -= min(dist / params["speed_gate"], 1.0) * 0.35
-            if score > best_score:
-                best_score = score
-                best = BallObservation((ox + x, oy + y), r, float(_clamp(score, 0.1, 0.95)), "color")
-        return best
+            if peri <= 0:
+                continue
+            circularity = 4.0 * math.pi * area / (peri * peri)
+            if circularity < 0.55:
+                continue
+            (cx, cy), r = cv2.minEnclosingCircle(c)
+            if self.min_r <= r <= self.max_r * 1.3:
+                results.append((float(cx), float(cy), float(r)))
+        results.sort(key=lambda t: abs(t[2] - (self.min_r + self.max_r) / 2.0))
+        return results[:20]
 
-    def _detect_hough(self, frame: np.ndarray) -> Optional[BallObservation]:
-        params = self.SPORT_HINTS[self.sport_profile]
-        roi, ox, oy = self._search_window(frame)
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (7, 7), 0)
-        circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1.2, 10, param1=120, param2=14,
-                                   minRadius=params["min_r"], maxRadius=params["max_r"])
-        if circles is None:
-            return None
-        circles = np.round(circles[0, :]).astype(int)
-        best = None
-        best_score = -1.0
-        for x, y, r in circles:
-            score = 0.75
-            if self.center is not None:
-                pred = (self.center[0] + self.velocity[0], self.center[1] + self.velocity[1])
-                dist = math.hypot((ox + x) - pred[0], (oy + y) - pred[1])
-                score -= min(dist / params["speed_gate"], 1.0) * 0.35
-            if score > best_score:
-                best_score = score
-                best = BallObservation((float(ox + x), float(oy + y)), float(r), float(_clamp(score, 0.1, 0.90)), "hough")
-        return best
-
-    def _merge_candidates(self, obs1: Optional[BallObservation], obs2: Optional[BallObservation]) -> Optional[BallObservation]:
-        if obs1 is None:
-            return obs2
-        if obs2 is None:
-            return obs1
-        if math.hypot(obs1.center[0] - obs2.center[0], obs1.center[1] - obs2.center[1]) <= max(12.0, obs1.radius + obs2.radius):
-            cx = (obs1.center[0] * obs1.confidence + obs2.center[0] * obs2.confidence) / max(obs1.confidence + obs2.confidence, 1e-6)
-            cy = (obs1.center[1] * obs1.confidence + obs2.center[1] * obs2.confidence) / max(obs1.confidence + obs2.confidence, 1e-6)
-            r = (obs1.radius + obs2.radius) / 2.0
-            conf = max(obs1.confidence, obs2.confidence)
-            return BallObservation((cx, cy), r, conf, "hybrid")
-        return obs1 if obs1.confidence >= obs2.confidence else obs2
-
-    def update(self, frame: np.ndarray) -> Optional[BallObservation]:
-        cand = self._merge_candidates(self._detect_hough(frame), self._detect_color_blob(frame))
-        if cand is None:
-            self.lost_frames += 1
-            if self.center is not None and self.lost_frames <= self.max_lost:
-                self.center = (self.center[0] + self.velocity[0], self.center[1] + self.velocity[1])
-                self.velocity = (self.velocity[0] * 0.9, self.velocity[1] * 0.9)
-                self.last_source = "pred"
-                self.last_conf = max(0.05, self.last_conf * 0.90)
-                return BallObservation(self.center, max(2.5, self.radius), self.last_conf, "pred")
-            self.reset()
-            return None
-
-        self.lost_frames = 0
-        if self.center is None:
-            self.center = cand.center
-            self.velocity = (0.0, 0.0)
-            self.radius = cand.radius
+    def _candidates_color_blob(self, hsv: np.ndarray, field_mask: Optional[np.ndarray]) -> list[tuple[float, float, float]]:
+        masks: list[np.ndarray] = []
+        if self.sport == "basketball":
+            masks.append(cv2.inRange(hsv, np.array([3, 80, 80]), np.array([22, 255, 255])))
+        elif self.sport == "cricket":
+            masks.append(cv2.inRange(hsv, np.array([0, 100, 60]), np.array([10, 255, 255])))
+            masks.append(cv2.inRange(hsv, np.array([165, 100, 60]), np.array([179, 255, 255])))
+            masks.append(cv2.inRange(hsv, np.array([0, 0, 180]), np.array([179, 45, 255])))
+        elif self.sport == "soccer":
+            masks.append(cv2.inRange(hsv, np.array([0, 0, 170]), np.array([179, 60, 255])))
         else:
-            vx = cand.center[0] - self.center[0]
-            vy = cand.center[1] - self.center[1]
-            self.velocity = (
-                self.velocity[0] * (1.0 - self.vel_alpha) + vx * self.vel_alpha,
-                self.velocity[1] * (1.0 - self.vel_alpha) + vy * self.vel_alpha,
-            )
-            self.center = (
-                self.center[0] * (1.0 - self.pos_alpha) + cand.center[0] * self.pos_alpha,
-                self.center[1] * (1.0 - self.pos_alpha) + cand.center[1] * self.pos_alpha,
-            )
-            self.radius = self.radius * 0.7 + cand.radius * 0.3
-        self.last_source = cand.source
-        self.last_conf = cand.confidence
-        return BallObservation(self.center, self.radius, self.last_conf, self.last_source)
+            masks.append(cv2.inRange(hsv, np.array([0, 0, 180]), np.array([179, 55, 255])))
+        combined = masks[0]
+        for m in masks[1:]:
+            combined = cv2.bitwise_or(combined, m)
+        if field_mask is not None and self.sport in {"soccer", "cricket"}:
+            combined = cv2.bitwise_and(combined, field_mask)
+        kernel = np.ones((3, 3), np.uint8)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel, iterations=1)
+        combined = cv2.dilate(combined, kernel, iterations=1)
+        cnts, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        results: list[tuple[float, float, float]] = []
+        for c in cnts:
+            area = cv2.contourArea(c)
+            peri = cv2.arcLength(c, True)
+            if peri <= 0:
+                continue
+            circularity = 4.0 * math.pi * area / (peri * peri)
+            if circularity < 0.40:
+                continue
+            (cx, cy), r = cv2.minEnclosingCircle(c)
+            if self.min_r * 0.7 <= r <= self.max_r * 1.5:
+                results.append((float(cx), float(cy), float(r)))
+        results.sort(key=lambda t: abs(t[2] - (self.min_r + self.max_r) / 2.0))
+        return results[:15]
 
+    def _score_candidate(self, cx: float, cy: float, radius: float, hsv: np.ndarray, motion_mask: Optional[np.ndarray], source: str) -> float:
+        r_int = max(3, int(radius))
+        x0 = max(0, int(cx - r_int))
+        y0 = max(0, int(cy - r_int))
+        x1 = min(self.src_w, int(cx + r_int + 1))
+        y1 = min(self.src_h, int(cy + r_int + 1))
+        patch = hsv[y0:y1, x0:x1]
+        color_score = 0.0
+        if patch.size > 0:
+            mh, ms, mv = patch.reshape(-1, 3).mean(axis=0)
+            if self.sport == "basketball":
+                if 5 <= mh <= 22 and ms >= 80 and mv >= 70:
+                    color_score = 1.0
+                elif 3 <= mh <= 28 and ms >= 50 and mv >= 50:
+                    color_score = 0.6
+            elif self.sport == "cricket":
+                white_s = 1.0 if (ms <= 45 and mv >= 170) else 0.0
+                red_s = 1.0 if ((mh <= 10 or mh >= 165) and ms >= 90 and mv >= 50) else 0.0
+                color_score = max(white_s, red_s)
+            elif self.sport == "soccer":
+                if ms <= 55 and mv >= 160:
+                    color_score = 0.9
+                elif ms <= 80 and mv >= 130:
+                    color_score = 0.5
+            else:
+                color_score = 0.3 if mv >= 150 else 0.0
+
+        motion_score = 0.0
+        if motion_mask is not None:
+            mr = max(5, int(radius * 2.0))
+            mx0 = max(0, int(cx - mr))
+            my0 = max(0, int(cy - mr))
+            mx1 = min(self.src_w, int(cx + mr + 1))
+            my1 = min(self.src_h, int(cy + mr + 1))
+            mp = motion_mask[my0:my1, mx0:mx1]
+            if mp.size > 0:
+                motion_score = float(np.count_nonzero(mp)) / float(mp.size)
+
+        pred_x = self.cx + self.vx
+        pred_y = self.cy + self.vy
+        dist = math.hypot(cx - pred_x, cy - pred_y)
+        proximity_score = max(0.0, 1.0 - dist / self.gate_radius)
+
+        expected_r = (self.min_r + self.max_r) / 2.0
+        size_dev = abs(radius - expected_r) / max(expected_r, 1.0)
+        size_score = max(0.0, 1.0 - size_dev)
+
+        source_bonus = 0.15 if source == "multi" else 0.0
+
+        if self.sport == "cricket":
+            score = 0.25 * color_score + 0.25 * motion_score + 0.25 * proximity_score + 0.15 * size_score + 0.10 * source_bonus
+        elif self.sport == "basketball":
+            score = 0.35 * color_score + 0.20 * motion_score + 0.22 * proximity_score + 0.13 * size_score + 0.10 * source_bonus
+        elif self.sport == "soccer":
+            score = 0.22 * color_score + 0.28 * motion_score + 0.28 * proximity_score + 0.12 * size_score + 0.10 * source_bonus
+        else:
+            score = 0.20 * color_score + 0.30 * motion_score + 0.30 * proximity_score + 0.10 * size_score + 0.10 * source_bonus
+        return float(score)
+
+    def update(self, frame: np.ndarray, gray: np.ndarray, motion_mask: Optional[np.ndarray], exclusion_mask: Optional[np.ndarray] = None) -> Optional[tuple[float, float, float, float]]:
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        det_gray = gray.copy()
+        if exclusion_mask is not None:
+            det_gray[exclusion_mask > 0] = 0
+        field_mask = self._build_field_mask(hsv)
+
+        raw_candidates: list[tuple[float, float, float, str]] = []
+        for cx, cy, r in self._candidates_hough(det_gray):
+            raw_candidates.append((cx, cy, r, "hough"))
+        for cx, cy, r in self._candidates_contour(det_gray, field_mask):
+            raw_candidates.append((cx, cy, r, "contour"))
+        for cx, cy, r in self._candidates_color_blob(hsv, field_mask):
+            raw_candidates.append((cx, cy, r, "color"))
+
+        if exclusion_mask is not None:
+            filtered = []
+            for cx, cy, r, src in raw_candidates:
+                ix, iy = int(round(cx)), int(round(cy))
+                if 0 <= iy < self.src_h and 0 <= ix < self.src_w and exclusion_mask[iy, ix] == 0:
+                    filtered.append((cx, cy, r, src))
+            raw_candidates = filtered
+
+        clusters: list[tuple[float, float, float, str]] = []
+        used = [False] * len(raw_candidates)
+        merge_dist = max(self.max_r * 2.5, 20.0)
+        for i, (cx1, cy1, r1, s1) in enumerate(raw_candidates):
+            if used[i]:
+                continue
+            group_cx = [cx1]
+            group_cy = [cy1]
+            group_r = [r1]
+            sources = {s1}
+            used[i] = True
+            for j in range(i + 1, len(raw_candidates)):
+                if used[j]:
+                    continue
+                cx2, cy2, r2, s2 = raw_candidates[j]
+                if math.hypot(cx1 - cx2, cy1 - cy2) < merge_dist:
+                    group_cx.append(cx2)
+                    group_cy.append(cy2)
+                    group_r.append(r2)
+                    sources.add(s2)
+                    used[j] = True
+            avg_cx = sum(group_cx) / len(group_cx)
+            avg_cy = sum(group_cy) / len(group_cy)
+            avg_r = sum(group_r) / len(group_r)
+            src_tag = "multi" if len(sources) > 1 else list(sources)[0]
+            clusters.append((avg_cx, avg_cy, avg_r, src_tag))
+
+        best: Optional[tuple[float, float, float, float]] = None
+        best_score = -1.0
+        for cx, cy, r, src in clusters:
+            score = self._score_candidate(cx, cy, r, hsv, motion_mask, src)
+            if score > best_score:
+                best_score = score
+                best = (cx, cy, r, score)
+
+        if best is None or best_score < 0.15:
+            self.missing_count += 1
+            self.conf *= 0.88
+            if self.missing_count > self.max_missing:
+                self.conf = 0.0
+            return None
+
+        cx, cy, r, score = best
+        new_vx = cx - self.cx
+        new_vy = cy - self.cy
+
+        if self.sport == "basketball":
+            pos_alpha = 0.65
+        elif self.sport == "cricket":
+            pos_alpha = 0.55
+        elif self.sport == "soccer":
+            pos_alpha = 0.60
+        else:
+            pos_alpha = 0.60
+        vel_alpha = pos_alpha * 0.75
+
+        self.vx = vel_alpha * self.vx + (1.0 - vel_alpha) * new_vx
+        self.vy = vel_alpha * self.vy + (1.0 - vel_alpha) * new_vy
+        self.cx = pos_alpha * self.cx + (1.0 - pos_alpha) * cx
+        self.cy = pos_alpha * self.cy + (1.0 - pos_alpha) * cy
+        self.radius = (0.6 * self.radius + 0.4 * r) if self.radius > 0 else r
+
+        if self._first_detection:
+            self.conf = max(0.40, min(1.0, 0.7 * 0.40 + 0.35 * score))
+            self._first_detection = False
+        else:
+            self.conf = min(1.0, 0.7 * self.conf + 0.35 * score)
+
+        self.missing_count = 0
+        return (self.cx, self.cy, self.radius, self.conf)
+
+    def reset_position(self, cx: float, cy: float) -> None:
+        self.cx = cx
+        self.cy = cy
+        self.vx = 0.0
+        self.vy = 0.0
+        self.conf *= 0.3
+        self._first_detection = True
 
 # ---------------------------------------------------------------------------
 # Panel discussion mode
 # ---------------------------------------------------------------------------
-
 @dataclass
 class _TrackedFace:
-    track_id: int
+    """
+    Temporally-smoothed face with position, size, and lifecycle metadata.
+
+    FIX-P6: tick_smooth() no longer pulls toward raw_x/raw_y on non-detection
+    frames. Instead it simply holds the current smoothed position (no EMA pull),
+    preventing the subtle backward drift seen when stride > 1.
+    """
+    face_id: int
     sx: float
     sy: float
     sw: float
     sh: float
-    age: int = 0
-    miss: int = 0
+    raw_x: float
+    raw_y: float
+    raw_w: float
+    raw_h: float
+    missing_frames: int = 0
+    active: bool = True
+    _pos_alpha: float = 0.90
+    _size_alpha: float = 0.92
+
+    def update(self, det_x: float, det_y: float, det_w: float, det_h: float) -> None:
+        self.raw_x = det_x
+        self.raw_y = det_y
+        self.raw_w = det_w
+        self.raw_h = det_h
+        a_p = self._pos_alpha
+        a_s = self._size_alpha
+        self.sx = a_p * self.sx + (1.0 - a_p) * det_x
+        self.sy = a_p * self.sy + (1.0 - a_p) * det_y
+        self.sw = a_s * self.sw + (1.0 - a_s) * det_w
+        self.sh = a_s * self.sh + (1.0 - a_s) * det_h
+        self.missing_frames = 0
+        self.active = True
+
+    def extrapolate(self) -> None:
+        """Called when face was not detected; hold position, count miss."""
+        self.missing_frames += 1
+        if self.missing_frames > 12:
+            self.active = False
+
+    def tick_smooth(self) -> None:
+        """
+        FIX-P6: On stride frames where detection is skipped, simply hold the
+        current smoothed position. Do NOT pull toward raw_ values - the raw
+        values are stale (last detection) so EMA pull would cause jitter/drift.
+        """
+        # No-op: hold smoothed position until next actual detection.
+        pass
 
 
-def _face_centre(tf: _TrackedFace) -> Tuple[float, float]:
+def _face_centre(tf: _TrackedFace) -> tuple[float, float]:
     return tf.sx, tf.sy
 
-
 def _match_faces_to_detections(
-    tracked: List[_TrackedFace],
-    detections: List[Tuple[float, float, float, float]],
+    tracked: list[_TrackedFace],
+    detections: list[tuple[float, float, float, float]],
     max_dist: float,
-) -> Tuple[Dict[int, int], List[int], List[int]]:
-    matched: Dict[int, int] = {}
+) -> tuple[dict[int, int], list[int], list[int]]:
+    matched: dict[int, int] = {}
     used_det: set[int] = set()
-    if not tracked or not detections:
-        return matched, list(range(len(tracked))), list(range(len(detections)))
+
     for ti, tf in enumerate(tracked):
-        best_j = -1
-        best_d = float("inf")
-        for dj, det in enumerate(detections):
-            if dj in used_det:
+        best_d = max_dist
+        best_di = -1
+        tx, ty = _face_centre(tf)
+        for di, (dx, dy, dw, dh) in enumerate(detections):
+            if di in used_det:
                 continue
-            dx = det[0] - tf.sx
-            dy = det[1] - tf.sy
-            d = math.hypot(dx, dy)
+            d = math.hypot(tx - (dx + dw / 2.0), ty - (dy + dh / 2.0))
             if d < best_d:
                 best_d = d
-                best_j = dj
-        if best_j >= 0 and best_d <= max_dist:
-            matched[ti] = best_j
-            used_det.add(best_j)
-    unmatched_tracks = [i for i in range(len(tracked)) if i not in matched]
-    unmatched_dets = [i for i in range(len(detections)) if i not in used_det]
-    return matched, unmatched_tracks, unmatched_dets
+                best_di = di
+        if best_di >= 0:
+            matched[ti] = best_di
+            used_det.add(best_di)
 
+    unmatched_tracked = [ti for ti in range(len(tracked)) if ti not in matched]
+    unmatched_det = [di for di in range(len(detections)) if di not in used_det]
+    return matched, unmatched_tracked, unmatched_det
 
 @dataclass
 class _PanelCell:
@@ -509,202 +771,541 @@ class _PanelCell:
     dst_w: int
     dst_h: int
 
-
-def _compute_panel_layout(n: int, canvas_w: int, canvas_h: int, gap: int = 4) -> List[_PanelCell]:
+def _compute_panel_layout(
+    n: int,
+    canvas_w: int,
+    canvas_h: int,
+    gap: int = 4,
+) -> list[_PanelCell]:
     n = max(1, min(n, 4))
-    cells: List[_PanelCell] = []
+    cells: list[_PanelCell] = []
     if n == 1:
         cells.append(_PanelCell(0, 0, canvas_w, canvas_h))
-    elif n == 2:
-        h1 = canvas_h // 2
-        cells += [_PanelCell(0, 0, canvas_w, h1 - gap // 2), _PanelCell(0, h1 + gap // 2, canvas_w, canvas_h - h1 - gap // 2)]
-    elif n == 3:
-        top_h = int(canvas_h * 0.40)
-        bottom_h = canvas_h - top_h - gap
-        half_w = canvas_w // 2
-        cells += [
-            _PanelCell(0, 0, canvas_w, top_h),
-            _PanelCell(0, top_h + gap, half_w - gap // 2, bottom_h),
-            _PanelCell(half_w + gap // 2, top_h + gap, canvas_w - half_w - gap // 2, bottom_h),
-        ]
-    else:
-        half_w = canvas_w // 2
-        half_h = canvas_h // 2
-        cells += [
-            _PanelCell(0, 0, half_w - gap // 2, half_h - gap // 2),
-            _PanelCell(half_w + gap // 2, 0, canvas_w - half_w - gap // 2, half_h - gap // 2),
-            _PanelCell(0, half_h + gap // 2, half_w - gap // 2, canvas_h - half_h - gap // 2),
-            _PanelCell(half_w + gap // 2, half_h + gap // 2, canvas_w - half_w - gap // 2, canvas_h - half_h - gap // 2),
-        ]
-    return cells
 
+    elif n == 2:
+        row_h = (canvas_h - gap) // 2
+        cells.append(_PanelCell(0, 0, canvas_w, row_h))
+        cells.append(_PanelCell(0, row_h + gap, canvas_w, canvas_h - row_h - gap))
+
+    elif n == 3:
+        top_h = (canvas_h - gap) // 2
+        bot_h = canvas_h - top_h - gap
+        col_w = (canvas_w - gap) // 2
+        cells.append(_PanelCell(0, 0, canvas_w, top_h))
+        cells.append(_PanelCell(0, top_h + gap, col_w, bot_h))
+        cells.append(_PanelCell(col_w + gap, top_h + gap, canvas_w - col_w - gap, bot_h))
+
+    else:  # 4
+        row_h = (canvas_h - gap) // 2
+        col_w = (canvas_w - gap) // 2
+        cells.append(_PanelCell(0,          0,          col_w,                   row_h))
+        cells.append(_PanelCell(col_w + gap, 0,          canvas_w - col_w - gap,  row_h))
+        cells.append(_PanelCell(0,          row_h + gap, col_w,                   canvas_h - row_h - gap))
+        cells.append(_PanelCell(col_w + gap, row_h + gap, canvas_w - col_w - gap,  canvas_h - row_h - gap))
+
+    return cells
 
 class PanelTracker:
     """
-    Stable face-based panel renderer.
-    Uses MediaPipe if available. Falls back to Haar.
+    FIX-P1: render() now always copies the canvas before storing as _prev_output.
+            Previously _prev_output aliased _canvas_buffer so blend was self*self=garbage.
 
-    FIX-P1: render() always copies the blended canvas before storing _prev_output.
+    FIX-P4: _candidate_hold logic fixed - count is reset to 0 whenever current_n
+            changes (not just when it differs from _active_count), so the hold
+            window always measures a stable contiguous run.
+
+    FIX-P5: render() now explicitly slices active_faces to [:n] before the cell
+            loop so face index and cell index always align.
+
+    FIX-C3: render() always returns a .copy() of its output so that callers
+            (including the realtime delay deque) hold independent frame data.
     """
+    def __init__(
+        self,
+        src_w: int,
+        src_h: int,
+        max_faces: int = 4,
+        max_missing_frames: int = 24,
+        layout_hold_frames: int = 15,
+        blend_frames: int = 10,
+        min_face_area_ratio: float = 0.0012,
+        pos_alpha: float = 0.90,
+        size_alpha: float = 0.92,
+    ):
+        self.src_w = src_w
+        self.src_h = src_h
+        self.max_faces = max_faces
+        self.max_missing_frames = max_missing_frames
+        self.layout_hold_frames = layout_hold_frames
+        self.blend_frames = blend_frames
+        self.min_face_area = min_face_area_ratio * src_w * src_h
+        self.pos_alpha = pos_alpha
+        self.size_alpha = size_alpha
 
-    def __init__(self, max_faces: int = 4, detection_stride: int = 3, gap: int = 4):
-        self.max_faces = max(1, min(max_faces, 4))
-        self.detection_stride = max(1, detection_stride)
-        self.gap = max(0, gap)
-        self.frame_idx = 0
-        self.tracks: List[_TrackedFace] = []
-        self.next_id = 0
+        self._tracked: list[_TrackedFace] = []
+        self._next_id: int = 0
+        self._active_count: int = 0
+        self._candidate_count: int = 0
+        self._candidate_hold: int = 0
+        self._blend_remaining: int = 0
         self._prev_output: Optional[np.ndarray] = None
+        self._match_dist: float = max(src_w, src_h) * 0.18
         self._canvas_buffer: Optional[np.ndarray] = None
-        self._haar = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-        self._mp_detector = None
-        if MEDIAPIPE_AVAILABLE:
-            try:
-                self._mp_detector = mp.solutions.face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.45)
-            except Exception:
-                self._mp_detector = None
 
-    def _detect_faces(self, frame: np.ndarray) -> List[Tuple[float, float, float, float]]:
-        h, w = frame.shape[:2]
-        detections: List[Tuple[float, float, float, float]] = []
-        if self._mp_detector is not None:
-            try:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                res = self._mp_detector.process(rgb)
-                if res.detections:
-                    for det in res.detections[: self.max_faces * 2]:
-                        box = det.location_data.relative_bounding_box
-                        x = _clamp(box.xmin * w, 0, w - 1)
-                        y = _clamp(box.ymin * h, 0, h - 1)
-                        bw = _clamp(box.width * w, 1, w)
-                        bh = _clamp(box.height * h, 1, h)
-                        detections.append((float(x + bw / 2.0), float(y + bh / 2.0), float(bw), float(bh)))
-            except Exception:
-                detections = []
-        if not detections:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            raw = self._haar.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=5,
-                                              minSize=(max(28, w // 20), max(28, h // 20)))
-            for (x, y, bw, bh) in raw[: self.max_faces * 2]:
-                detections.append((float(x + bw / 2.0), float(y + bh / 2.0), float(bw), float(bh)))
-        detections.sort(key=lambda d: d[2] * d[3], reverse=True)
-        return detections[: self.max_faces]
-
-    def update(self, frame: np.ndarray) -> List[_TrackedFace]:
-        self.frame_idx += 1
-        detections: List[Tuple[float, float, float, float]]
-        if self.frame_idx % self.detection_stride == 1 or not self.tracks:
-            detections = self._detect_faces(frame)
-        else:
-            detections = []
-
-        max_dist = max(frame.shape[1], frame.shape[0]) * 0.15
-        matched, unmatched_tracks, unmatched_dets = _match_faces_to_detections(self.tracks, detections, max_dist)
-
-        for ti, dj in matched.items():
-            tf = self.tracks[ti]
-            cx, cy, bw, bh = detections[dj]
-            tf.sx = tf.sx * 0.78 + cx * 0.22
-            tf.sy = tf.sy * 0.78 + cy * 0.22
-            tf.sw = tf.sw * 0.75 + bw * 0.25
-            tf.sh = tf.sh * 0.75 + bh * 0.25
-            tf.age += 1
-            tf.miss = 0
-
-        for ti in unmatched_tracks:
-            self.tracks[ti].miss += 1
-            self.tracks[ti].age += 1
-
-        for dj in unmatched_dets:
-            cx, cy, bw, bh = detections[dj]
-            self.tracks.append(_TrackedFace(self.next_id, cx, cy, bw, bh, age=1, miss=0))
-            self.next_id += 1
-
-        self.tracks = [t for t in self.tracks if t.miss <= max(6, self.detection_stride * 3)]
-        self.tracks.sort(key=lambda t: (t.sx, -t.sw * t.sh))
-        return self.tracks[: self.max_faces]
+        self.face_detector: Optional[cv2.CascadeClassifier] = None
+        self.profile_detector: Optional[cv2.CascadeClassifier] = None
+        try:
+            self.face_detector = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            )
+        except Exception:
+            pass
+        try:
+            self.profile_detector = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_profileface.xml"
+            )
+        except Exception:
+            pass
+        self.use_mediapipe = True
+        self._mp_face = None
+        self._mp_available = False
+        self.detector_backend_name = "haar"
+        try:
+            import mediapipe as mp
+            self._mp = mp
+            self._mp_face = mp.solutions.face_detection.FaceDetection(
+                model_selection=0,
+                min_detection_confidence=0.60,
+            )
+            self._mp_available = True
+            self.detector_backend_name = "mediapipe"
+        except Exception:
+            self._mp = None
+            self._mp_face = None
+            self._mp_available = False
+            self.detector_backend_name = "haar"
 
     @staticmethod
-    def _crop_for_face(frame: np.ndarray, tf: _TrackedFace, out_w: int, out_h: int, top_overlay_ratio: float, bottom_overlay_ratio: float) -> np.ndarray:
-        h, w = frame.shape[:2]
-        face_h = max(32.0, tf.sh)
-        crop_h = min(float(h), face_h * 3.0)
-        crop_w = min(float(w), crop_h * out_w / max(out_h, 1))
-        cx = tf.sx
-        # bias upward so faces sit above center and score ticker remains visible when bottom overlay present
-        cy = tf.sy + crop_h * 0.08
-        x1 = int(_clamp(cx - crop_w / 2, 0, max(0, w - crop_w)))
-        y1 = int(_clamp(cy - crop_h / 2, top_overlay_ratio * h, max(top_overlay_ratio * h, h - bottom_overlay_ratio * h - crop_h)))
-        x2 = int(min(w, x1 + crop_w))
-        y2 = int(min(h, y1 + crop_h))
-        crop = frame[y1:y2, x1:x2]
-        if crop.size == 0:
-            crop = frame
-        return cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+    def _nms_faces(faces: list[tuple[int, int, int, int]], iou_thresh: float = 0.4) -> list[tuple[int, int, int, int]]:
+        if len(faces) <= 1:
+            return faces
+        boxes = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+        keep: list[tuple[int, int, int, int]] = []
+        used = [False] * len(boxes)
+        for i in range(len(boxes)):
+            if used[i]:
+                continue
+            keep.append(boxes[i])
+            used[i] = True
+            x1, y1, w1, h1 = boxes[i]
+            for j in range(i + 1, len(boxes)):
+                if used[j]:
+                    continue
+                x2, y2, w2, h2 = boxes[j]
+                ix0 = max(x1, x2)
+                iy0 = max(y1, y2)
+                ix1 = min(x1 + w1, x2 + w2)
+                iy1 = min(y1 + h1, y2 + h2)
+                inter = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+                union = w1 * h1 + w2 * h2 - inter
+                if union > 0 and inter / union > iou_thresh:
+                    used[j] = True
+        return keep
 
-    def render(self, frame: np.ndarray, target_w: int, target_h: int, top_overlay_ratio: float = 0.0, bottom_overlay_ratio: float = 0.0) -> np.ndarray:
-        tracks = self.update(frame)
-        n = max(1, min(len(tracks), self.max_faces))
-        cells = _compute_panel_layout(n, target_w, target_h, self.gap)
-        canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-        if not tracks:
-            canvas[:] = _resize_cover(frame, target_w, target_h)
+    def detect_faces(self, frame: np.ndarray, gray: np.ndarray) -> list[tuple[int, int, int, int]]:
+        if self.use_mediapipe and self._mp_available and self._mp_face is not None:
+            try:
+                h, w = frame.shape[:2]
+                det_scale = 1.0
+                if w > 960:
+                    det_scale = 960.0 / w
+                if det_scale < 1.0:
+                    small = cv2.resize(frame, (int(round(w * det_scale)), int(round(h * det_scale))), interpolation=cv2.INTER_AREA)
+                else:
+                    small = frame
+                rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                res = self._mp_face.process(rgb)
+                mp_faces: list[tuple[int, int, int, int]] = []
+                sh, sw = small.shape[:2]
+                inv = 1.0 / det_scale
+                if res and res.detections:
+                    for det in res.detections:
+                        score = float(det.score[0]) if getattr(det, 'score', None) else 0.0
+                        if score < 0.60:
+                            continue
+                        rb = det.location_data.relative_bounding_box
+                        x = int(round(rb.xmin * sw * inv))
+                        y = int(round(rb.ymin * sh * inv))
+                        ww = int(round(rb.width * sw * inv))
+                        hh = int(round(rb.height * sh * inv))
+                        if ww <= 0 or hh <= 0:
+                            continue
+                        x = max(0, min(x, w - 1))
+                        y = max(0, min(y, h - 1))
+                        ww = min(ww, w - x)
+                        hh = min(hh, h - y)
+                        if ww < 48 or hh < 48:
+                            continue
+                        ar = ww / max(hh, 1)
+                        if 0.60 <= ar <= 1.60:
+                            mp_faces.append((x, y, ww, hh))
+                if mp_faces:
+                    self.detector_backend_name = "mediapipe"
+                    return self._nms_faces(mp_faces, iou_thresh=0.35)
+            except Exception:
+                pass
+
+        det_scale = 0.5
+        small_gray = cv2.resize(gray, None, fx=det_scale, fy=det_scale, interpolation=cv2.INTER_AREA)
+        inv = 1.0 / det_scale
+        min_sz = (24, 24)
+        faces: list[tuple[int, int, int, int]] = []
+        if self.face_detector is not None:
+            try:
+                detected = self.face_detector.detectMultiScale(
+                    small_gray, scaleFactor=1.10, minNeighbors=5, minSize=min_sz
+                )
+                if len(detected):
+                    faces.extend([(int(x * inv), int(y * inv), int(w * inv), int(h * inv)) for (x, y, w, h) in detected])
+            except Exception:
+                pass
+        if self.profile_detector is not None:
+            try:
+                detected = self.profile_detector.detectMultiScale(
+                    small_gray, scaleFactor=1.10, minNeighbors=5, minSize=min_sz
+                )
+                if len(detected):
+                    faces.extend([(int(x * inv), int(y * inv), int(w * inv), int(h * inv)) for (x, y, w, h) in detected])
+            except Exception:
+                pass
+        filtered: list[tuple[int, int, int, int]] = []
+        for (x, y, w, h) in faces:
+            ar = w / max(h, 1)
+            if 0.65 <= ar <= 1.50:
+                filtered.append((x, y, w, h))
+        self.detector_backend_name = "haar"
+        return self._nms_faces(filtered, iou_thresh=0.4)
+
+    def update_detections(
+        self,
+        raw_faces: list[tuple[int, int, int, int]],
+    ) -> None:
+        faces: list[tuple[float, float, float, float]] = [
+            (float(x), float(y), float(w), float(h))
+            for (x, y, w, h) in raw_faces
+            if w * h >= self.min_face_area
+        ]
+        if len(faces) > self.max_faces:
+            faces.sort(key=lambda f: f[2] * f[3], reverse=True)
+            faces = faces[:self.max_faces]
+
+        matched, unmatched_t, unmatched_d = _match_faces_to_detections(
+            self._tracked, faces, self._match_dist
+        )
+
+        for ti, di in matched.items():
+            dx, dy, dw, dh = faces[di]
+            self._tracked[ti].update(dx + dw / 2.0, dy + dh / 2.0, dw, dh)
+
+        for ti in unmatched_t:
+            self._tracked[ti].extrapolate()
+
+        for di in unmatched_d:
+            dx, dy, dw, dh = faces[di]
+            cx, cy = dx + dw / 2.0, dy + dh / 2.0
+            tf = _TrackedFace(
+                face_id=self._next_id,
+                sx=cx, sy=cy, sw=dw, sh=dh,
+                raw_x=cx, raw_y=cy, raw_w=dw, raw_h=dh,
+                _pos_alpha=self.pos_alpha,
+                _size_alpha=self.size_alpha,
+            )
+            self._next_id += 1
+            self._tracked.append(tf)
+
+        max_tracked = self.max_faces * 3
+        if len(self._tracked) > max_tracked:
+            self._tracked.sort(
+                key=lambda tf: (tf.active, -tf.missing_frames), reverse=True
+            )
+            self._tracked = self._tracked[:self.max_faces * 2]
+
+        self._tracked = [
+            tf for tf in self._tracked
+            if tf.missing_frames <= self.max_missing_frames
+        ]
+
+        visible = [tf for tf in self._tracked if tf.active]
+        current_n = max(1, min(len(visible), self.max_faces))
+
+        # FIX-P4: Reset hold counter whenever count changes
+        if current_n != self._candidate_count:
+            self._candidate_count = current_n
+            self._candidate_hold = 0
         else:
-            for tf, cell in zip(tracks[:n], cells):
-                strip = self._crop_for_face(frame, tf, cell.dst_w, cell.dst_h, top_overlay_ratio, bottom_overlay_ratio)
-                canvas[cell.dst_y:cell.dst_y + cell.dst_h, cell.dst_x:cell.dst_x + cell.dst_w] = strip
-        if self._prev_output is not None and self._prev_output.shape == canvas.shape:
-            canvas = cv2.addWeighted(canvas, 0.82, self._prev_output, 0.18, 0)
-        # FIX-P1: store an independent copy
-        self._prev_output = canvas.copy()
-        return canvas
+            self._candidate_hold += 1
 
+        if self._candidate_hold >= self.layout_hold_frames:
+            if current_n != self._active_count:
+                self._active_count = current_n
+                self._blend_remaining = self.blend_frames
+
+    def tick_extrapolation(self) -> None:
+        for tf in self._tracked:
+            tf.tick_smooth()
+
+    def render(
+        self,
+        source_frame: np.ndarray,
+        canvas_w: int,
+        canvas_h: int,
+        gap: int = 4,
+    ) -> np.ndarray:
+        """
+        FIX-P1: _prev_output is always set to a copy of the canvas.
+        FIX-P5: active_faces is explicitly sliced to [:n].
+        FIX-C3: Returns a .copy() so callers hold independent frame data.
+        """
+        if self._active_count == 0:
+            self._active_count = 1
+
+        all_active = sorted(
+            [tf for tf in self._tracked if tf.active],
+            key=lambda tf: tf.sx,
+        )
+
+        if len(all_active) == 0:
+            fallback_frame = _resize_cover(source_frame, canvas_w, canvas_h)
+            if self._blend_remaining > 0 and self._prev_output is not None:
+                prev = self._prev_output
+                if prev.shape[:2] == fallback_frame.shape[:2]:
+                    alpha = self._blend_remaining / max(self.blend_frames, 1)
+                    fallback_frame = cv2.addWeighted(prev, alpha, fallback_frame, 1.0 - alpha, 0)
+                self._blend_remaining -= 1
+            self._prev_output = fallback_frame.copy()
+            return fallback_frame.copy()
+
+        n = min(self._active_count, max(1, len(all_active)))
+        cells = _compute_panel_layout(n, canvas_w, canvas_h, gap=gap)
+
+        # FIX-P5: slice faces to exactly n entries
+        active_faces = all_active[:n]
+
+        if self._canvas_buffer is None or self._canvas_buffer.shape != (canvas_h, canvas_w, 3):
+            self._canvas_buffer = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+        else:
+            self._canvas_buffer[:] = 0
+        canvas = self._canvas_buffer
+
+        face_sizes = [f.sw * f.sh for f in active_faces]
+        avg_size = sum(face_sizes) / max(len(face_sizes), 1)
+
+        for idx, cell in enumerate(cells):
+            if idx < len(active_faces):
+                face = active_faces[idx]
+                size_ratio = math.sqrt((face.sw * face.sh) / max(avg_size, 1.0))
+                zoom_factor = _clamp(1.0 / max(size_ratio, 0.5), 0.7, 1.4)
+                crop = self._crop_person(source_frame, face, cell.dst_w, cell.dst_h, zoom_factor)
+            else:
+                canvas[
+                    cell.dst_y : cell.dst_y + cell.dst_h,
+                    cell.dst_x: cell.dst_x + cell.dst_w,
+                ] = 0
+                continue
+
+            rendered = _resize_cover(crop, cell.dst_w, cell.dst_h)
+            canvas[
+                cell.dst_y: cell.dst_y + cell.dst_h,
+                cell.dst_x: cell.dst_x + cell.dst_w,
+            ] = rendered
+
+        self._draw_dividers(canvas, cells, gap)
+
+        # FIX-P1: take an explicit copy of canvas BEFORE blending
+        canvas_copy = canvas.copy()
+
+        output: np.ndarray
+        if self._blend_remaining > 0 and self._prev_output is not None:
+            prev = self._prev_output
+            if prev.shape[:2] == canvas_copy.shape[:2]:
+                alpha = self._blend_remaining / max(self.blend_frames, 1)
+                output = cv2.addWeighted(prev, alpha, canvas_copy, 1.0 - alpha, 0)
+            else:
+                output = canvas_copy
+            self._blend_remaining -= 1
+        else:
+            output = canvas_copy
+
+        # FIX-P1 + FIX-C3: store copy; return copy
+        self._prev_output = output.copy()
+        return output.copy()
+
+    def _crop_person(
+        self, frame: np.ndarray, face: _TrackedFace,
+        cell_w: int = 0, cell_h: int = 0,
+        zoom_factor: float = 1.0,
+    ) -> np.ndarray:
+        fh, fw = frame.shape[:2]
+        cx, cy = face.sx, face.sy
+        fw_f, fh_f = face.sw, face.sh
+
+        cell_ar = (cell_w / max(cell_h, 1)) if cell_w > 0 and cell_h > 0 else 9.0 / 16.0
+
+        base_crop_w = fw_f * 3.0 * zoom_factor
+        min_crop_w = fw_f * 2.5
+        crop_w = max(base_crop_w, min_crop_w)
+        crop_h = crop_w / max(cell_ar, 0.01)
+
+        crop_w = min(crop_w, fw * 0.95)
+        crop_h = min(crop_h, fh * 0.95)
+        if crop_w / max(crop_h, 1) > cell_ar:
+            crop_w = crop_h * cell_ar
+        else:
+            crop_h = crop_w / max(cell_ar, 0.01)
+
+        cy_shifted = cy - fh_f * 0.35
+        x0 = int(round(cx - crop_w / 2.0))
+        y0 = int(round(cy_shifted - crop_h * 0.42))
+        x1 = int(round(x0 + crop_w))
+        y1 = int(round(y0 + crop_h))
+
+        if x0 < 0:
+            x1 -= x0; x0 = 0
+        if y0 < 0:
+            y1 -= y0; y0 = 0
+        if x1 > fw:
+            x0 -= (x1 - fw); x1 = fw
+        if y1 > fh:
+            y0 -= (y1 - fh); y1 = fh
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+
+        actual_w = x1 - x0
+        actual_h = y1 - y0
+        if actual_w > 0 and actual_h > 0:
+            actual_ar = actual_w / actual_h
+            if actual_ar > cell_ar * 1.02:
+                trim = int((actual_w - actual_h * cell_ar) / 2)
+                trim = max(0, min(trim, (actual_w // 2) - 5))
+                x0 += trim; x1 -= trim
+            elif actual_ar < cell_ar * 0.98:
+                trim = int((actual_h - actual_w / cell_ar) / 2)
+                trim = max(0, min(trim, (actual_h // 2) - 5))
+                y0 += trim; y1 -= trim
+
+        x0 = max(0, min(x0, fw - 1))
+        y0 = max(0, min(y0, fh - 1))
+        x1 = max(x0 + 1, min(x1, fw))
+        y1 = max(y0 + 1, min(y1, fh))
+
+        if x1 <= x0 or y1 <= y0:
+            c_w = int(fw * 0.45)
+            c_h = int(c_w / max(cell_ar, 0.01))
+            c_h = min(c_h, fh)
+            c_w = int(c_h * cell_ar)
+            c_x0 = max(0, int(cx - c_w / 2))
+            c_y0 = max(0, int(cy - c_h / 2))
+            c_x0 = min(c_x0, max(0, fw - c_w))
+            c_y0 = min(c_y0, max(0, fh - c_h))
+            return frame[c_y0:c_y0 + c_h, c_x0:c_x0 + c_w]
+
+        return frame[y0:y1, x0:x1]
+
+    @staticmethod
+    def _draw_dividers(canvas: np.ndarray, cells: list[_PanelCell], gap: int) -> None:
+        if gap < 2:
+            return
+        h, w = canvas.shape[:2]
+        xs: set[int] = set()
+        ys: set[int] = set()
+        for c in cells:
+            if c.dst_x > 0:
+                xs.add(c.dst_x)
+            if c.dst_y > 0:
+                ys.add(c.dst_y)
+        color = (8, 8, 8)
+        for x in xs:
+            x0 = max(0, x - gap // 2)
+            x1 = min(w, x0 + gap)
+            canvas[:, x0:x1] = color
+        for y in ys:
+            y0 = max(0, y - gap // 2)
+            y1 = min(h, y0 + gap)
+            canvas[y0:y1, :] = color
+
+    @property
+    def active_count(self) -> int:
+        return max(1, self._active_count)
+
+    @property
+    def tracked_faces(self) -> list[_TrackedFace]:
+        return list(self._tracked)
 
 # ---------------------------------------------------------------------------
-# Auto mode detection
+# Auto mode detection                                              ← NEW
 # ---------------------------------------------------------------------------
-
 class AutoModeDetector:
-    def __init__(self, min_faces: int = AUTO_MODE_PANEL_MIN_FACES, threshold_ratio: float = AUTO_MODE_PANEL_RATIO):
+    """
+    Samples frames during the first N seconds and infers whether the content
+    is a panel discussion (>=2 persistent faces spread across the frame) or
+    a sports / single-subject broadcast.
+
+    Usage:
+        detector = AutoModeDetector()
+        for frame in first_45_frames:
+            detector.feed(frame)
+        mode = detector.result()   # "panel" | "sports" | "single"
+    """
+
+    def __init__(self, probe_frames: int = 45, min_faces: int = 2, panel_ratio: float = 0.55):
+        self.probe_frames = max(8, probe_frames)
         self.min_faces = min_faces
-        self.threshold_ratio = threshold_ratio
-        self.face_detector = PanelTracker(max_faces=4, detection_stride=1)
+        self.panel_ratio = panel_ratio
+        self._face_det = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        self._panel_hits = 0
+        self._fed = 0
 
-    def infer_mode(self, frames: Sequence[np.ndarray], ball_tracker: Optional[BallTracker] = None) -> str:
-        if not frames:
+    def feed(self, frame: np.ndarray) -> None:
+        if self._fed >= self.probe_frames:
+            return
+        self._fed += 1
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+        faces = self._face_det.detectMultiScale(small, scaleFactor=1.12, minNeighbors=4, minSize=(20, 20))
+        if len(faces) >= self.min_faces:
+            xs = [int(x) for (x, _, _, _) in faces]
+            spread = (max(xs) - min(xs)) / max(small.shape[1], 1)
+            if spread > 0.30:
+                self._panel_hits += 1
+
+    def ready(self) -> bool:
+        return self._fed >= self.probe_frames
+
+    def result(self) -> str:
+        if self._fed == 0:
             return "single"
-        panel_hits = 0
-        sport_hits = 0
-        for frame in frames:
-            faces = self.face_detector._detect_faces(frame)
-            if len(faces) >= self.min_faces:
-                xs = [f[0] for f in faces]
-                spread = (max(xs) - min(xs)) / max(frame.shape[1], 1)
-                if spread > 0.35:
-                    panel_hits += 1
-            if ball_tracker is not None:
-                obs = ball_tracker.update(frame)
-                if obs is not None and obs.confidence >= 0.35:
-                    sport_hits += 1
-        panel_ratio = panel_hits / max(len(frames), 1)
-        sport_ratio = sport_hits / max(len(frames), 1)
-        if panel_ratio >= self.threshold_ratio:
+        ratio = self._panel_hits / max(self._fed, 1)
+        if ratio >= self.panel_ratio:
             return "panel"
-        if sport_ratio >= 0.25:
-            return "sports"
         return "single"
-
 
 # ---------------------------------------------------------------------------
 # Smooth reframer
 # ---------------------------------------------------------------------------
-
 class SmoothReframer:
     """
-    Main realtime reframer.
+    FIX-P2: Panel mode now calls overlay_detector.update() every frame (not on
+            stride), matching the behaviour of single-crop mode. Overlay stride
+            is kept for the panel-specific face detection only.
 
-    FIX-P2: panel mode calls overlay_detector.update() every frame and only
-    throttles face detection inside PanelTracker.
+    FIX-B7: Motion contribution to camera target is now a single weighted term
+            instead of two overlapping terms. When ball tracking is active the
+            motion weight is further reduced to avoid crowd/ad interference.
+
+    FIX-C2: _process_panel() returns a .copy() of the output buffer (delegated
+            to PanelTracker.render() which now always returns a copy - FIX-C3).
     """
 
     def __init__(
@@ -719,157 +1320,398 @@ class SmoothReframer:
         max_pan_ratio: float = 0.012,
         sport_profile: str = "auto",
         ball_tracking: bool = True,
+        ball_weight: float = 0.55,
+        context_bias: float = 0.20,
         overlay_composite: bool = True,
         preserve_bottom_overlay: bool = False,
         panel_mode: bool = False,
         panel_max_faces: int = 4,
-        panel_detection_stride: int = 3,
+        panel_detection_stride: int = 2,
         panel_gap: int = 4,
-        auto_mode: bool = False,
+        panel_max_missing_frames: int = 24,
+        panel_layout_hold_frames: int = 15,
+        panel_blend_frames: int = 10,
+        panel_min_face_area_ratio: float = 0.0012,
+        panel_pos_alpha: float = 0.90,
+        panel_size_alpha: float = 0.92,
+        overlay_stride: int = 2,
+        auto_mode: bool = False,                                    # ← NEW
     ):
-        self.src_w = src_w
-        self.src_h = src_h
-        self.target_w = target_w
-        self.target_h = target_h
-        self.smooth_strength = _clamp(smooth_strength, 0.75, 0.995)
-        self.analysis_stride = max(1, analysis_stride)
-        self.deadzone_ratio = _clamp(deadzone_ratio, 0.0, 0.25)
-        self.max_pan_ratio = _clamp(max_pan_ratio, 0.002, 0.05)
-        self.sport_profile = sport_profile
-        self.ball_tracking = ball_tracking
-        self.overlay_composite = overlay_composite
-        self.preserve_bottom_overlay = preserve_bottom_overlay
-        self.panel_mode = panel_mode
-        self.auto_mode = auto_mode
-        self.current_mode = "panel" if panel_mode else ("sports" if ball_tracking else "single")
+        self.src_w = int(src_w)
+        self.src_h = int(src_h)
+        self.target_w = int(target_w)
+        self.target_h = int(target_h)
         self.crop_w, self.crop_h = _vertical_crop_box(src_w, src_h)
-        self.cx = src_w / 2.0
-        self.cy = src_h / 2.0
-        self.frame_idx = 0
-        self.overlay_detector = OverlayDetector()
+        self.max_x = max(0, src_w - self.crop_w)
+        self.max_y = max(0, src_h - self.crop_h)
+        self.smooth_strength = float(smooth_strength)
+        self.analysis_stride = max(1, int(analysis_stride))
+        self.deadzone_px = max(8.0, self.crop_w * deadzone_ratio)
+        self.max_pan_px = max(2.0, self.crop_w * max_pan_ratio)
+        self.ball_weight = float(ball_weight)
+        self.context_bias = float(context_bias)
+        self.overlay_composite = bool(overlay_composite)
+        self.preserve_bottom_overlay = bool(preserve_bottom_overlay)
+        self.sport_profile = (sport_profile or "auto").strip().lower()
+
+        self.panel_mode = bool(panel_mode)
+        self.panel_gap = int(panel_gap)
+        self.panel_detection_stride = max(1, int(panel_detection_stride))
+        self.overlay_stride = max(1, int(overlay_stride))
+
+        # ← NEW: auto mode detection
+        self.auto_mode = bool(auto_mode)
+        self._auto_detector: Optional[AutoModeDetector] = AutoModeDetector() if auto_mode else None
+        self._auto_decided = False
+
+        self.face_detector = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        self.saliency = None
+        try:
+            if hasattr(cv2, "saliency"):
+                self.saliency = cv2.saliency.StaticSaliencySpectralResidual_create()
+        except Exception:
+            self.saliency = None
+
+        self.overlay_detector = OverlayDetector(src_w, src_h)
         self.scene_detector = SceneChangeDetector()
-        self.ball_tracker = BallTracker(sport_profile=sport_profile) if ball_tracking else None
-        self.panel_tracker = PanelTracker(max_faces=panel_max_faces, detection_stride=panel_detection_stride, gap=panel_gap)
-        self.auto_detector = AutoModeDetector() if auto_mode else None
-        self._mode_probe: Deque[np.ndarray] = collections.deque(maxlen=AUTO_MODE_PROBE_FRAMES)
-        self.stats = {
-            "mode": self.current_mode,
-            "ball_confidence": 0.0,
-            "panel_faces": 0,
-            "top_overlay_ratio": 0.0,
-            "bottom_overlay_ratio": 0.0,
-            "scene_cuts": 0,
-        }
 
-    def _safe_center(self, cx: float, cy: float, top_overlay_ratio: float, bottom_overlay_ratio: float) -> Tuple[float, float]:
-        hw = self.crop_w / 2.0
-        hh = self.crop_h / 2.0
-        min_x = hw
-        max_x = self.src_w - hw
-        min_y = max(hh, top_overlay_ratio * self.src_h + hh * 0.3)
-        max_y = min(self.src_h - hh, self.src_h - bottom_overlay_ratio * self.src_h - hh * 0.65)
-        if max_y < min_y:
-            max_y = min_y
-        return (_clamp(cx, min_x, max_x), _clamp(cy, min_y, max_y))
-
-    def _update_mode(self, frame: np.ndarray) -> None:
-        if not self.auto_mode or self.auto_detector is None:
-            self.stats["mode"] = self.current_mode
-            return
-        if self.frame_idx % max(8, self.analysis_stride) == 1:
-            self._mode_probe.append(cv2.resize(frame, (min(640, frame.shape[1]), int(frame.shape[0] * min(640, frame.shape[1]) / max(frame.shape[1],1))), interpolation=cv2.INTER_AREA))
-        if len(self._mode_probe) >= min(12, self._mode_probe.maxlen) and self.frame_idx % 15 == 0:
-            frames = list(self._mode_probe)[-12:]
-            mode = self.auto_detector.infer_mode(frames, self.ball_tracker if self.ball_tracking else None)
-            self.current_mode = mode
-        self.stats["mode"] = self.current_mode
-
-    def _subject_center_from_saliency(self, frame: np.ndarray, top_overlay_ratio: float, bottom_overlay_ratio: float) -> Tuple[float, float]:
-        h, w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        lap = np.abs(cv2.Laplacian(gray, cv2.CV_32F))
-        sal = cv2.GaussianBlur(lap, (31, 31), 0)
-        y1 = int(top_overlay_ratio * h)
-        y2 = int(h - bottom_overlay_ratio * h)
-        if y2 <= y1:
-            y1, y2 = 0, h
-        roi = sal[y1:y2, :]
-        if roi.size == 0 or float(roi.sum()) <= 1e-6:
-            return w / 2.0, h / 2.0
-        ys, xs = np.mgrid[y1:y2, 0:w]
-        total = float(roi.sum())
-        cx = float((xs * roi).sum() / total)
-        cy = float((ys * roi).sum() / total)
-        return cx, cy
-
-    def _update_single_crop(self, frame: np.ndarray, top_overlay_ratio: float, bottom_overlay_ratio: float) -> np.ndarray:
-        want_cx = self.src_w / 2.0
-        want_cy = self.src_h / 2.0
-        ball_obs = None
-        if self.ball_tracker is not None and self.current_mode == "sports":
-            ball_obs = self.ball_tracker.update(frame)
-        if ball_obs is not None and ball_obs.confidence >= 0.28:
-            want_cx, want_cy = ball_obs.center
-            self.stats["ball_confidence"] = round(ball_obs.confidence, 3)
+        if self.panel_mode:
+            self.ball_tracker = None
         else:
-            self.stats["ball_confidence"] = float(round(self.stats.get("ball_confidence", 0.0) * 0.9, 3))
-            want_cx, want_cy = self._subject_center_from_saliency(frame, top_overlay_ratio, bottom_overlay_ratio)
-        # scorecard-safe cropping: keep bottom ticker and top scorebug by compressing center into safe lane
-        want_cx, want_cy = self._safe_center(want_cx, want_cy, top_overlay_ratio, bottom_overlay_ratio)
-        alpha = 1.0 - self.smooth_strength
-        deadzone_x = self.crop_w * self.deadzone_ratio
-        deadzone_y = self.crop_h * self.deadzone_ratio
-        dx = want_cx - self.cx
-        dy = want_cy - self.cy
-        if abs(dx) > deadzone_x:
-            step_x = np.sign(dx) * min(abs(dx) * alpha, self.src_w * self.max_pan_ratio)
-            self.cx += step_x
-        if abs(dy) > deadzone_y:
-            step_y = np.sign(dy) * min(abs(dy) * alpha, self.src_h * (self.max_pan_ratio * 0.8))
-            self.cy += step_y
-        self.cx, self.cy = self._safe_center(self.cx, self.cy, top_overlay_ratio, bottom_overlay_ratio)
-        x1 = int(_clamp(self.cx - self.crop_w / 2.0, 0, max(0, self.src_w - self.crop_w)))
-        y1 = int(_clamp(self.cy - self.crop_h / 2.0, 0, max(0, self.src_h - self.crop_h)))
-        x2 = min(self.src_w, x1 + self.crop_w)
-        y2 = min(self.src_h, y1 + self.crop_h)
-        crop = frame[y1:y2, x1:x2]
+            self.ball_tracker = BallTracker(src_w, src_h, sport_profile=self.sport_profile) if ball_tracking else None
+
+        self.panel_tracker: Optional[PanelTracker] = None
+        if self.panel_mode:
+            self.panel_tracker = PanelTracker(
+                src_w=src_w,
+                src_h=src_h,
+                max_faces=panel_max_faces,
+                max_missing_frames=panel_max_missing_frames,
+                layout_hold_frames=panel_layout_hold_frames,
+                blend_frames=panel_blend_frames,
+                min_face_area_ratio=panel_min_face_area_ratio,
+                pos_alpha=panel_pos_alpha,
+                size_alpha=panel_size_alpha,
+            )
+
+        self.smoothed_cx = src_w / 2.0
+        self.smoothed_cy = src_h / 2.0
+        self.target_cx = self.smoothed_cx
+        self.target_cy = self.smoothed_cy
+        self.prev_gray: Optional[np.ndarray] = None
+        self.frame_idx = 0
+        self._panel_no_face_count: int = 0
+        self._panel_output_buffer: Optional[np.ndarray] = None
+
+        # ← NEW: store init params for late panel init after auto detection
+        self._init_panel_max_faces = panel_max_faces
+        self._init_panel_max_missing = panel_max_missing_frames
+        self._init_panel_hold = panel_layout_hold_frames
+        self._init_panel_blend = panel_blend_frames
+        self._init_panel_min_area = panel_min_face_area_ratio
+        self._init_panel_pos_alpha = panel_pos_alpha
+        self._init_panel_size_alpha = panel_size_alpha
+        self._init_ball_tracking = ball_tracking
+
+    def _detect_motion(self, gray: np.ndarray) -> tuple[list[tuple[int, int, int, int]], Optional[np.ndarray]]:
+        if self.prev_gray is None:
+            return [], None
+        diff = cv2.absdiff(gray, self.prev_gray)
+        diff = cv2.GaussianBlur(diff, (9, 9), 0)
+        _, motion = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY)
+        kernel = np.ones((3, 3), np.uint8)
+        motion = cv2.morphologyEx(motion, cv2.MORPH_OPEN, kernel, iterations=1)
+        motion = cv2.dilate(motion, None, iterations=2)
+        excl = self.overlay_detector.exclusion_mask
+        if excl is not None:
+            motion[excl > 0] = 0
+        cnts, _ = cv2.findContours(motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_area = 0.006 * self.src_w * self.src_h
+        boxes: list[tuple[int, int, int, int]] = []
+        for c in sorted(cnts, key=cv2.contourArea, reverse=True)[:10]:
+            x, y, w, h = cv2.boundingRect(c)
+            if w * h > min_area:
+                boxes.append((x, y, w, h))
+        return boxes, motion
+
+    def _compose_output(
+        self,
+        play_crop: np.ndarray,
+        top_strip: Optional[np.ndarray],
+        bottom_strip: Optional[np.ndarray],
+    ) -> np.ndarray:
+        top_h = 0
+        if self.overlay_composite and top_strip is not None and top_strip.size:
+            strip_h_src = top_strip.shape[0]
+            top_h = int(round(self.target_h * 0.082))
+            if strip_h_src < 0.05 * self.src_h:
+                top_h = int(round(self.target_h * 0.075))
+            top_h = int(_clamp(top_h, 42, int(self.target_h * 0.11)))
+        bottom_h = 0
+        if self.overlay_composite and self.preserve_bottom_overlay and bottom_strip is not None and bottom_strip.size:
+            bottom_h = int(_clamp(int(round(self.target_h * 0.045)), 20, int(self.target_h * 0.07)))
+
+        mid_h = max(1, self.target_h - top_h - bottom_h)
+        output = np.zeros((self.target_h, self.target_w, 3), dtype=np.uint8)
+
+        play_render = _resize_cover(play_crop, self.target_w, mid_h)
+        output[top_h:top_h + mid_h, :] = play_render
+
+        if top_h > 0 and top_strip is not None and top_strip.size:
+            scoreboard = cv2.resize(top_strip, (self.target_w, top_h), interpolation=cv2.INTER_AREA)
+            output[:top_h, :] = scoreboard
+            cv2.line(output, (0, top_h - 1), (self.target_w - 1, top_h - 1), (10, 10, 10), 1)
+
+        if bottom_h > 0 and bottom_strip is not None and bottom_strip.size:
+            lower = cv2.resize(bottom_strip, (self.target_w, bottom_h), interpolation=cv2.INTER_AREA)
+            output[self.target_h - bottom_h:, :] = lower
+            cv2.line(output, (0, self.target_h - bottom_h), (self.target_w - 1, self.target_h - bottom_h), (10, 10, 10), 1)
+
+        return output
+
+    def _process_panel(self, frame: np.ndarray) -> np.ndarray:
+        """
+        FIX-P2: overlay_detector.update() is called every frame (removed stride).
+                Face detection remains strided via panel_detection_stride.
+        FIX-C2: output is always a fresh copy (PanelTracker.render() now returns copy).
+        """
+        assert self.panel_tracker is not None
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # FIX-P2: always update overlay detector - no stride here
+        self.overlay_detector.update(frame)
+        play_top, play_bot = self.overlay_detector.get_play_area_bounds()
+
+        if self.frame_idx % self.panel_detection_stride == 0:
+            try:
+                raw_faces = self.panel_tracker.detect_faces(frame, gray)
+
+                adjusted: list[tuple[int, int, int, int]] = []
+                top_ol = self.overlay_detector.top_overlay
+                bot_ol = self.overlay_detector.bottom_overlay
+
+                for (x, y, w, h) in raw_faces:
+                    face_cy = y + h / 2.0
+                    in_top = top_ol is not None and face_cy < top_ol[1]
+                    in_bot = bot_ol is not None and face_cy > bot_ol[0]
+                    if not (in_top or in_bot):
+                        adjusted.append((x, y, w, h))
+
+                self.panel_tracker.update_detections(adjusted)
+
+                active_tracked = [tf for tf in self.panel_tracker._tracked if tf.active]
+                if self.frame_idx % 30 == 0:
+                    print(f"[PanelDebug] frame={self.frame_idx} backend={self.panel_tracker.detector_backend_name} "
+                          f"raw={len(raw_faces)} filtered={len(adjusted)} active={len(active_tracked)} "
+                          f"layout={self.panel_tracker.active_count}")
+
+            except Exception as e:
+                if self.frame_idx % 30 == 0:
+                    print(f"[PanelDebug] frame={self.frame_idx} detection_error={e}")
+                self.panel_tracker.tick_extrapolation()
+        else:
+            self.panel_tracker.tick_extrapolation()
+
+        active_faces = [tf for tf in self.panel_tracker._tracked if tf.active]
+        if len(active_faces) == 0:
+            self._panel_no_face_count += 1
+        else:
+            self._panel_no_face_count = 0
+
+        if self._panel_no_face_count > 90:
+            return self._process_single(frame)
+
+        top_strip = self.overlay_detector.extract_top_strip(frame) if self.overlay_composite else None
+        bottom_strip = self.overlay_detector.extract_bottom_strip(frame) if self.overlay_composite else None
+
+        top_h = 0
+        if self.overlay_composite and top_strip is not None and top_strip.size:
+            top_h = int(_clamp(int(round(self.target_h * 0.082)), 42, int(self.target_h * 0.11)))
+        bottom_h = 0
+        if self.overlay_composite and self.preserve_bottom_overlay and bottom_strip is not None and bottom_strip.size:
+            bottom_h = int(_clamp(int(round(self.target_h * 0.045)), 20, int(self.target_h * 0.07)))
+
+        panel_canvas_h = max(1, self.target_h - top_h - bottom_h)
+
+        # render() now returns a .copy() (FIX-C3)
+        panel_frame = self.panel_tracker.render(
+            source_frame=frame,
+            canvas_w=self.target_w,
+            canvas_h=panel_canvas_h,
+            gap=self.panel_gap,
+        )
+
+        output = np.zeros((self.target_h, self.target_w, 3), dtype=np.uint8)
+        output[top_h: top_h + panel_canvas_h, :] = panel_frame
+
+        if top_h > 0 and top_strip is not None and top_strip.size:
+            scoreboard = cv2.resize(top_strip, (self.target_w, top_h), interpolation=cv2.INTER_AREA)
+            output[:top_h, :] = scoreboard
+            cv2.line(output, (0, top_h - 1), (self.target_w - 1, top_h - 1), (10, 10, 10), 1)
+
+        if bottom_h > 0 and bottom_strip is not None and bottom_strip.size:
+            lower = cv2.resize(bottom_strip, (self.target_w, bottom_h), interpolation=cv2.INTER_AREA)
+            output[self.target_h - bottom_h:, :] = lower
+            cv2.line(output, (0, self.target_h - bottom_h), (self.target_w - 1, self.target_h - bottom_h), (10, 10, 10), 1)
+
+        # FIX-C2: output is already a fresh np.zeros array - no alias risk here
+        return output
+
+    def _process_single(self, frame: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self.overlay_detector.update(frame)
+        is_cut = self.scene_detector.check(gray)
+        if is_cut:
+            self.smoothed_cx = (self.smoothed_cx + self.src_w / 2.0) / 2.0
+            self.smoothed_cy = (self.smoothed_cy + self.src_h / 2.0) / 2.0
+            if self.ball_tracker is not None:
+                self.ball_tracker.reset_position(self.src_w / 2.0, self.src_h / 2.0)
+
+        if self.frame_idx % self.analysis_stride == 0:
+            candidates: list[tuple[float, tuple[float, float]]] = []
+            excl = self.overlay_detector.exclusion_mask
+            play_top, play_bot = self.overlay_detector.get_play_area_bounds()
+
+            try:
+                play_gray = gray[play_top:play_bot, :]
+                faces = self.face_detector.detectMultiScale(play_gray, scaleFactor=1.15, minNeighbors=4, minSize=(32, 32))
+            except Exception:
+                faces = []
+            for (x, y, w, h) in faces[:3]:
+                candidates.append((0.30, (x + w / 2.0, play_top + y + h / 2.0)))
+
+            motion_boxes, motion_mask = self._detect_motion(gray)
+
+            # FIX-B7: single motion candidate with a fixed weight
+            if motion_boxes:
+                x0 = min(p[0] for p in motion_boxes)
+                y0 = min(p[1] for p in motion_boxes)
+                x1 = max(p[0] + p[2] for p in motion_boxes)
+                y1 = max(p[1] + p[3] for p in motion_boxes)
+                motion_w = 0.20 if self.ball_tracker is not None else 0.38
+                candidates.append((motion_w, ((x0 + x1) / 2.0, (y0 + y1) / 2.0)))
+            else:
+                motion_mask = None
+
+            if self.saliency is not None:
+                try:
+                    success, sal_map = self.saliency.computeSaliency(frame)
+                    if success:
+                        sal_map = (sal_map * 255).astype("uint8")
+                        if excl is not None:
+                            sal_map[excl > 0] = 0
+                        _, thresh = cv2.threshold(sal_map, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        if cnts:
+                            c = max(cnts, key=cv2.contourArea)
+                            x, y, w, h = cv2.boundingRect(c)
+                            if w * h > 0.02 * self.src_w * self.src_h:
+                                candidates.append((0.08, (x + w / 2.0, y + h / 2.0)))
+                except Exception:
+                    pass
+
+            if self.ball_tracker is not None:
+                ball = self.ball_tracker.update(frame, gray, motion_mask, excl)
+                if ball is not None:
+                    bx, by, _br, bconf = ball
+                    candidates.append((self.ball_weight * max(0.25, bconf), (bx, by)))
+                    if motion_boxes:
+                        mx0 = min(p[0] for p in motion_boxes)
+                        my0 = min(p[1] for p in motion_boxes)
+                        mx1 = max(p[0] + p[2] for p in motion_boxes)
+                        my1 = max(p[1] + p[3] for p in motion_boxes)
+                        candidates.append((self.context_bias, ((mx0 + mx1) / 2.0, (my0 + my1) / 2.0)))
+
+            if candidates:
+                ws = sum(w for w, _ in candidates)
+                self.target_cx = sum(cx * w for w, (cx, _) in candidates) / max(ws, 1e-6)
+                self.target_cy = sum(cy * w for w, (_, cy) in candidates) / max(ws, 1e-6)
+            else:
+                self.target_cx = self.src_w / 2.0
+                self.target_cy = self.src_h / 2.0
+
+            y_margin = max(12, int(0.02 * self.src_h))
+            self.target_cy = _clamp(self.target_cy, play_top + y_margin, play_bot - y_margin)
+
+        self.prev_gray = gray
+
+        dx = self.target_cx - self.smoothed_cx
+        dy = self.target_cy - self.smoothed_cy
+        if abs(dx) < self.deadzone_px:
+            dx = 0.0
+        if abs(dy) < self.deadzone_px * 0.45:
+            dy = 0.0
+        alpha = (1.0 - self.smooth_strength) * (3.0 if is_cut else 1.0)
+        self.smoothed_cx += max(-self.max_pan_px, min(self.max_pan_px, dx * alpha))
+        self.smoothed_cy += max(-(self.max_pan_px * 0.45), min(self.max_pan_px * 0.45, dy * alpha))
+
+        play_top, play_bot = self.overlay_detector.get_play_area_bounds()
+        x0 = int(round(self.smoothed_cx - self.crop_w / 2.0))
+        x0 = int(_clamp(x0, 0, self.max_x))
+
+        play_h = play_bot - play_top
+        if play_h >= self.crop_h:
+            min_y = play_top
+            max_y = play_bot - self.crop_h
+            y0 = int(round(self.smoothed_cy - self.crop_h / 2.0))
+            y0 = int(_clamp(y0, min_y, max_y))
+        else:
+            y0 = int(_clamp(round(self.smoothed_cy - self.crop_h / 2.0), 0, self.max_y))
+            if self.overlay_detector.top_overlay is not None and y0 < play_top:
+                y0 = min(self.max_y, play_top)
+            if self.overlay_detector.bottom_overlay is not None and y0 + self.crop_h > play_bot:
+                y0 = max(0, play_bot - self.crop_h)
+
+        crop = frame[y0:y0 + self.crop_h, x0:x0 + self.crop_w]
         if crop.size == 0:
             crop = frame
-        out = cv2.resize(crop, (self.target_w, self.target_h), interpolation=cv2.INTER_LINEAR)
-        if self.overlay_composite and (top_overlay_ratio > 1e-3 or (bottom_overlay_ratio > 1e-3 and self.preserve_bottom_overlay)):
-            full_scaled = _resize_cover(frame, self.target_w, self.target_h)
-            if top_overlay_ratio > 1e-3:
-                top_h = max(1, int(self.target_h * top_overlay_ratio))
-                out[:top_h, :] = full_scaled[:top_h, :]
-            if self.preserve_bottom_overlay and bottom_overlay_ratio > 1e-3:
-                bot_h = max(1, int(self.target_h * bottom_overlay_ratio))
-                out[self.target_h - bot_h :, :] = full_scaled[self.target_h - bot_h :, :]
-        return out
+
+        top_strip = self.overlay_detector.extract_top_strip(frame) if self.overlay_composite else None
+        bottom_strip = self.overlay_detector.extract_bottom_strip(frame) if self.overlay_composite else None
+        output = self._compose_output(crop, top_strip, bottom_strip)
+        return output
 
     def process(self, frame: np.ndarray) -> np.ndarray:
+        """Process one frame and return the 9:16 output."""
         self.frame_idx += 1
-        top_overlay_ratio, bottom_overlay_ratio = self.overlay_detector.update(frame)
-        self.stats["top_overlay_ratio"] = round(top_overlay_ratio, 3)
-        self.stats["bottom_overlay_ratio"] = round(bottom_overlay_ratio, 3)
-        if self.scene_detector.update(frame):
-            self.stats["scene_cuts"] += 1
-            # faster recenter on cuts
-            self.cx, self.cy = self.src_w / 2.0, self.src_h / 2.0
-            if self.ball_tracker is not None:
-                self.ball_tracker.reset()
-        self._update_mode(frame)
-        if self.current_mode == "panel":
-            out = self.panel_tracker.render(frame, self.target_w, self.target_h, top_overlay_ratio, bottom_overlay_ratio if self.preserve_bottom_overlay else 0.0)
-            self.stats["panel_faces"] = min(len(self.panel_tracker.tracks), 4)
-            return out
-        self.stats["panel_faces"] = 0
-        return self._update_single_crop(frame, top_overlay_ratio, bottom_overlay_ratio)
 
+        # ← NEW: auto mode detection during first N frames
+        if self.auto_mode and self._auto_detector is not None and not self._auto_decided:
+            self._auto_detector.feed(frame)
+            if self._auto_detector.ready():
+                mode = self._auto_detector.result()
+                self._auto_decided = True
+                if mode == "panel" and self.panel_tracker is None:
+                    logger.info("[AutoMode] Detected PANEL content - switching to panel mode")
+                    self.panel_mode = True
+                    self.ball_tracker = None
+                    self.panel_tracker = PanelTracker(
+                        src_w=self.src_w,
+                        src_h=self.src_h,
+                        max_faces=self._init_panel_max_faces,
+                        max_missing_frames=self._init_panel_max_missing,
+                        layout_hold_frames=self._init_panel_hold,
+                        blend_frames=self._init_panel_blend,
+                        min_face_area_ratio=self._init_panel_min_area,
+                        pos_alpha=self._init_panel_pos_alpha,
+                        size_alpha=self._init_panel_size_alpha,
+                    )
+                elif mode == "single" and self.panel_mode:
+                    logger.info("[AutoMode] Detected SINGLE/SPORTS content - keeping single mode")
+                    # already in single if not panel_mode; keep ball tracker
+
+        if self.panel_mode and self.panel_tracker is not None:
+            result = self._process_panel(frame)
+        else:
+            result = self._process_single(frame)
+        return result
 
 # ---------------------------------------------------------------------------
 # Offline vertical master generation
 # ---------------------------------------------------------------------------
-
 def create_vertical_master(
     source_path: str,
     output_path: str,
@@ -885,9 +1727,9 @@ def create_vertical_master(
     preserve_bottom_overlay: bool = False,
     panel_mode: bool = False,
     panel_max_faces: int = 4,
-    panel_detection_stride: int = 3,
+    panel_detection_stride: int = 2,
     panel_gap: int = 4,
-    auto_mode: bool = False,
+    auto_mode: bool = False,                                        # ← NEW
     progress_cb: Optional[Callable[[float, str], None]] = None,
 ):
     cap = cv2.VideoCapture(source_path)
@@ -900,8 +1742,7 @@ def create_vertical_master(
     if src_w <= 0 or src_h <= 0:
         cap.release()
         return False, "Invalid source dimensions"
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_path, fourcc, fps, (target_w, target_h))
+
     reframer = SmoothReframer(
         src_w, src_h, target_w, target_h,
         smooth_strength=smooth_strength,
@@ -918,34 +1759,40 @@ def create_vertical_master(
         panel_gap=panel_gap,
         auto_mode=auto_mode,
     )
-    fi = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            break
-        if src_w != frame.shape[1] or src_h != frame.shape[0]:
-            frame = cv2.resize(frame, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
-        out_frame = reframer.process(frame)
-        out.write(out_frame)
-        fi += 1
-        if progress_cb and fi % max(1, frame_count // 100 if frame_count > 0 else 30) == 0:
-            progress_cb(fi / max(frame_count, 1), f"Rendering {fi}/{frame_count or '?'}")
-    out.release()
-    cap.release()
-    return True, output_path
+    writer = cv2.VideoWriter(
+        output_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps if fps > 0 else DEFAULT_OUTPUT_FPS,
+        (target_w, target_h),
+    )
+    if not writer.isOpened():
+        cap.release()
+        return False, "Could not create output file"
 
+    idx = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            writer.write(reframer.process(frame))
+            idx += 1
+            if progress_cb and frame_count > 0 and idx % 5 == 0:
+                progress_cb(idx / frame_count, f"Creating vertical master {idx}/{frame_count}")
+    finally:
+        cap.release()
+        writer.release()
+    return True, "Done"
 
 # ---------------------------------------------------------------------------
 # Cloudflare Stream live push helpers
 # ---------------------------------------------------------------------------
-
 @dataclass
 class CFStreamConfig:
     account_id: str
     api_token: str
     customer_code: str
     prefer_low_latency: bool = False
-
 
 @dataclass
 class LiveSession:
@@ -955,7 +1802,7 @@ class LiveSession:
     hls_url: str
     dash_url: str
     iframe_url: str
-    ffmpeg_cmd: List[str]
+    ffmpeg_cmd: list[str]
     proc: Optional[subprocess.Popen]
     log_path: str
     stop_event: threading.Event = field(default_factory=threading.Event)
@@ -963,7 +1810,6 @@ class LiveSession:
     status: str = "created"
     stats: dict = field(default_factory=dict)
     error: str = ""
-
 
 def cfstream_config_from_inputs(account_id: str, api_token: str, customer_code: str, prefer_low_latency: bool = False) -> CFStreamConfig:
     if not account_id:
@@ -975,10 +1821,8 @@ def cfstream_config_from_inputs(account_id: str, api_token: str, customer_code: 
     code = customer_code.strip().replace("customer-", "").replace(".cloudflarestream.com", "").strip("/")
     return CFStreamConfig(account_id.strip(), api_token.strip(), code, bool(prefer_low_latency))
 
-
 def _cf_api_request(cfg: CFStreamConfig, method: str, path: str, payload: Optional[dict] = None):
-    base = f"https://api.cloudflare.com/client/v4/accounts/{cfg.account_id}"
-    url = base + path
+    url = f"https://api.cloudflare.com/client/v4{path}"
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {
         "Authorization": f"Bearer {cfg.api_token}",
@@ -997,7 +1841,6 @@ def _cf_api_request(cfg: CFStreamConfig, method: str, path: str, payload: Option
             parsed = {"success": False, "errors": [{"message": body}]}
         return exc.code, parsed
 
-
 def create_live_input(cfg: CFStreamConfig, name: str, recording_mode: str = "automatic") -> dict:
     payload = {
         "meta": {"name": name},
@@ -1005,15 +1848,13 @@ def create_live_input(cfg: CFStreamConfig, name: str, recording_mode: str = "aut
         "preferLowLatency": bool(cfg.prefer_low_latency),
         "enabled": True,
     }
-    status, parsed = _cf_api_request(cfg, "POST", "/stream/live_inputs", payload)
+    status, parsed = _cf_api_request(cfg, "POST", f"/accounts/{cfg.account_id}/stream/live_inputs", payload)
     if status not in (200, 201) or not parsed.get("success"):
         raise RuntimeError(f"Create live input failed: {parsed}")
     return parsed["result"]
 
-
 def disable_live_input(cfg: CFStreamConfig, uid: str) -> None:
-    _cf_api_request(cfg, "PUT", f"/stream/live_inputs/{uid}", {"enabled": False})
-
+    _cf_api_request(cfg, "PUT", f"/accounts/{cfg.account_id}/stream/live_inputs/{uid}", {"enabled": False})
 
 def build_public_playback_urls(cfg: CFStreamConfig, uid: str):
     base = f"https://customer-{cfg.customer_code}.cloudflarestream.com/{uid}"
@@ -1021,7 +1862,6 @@ def build_public_playback_urls(cfg: CFStreamConfig, uid: str):
     dash = f"{base}/manifest/video.mpd"
     iframe = f"{base}/iframe?autoplay=true&muted=true&controls=true&preload=metadata"
     return hls, dash, iframe
-
 
 def build_push_file_command(reframed_mp4: str, rtmps_url: str, stream_key: str, loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS):
     target = rtmps_url.rstrip("/") + "/" + stream_key
@@ -1031,26 +1871,26 @@ def build_push_file_command(reframed_mp4: str, rtmps_url: str, stream_key: str, 
         cmd += ["-stream_loop", "-1"]
     cmd += [
         "-re", "-i", reframed_mp4,
-        "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-tune", "zerolatency",                                     # ← NEW
         "-pix_fmt", "yuv420p",
         "-fps_mode", "cfr",
         "-r", str(fps_int),
         "-b:v", DEFAULT_VIDEO_BITRATE,
         "-maxrate", DEFAULT_MAXRATE,
         "-bufsize", DEFAULT_BUFSIZE,
-        "-g", str(fps_int * DEFAULT_GOP_SEC),
-        "-keyint_min", str(fps_int * DEFAULT_GOP_SEC),
+        "-g", str(fps_int * 2),
+        "-keyint_min", str(fps_int * 2),
         "-sc_threshold", "0",
         "-profile:v", "high",
-        "-x264-params", f"nal-hrd=cbr:force-cfr=1:scenecut=0:keyint={fps_int * DEFAULT_GOP_SEC}:min-keyint={fps_int * DEFAULT_GOP_SEC}",
-        "-c:a", "aac", "-b:a", DEFAULT_AUDIO_BITRATE, "-ar", "48000", "-ac", "2",
+        "-x264-params", f"nal-hrd=cbr:force-cfr=1:scenecut=0:keyint={fps_int * 2}:min-keyint={fps_int * 2}",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
         "-flvflags", "no_duration_filesize",
-        "-fflags", "nobuffer",
-        "-flags", "low_delay",
+        "-fflags", "nobuffer",                                      # ← NEW
+        "-flags", "low_delay",                                      # ← NEW
         "-f", "flv", target,
     ]
     return cmd
-
 
 def start_vod_to_live_push(cfg: CFStreamConfig, reframed_mp4: str, asset_name: str, loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS) -> LiveSession:
     live_input = create_live_input(cfg, name=safe_token(Path(asset_name).stem))
@@ -1063,7 +1903,6 @@ def start_vod_to_live_push(cfg: CFStreamConfig, reframed_mp4: str, asset_name: s
     log_fp = open(log_path, "w", encoding="utf-8")
     proc = subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT, text=True)
     return LiveSession(uid, rtmps_url, stream_key, hls_url, dash_url, iframe_url, cmd, proc, log_path, status="streaming")
-
 
 def build_realtime_rtmps_push_command(target_w: int, target_h: int, fps: float, rtmps_url: str, stream_key: str):
     target = rtmps_url.rstrip("/") + "/" + stream_key
@@ -1082,21 +1921,20 @@ def build_realtime_rtmps_push_command(target_w: int, target_h: int, fps: float, 
         "-b:v", DEFAULT_VIDEO_BITRATE,
         "-maxrate", DEFAULT_MAXRATE,
         "-bufsize", DEFAULT_BUFSIZE,
-        "-g", str(fps_int * DEFAULT_GOP_SEC),
-        "-keyint_min", str(fps_int * DEFAULT_GOP_SEC),
+        "-g", str(fps_int * 2),
+        "-keyint_min", str(fps_int * 2),
         "-sc_threshold", "0",
         "-profile:v", "high",
-        "-x264-params", f"nal-hrd=cbr:force-cfr=1:scenecut=0:keyint={fps_int * DEFAULT_GOP_SEC}:min-keyint={fps_int * DEFAULT_GOP_SEC}",
-        "-c:a", "aac", "-b:a", DEFAULT_AUDIO_BITRATE, "-ar", "48000", "-ac", "2",
+        "-x264-params", f"nal-hrd=cbr:force-cfr=1:scenecut=0:keyint={fps_int * 2}:min-keyint={fps_int * 2}",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
         "-flvflags", "no_duration_filesize",
-        "-fflags", "nobuffer",
-        "-flags", "low_delay",
+        "-fflags", "nobuffer",                                      # ← NEW
+        "-flags", "low_delay",                                      # ← NEW
         "-f", "flv", target,
     ]
 
-
 def _read_exact(stream, nbytes: int) -> bytes:
-    chunks: List[bytes] = []
+    chunks = []
     remaining = nbytes
     while remaining > 0:
         data = stream.read(remaining)
@@ -1106,20 +1944,20 @@ def _read_exact(stream, nbytes: int) -> bytes:
         remaining -= len(data)
     return b"".join(chunks)
 
-
-def _build_ingest_command(source: str, fps: float, pace_input: bool, loop_file: bool) -> List[str]:
+def _build_ingest_command(source: str, fps: float, pace_input: bool, loop_file: bool) -> list[str]:
     fps_int = max(24, min(60, int(round(fps or DEFAULT_OUTPUT_FPS))))
     vf = (
         f"fps={fps_int},"
         f"scale={WORKING_INPUT_W}:{WORKING_INPUT_H}:force_original_aspect_ratio=decrease,"
         f"pad={WORKING_INPUT_W}:{WORKING_INPUT_H}:(ow-iw)/2:(oh-ih)/2:black"
     )
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-fflags", "nobuffer", "-flags", "low_delay"]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
+           "-fflags", "nobuffer",                                   # ← NEW
+           "-flags", "low_delay"]                                   # ← NEW
     effective_pace = pace_input if is_network_source(source) else False
     cmd += _source_input_args(source, pace_input=effective_pace, loop_file=loop_file)
     cmd += ["-an", "-vf", vf, "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"]
     return cmd
-
 
 def _make_placeholder_frame(target_w: int, target_h: int, text: str = "Starting stream...") -> np.ndarray:
     frame = np.zeros((target_h, target_w, 3), dtype=np.uint8)
@@ -1131,7 +1969,6 @@ def _make_placeholder_frame(target_w: int, target_h: int, text: str = "Starting 
     cv2.putText(frame, "Cloudflare live input priming", (28, target_h // 2 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 195, 230), 1, cv2.LINE_AA)
     return frame
 
-
 def _open_ingest_process(source: str, fps: float, pace_input: bool, loop_file: bool, log_path: str) -> subprocess.Popen:
     cmd = _build_ingest_command(source, fps=fps, pace_input=pace_input, loop_file=loop_file)
     log_fp = open(log_path, "a", encoding="utf-8")
@@ -1139,26 +1976,31 @@ def _open_ingest_process(source: str, fps: float, pace_input: bool, loop_file: b
     log_fp.flush()
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log_fp, bufsize=0)
 
-
 def _start_output_process(session: LiveSession) -> subprocess.Popen:
     log_fp = open(session.log_path, "a", encoding="utf-8")
     log_fp.write("\n=== PUSH CMD ===\n" + " ".join(session.ffmpeg_cmd) + "\n")
     log_fp.flush()
     return subprocess.Popen(session.ffmpeg_cmd, stdin=subprocess.PIPE, stdout=log_fp, stderr=subprocess.STDOUT, bufsize=0)
 
-
+# ---------------------------------------------------------------------------
+# NEW: Robust process termination helper
+# ---------------------------------------------------------------------------
 def _terminate_process(proc: Optional[subprocess.Popen], timeout: float = 5.0) -> None:
+    """Terminate a subprocess gracefully, escalating to kill if needed."""
     if proc is None:
         return
     with contextlib.suppress(Exception):
         if proc.poll() is None:
             proc.terminate()
-            proc.wait(timeout=timeout)
-    with contextlib.suppress(Exception):
-        if proc.poll() is None:
-            proc.kill()
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
-
+# ---------------------------------------------------------------------------
+# REWRITTEN: Realtime worker with time-based buffer, pacing, frame drops,
+#            ingest restart, and richer analytics.
+# ---------------------------------------------------------------------------
 def _realtime_worker(
     session: LiveSession,
     source: str,
@@ -1177,23 +2019,23 @@ def _realtime_worker(
     preserve_bottom_overlay: bool,
     panel_mode: bool = False,
     panel_max_faces: int = 4,
-    panel_detection_stride: int = 3,
+    panel_detection_stride: int = 2,
     panel_gap: int = 4,
     auto_mode: bool = False,
 ) -> None:
     session.status = "probing"
     info = probe_source(source)
-    fps = float(info.get("fps") or DEFAULT_OUTPUT_FPS)
-    if fps <= 1:
-        fps = DEFAULT_OUTPUT_FPS
+    fps = DEFAULT_OUTPUT_FPS
     src_w, src_h = WORKING_INPUT_W, WORKING_INPUT_H
     frame_bytes = src_w * src_h * 3
-    delay_seconds = max(0.0, delay_seconds)
-    max_buffer_frames = max(int(round(MAX_BUFFER_SECONDS * fps)), int(round(delay_seconds * fps)) + 15)
+    delay_seconds = max(0.0, float(delay_seconds))
+    max_buffer_frames = max(
+        int(round(MAX_BUFFER_SECONDS * fps)),
+        int(round(delay_seconds * fps)) + 15,
+    )
     session.stats = {
         "fps": round(fps, 3),
-        "delay_seconds": round(delay_seconds, 3),
-        "buffer_frames": 0,
+        "delay_seconds": round(delay_seconds, 2),
         "working_resolution": f"{src_w}x{src_h}",
         "source_reported_resolution": f"{int(info.get('width') or 0)}x{int(info.get('height') or 0)}",
         "sport_profile": sport_profile,
@@ -1202,12 +2044,18 @@ def _realtime_worker(
         "frames_in": 0,
         "frames_out": 0,
         "frame_drops": 0,
+        "buffer_len": 0,
+        "placeholder_frames": 0,
         "source_stalls": 0,
-        "mode": "panel" if panel_mode else ("sports" if ball_tracking else "single"),
-        "ball_confidence": 0.0,
-        "panel_faces": 0,
-        "processing_ms": 0.0,
         "ingest_restarts": 0,
+        "processing_ms": 0.0,
+        "fps_actual": 0.0,
+        "ball_confidence": 0.0,
+        "overlay_top": False,
+        "overlay_bottom": False,
+        "panel_active_faces": 0,
+        "panel_detector": "-",
+        "mode": "panel" if panel_mode else "single",
     }
     reframer = SmoothReframer(
         src_w, src_h, target_w, target_h,
@@ -1225,88 +2073,163 @@ def _realtime_worker(
         panel_gap=panel_gap,
         auto_mode=auto_mode,
     )
-    buffer: collections.deque[Tuple[float, np.ndarray]] = collections.deque()
+    # Time-based buffer: each entry is (monotonic_timestamp, frame_ndarray)
+    buffer: collections.deque[tuple[float, np.ndarray]] = collections.deque()
     placeholder = _make_placeholder_frame(target_w, target_h)
     frame_interval = 1.0 / fps
-    next_output_ts = time.monotonic()
-    ingest_log_path = tempfile.NamedTemporaryFile(delete=False, suffix=".ingest.log").name
-    ingest_proc = _open_ingest_process(source, fps=fps, pace_input=pace_input, loop_file=loop_file, log_path=ingest_log_path)
-    session.proc = _start_output_process(session)
-    session.status = "streaming"
-
-    def restart_ingest() -> subprocess.Popen:
-        _terminate_process(ingest_proc)
-        session.stats["ingest_restarts"] += 1
-        return _open_ingest_process(source, fps=fps, pace_input=pace_input, loop_file=loop_file, log_path=ingest_log_path)
 
     try:
+        session.proc = _start_output_process(session)
+    except Exception as exc:
+        session.status = "ffmpeg_start_failed"
+        session.error = str(exc)
+        return
+
+    # Prime output so Cloudflare accepts the connection
+    session.status = "priming_output"
+    try:
+        if session.proc.stdin:
+            prime = min(15, max(1, int(fps * 0.5)))
+            for _ in range(prime):
+                if session.stop_event.is_set():
+                    break
+                session.proc.stdin.write(placeholder.tobytes())
+                session.stats["placeholder_frames"] += 1
+    except Exception as exc:
+        session.status = "ffmpeg_pipe_broken"
+        session.error = f"Could not prime Cloudflare output: {exc}"
+        return
+
+    ingest: Optional[subprocess.Popen] = None
+    next_deadline = time.monotonic()
+    source_ended = False
+    fps_counter = 0
+    fps_timer = time.monotonic()
+
+    def _restart_ingest() -> subprocess.Popen:
+        """Terminate current ingest and start a fresh one."""
+        nonlocal ingest
+        _terminate_process(ingest)
+        session.stats["ingest_restarts"] += 1
+        logger.warning("[IngestRestart] Restarting ingest process (restart #%d)", session.stats["ingest_restarts"])
+        return _open_ingest_process(source, fps=fps, pace_input=pace_input, loop_file=loop_file, log_path=session.log_path)
+
+    try:
+        session.status = "connecting_source"
+        ingest = _open_ingest_process(source, fps=fps, pace_input=pace_input, loop_file=loop_file, log_path=session.log_path)
+
         while not session.stop_event.is_set():
-            loop_started = time.monotonic()
-            if ingest_proc.poll() is not None:
+            loop_start = time.monotonic()
+
+            # --- Guard: restart if ingest died ---
+            if ingest is not None and ingest.poll() is not None:
                 session.stats["source_stalls"] += 1
-                session.stats["ingest_restarts"] += 1
-                ingest_proc = _open_ingest_process(source, fps=fps, pace_input=pace_input, loop_file=loop_file, log_path=ingest_log_path)
+                ingest = _restart_ingest()
                 time.sleep(0.15)
                 continue
-            raw = _read_exact(ingest_proc.stdout, frame_bytes) if ingest_proc.stdout is not None else b""
-            if len(raw) != frame_bytes:
-                session.stats["source_stalls"] += 1
-                # keep stream alive with placeholder frame and restart ingest if repeated
-                buffer.append((time.monotonic(), placeholder.copy()))
-                session.stats["frames_in"] += 1
-                ingest_proc = restart_ingest()
-                time.sleep(0.10)
-            else:
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape(src_h, src_w, 3)
-                processed = reframer.process(frame)
-                buffer.append((time.monotonic(), processed.copy()))
-                session.stats["frames_in"] += 1
-                session.stats["mode"] = reframer.stats.get("mode", session.stats["mode"])
-                session.stats["ball_confidence"] = reframer.stats.get("ball_confidence", 0.0)
-                session.stats["panel_faces"] = reframer.stats.get("panel_faces", 0)
-            # cap backlog for realtime correctness
+
+            # --- Read frame ---
+            if not source_ended:
+                raw = _read_exact(ingest.stdout, frame_bytes) if ingest and ingest.stdout else b""
+                if len(raw) < frame_bytes:
+                    source_ended = True
+                    session.stats["source_stalls"] += 1
+                    session.error = f"Source unavailable: {source}"
+                    # Try restart for recoverable network sources
+                    if is_network_source(source):
+                        ingest = _restart_ingest()
+                        source_ended = False
+                        time.sleep(0.10)
+                        continue
+                else:
+                    frame = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3))
+                    now = time.monotonic()
+                    processed = reframer.process(frame)
+                    # Append (timestamp, independent copy) to time-based buffer
+                    buffer.append((now, processed))
+                    session.stats["frames_in"] += 1
+
+            # --- Drop excess frames to prevent latency creep ---
             while len(buffer) > max_buffer_frames:
                 buffer.popleft()
                 session.stats["frame_drops"] += 1
-            # time-based release so delay does not drift and speed does not fast-forward
-            now = time.monotonic()
-            release_before = now - delay_seconds
-            while buffer and buffer[0][0] <= release_before:
-                out_frame = buffer.popleft()[1]
-                if session.proc is None or session.proc.stdin is None or session.proc.poll() is not None:
-                    raise RuntimeError("Output process died")
-                try:
-                    session.proc.stdin.write(out_frame.tobytes())
-                except BrokenPipeError as exc:
-                    raise RuntimeError("Output pipe broken") from exc
-                session.stats["frames_out"] += 1
-                break  # only one output frame per loop iteration; pacing controlled below
-            # if startup and nothing mature yet, feed placeholder on cadence
-            if session.stats["frames_out"] == 0 and session.proc is not None and session.proc.stdin is not None:
-                try:
-                    session.proc.stdin.write(placeholder.tobytes())
-                except Exception:
-                    pass
-            next_output_ts += frame_interval
-            sleep = next_output_ts - time.monotonic()
-            if sleep > 0:
-                time.sleep(sleep)
-            else:
-                # do not accumulate negative drift
-                next_output_ts = time.monotonic()
-            session.stats["buffer_frames"] = len(buffer)
-            session.stats["processing_ms"] = round((time.monotonic() - loop_started) * 1000.0, 2)
-    except Exception as exc:
-        session.error = str(exc)
-        session.status = "failed"
-        logger.exception("Realtime worker failed: %s", exc)
-    finally:
-        _terminate_process(ingest_proc)
-        _terminate_process(session.proc)
-        session.proc = None
-        if session.status != "failed":
-            session.status = "stopped"
 
+            # --- Time-based output: release frames that are old enough ---
+            now = time.monotonic()
+            release_cutoff = now - delay_seconds
+            frame_to_write = None
+
+            if buffer and buffer[0][0] <= release_cutoff:
+                session.status = "streaming"
+                frame_to_write = buffer.popleft()[1]
+            elif not source_ended and not buffer:
+                session.status = "buffering"
+                frame_to_write = placeholder
+                session.stats["placeholder_frames"] += 1
+            elif source_ended and buffer:
+                session.status = "draining"
+                frame_to_write = buffer.popleft()[1]
+            elif source_ended and not buffer:
+                session.status = "source_ended"
+                break
+
+            # --- Write to output ---
+            if session.proc and session.proc.stdin and frame_to_write is not None:
+                try:
+                    session.proc.stdin.write(frame_to_write.tobytes())
+                    session.stats["frames_out"] += 1
+                    fps_counter += 1
+                except Exception as exc:
+                    session.status = "ffmpeg_pipe_broken"
+                    session.error = str(exc)
+                    break
+
+            # --- Strict frame pacing (fixes fast-forward) ---
+            next_deadline += frame_interval
+            sleep_for = next_deadline - time.monotonic()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            else:
+                # System lagging -> reset deadline to prevent burst catch-up
+                next_deadline = time.monotonic()
+
+            # --- Update metrics ---
+            session.stats["processing_ms"] = round((time.monotonic() - loop_start) * 1000.0, 2)
+            session.stats["buffer_len"] = len(buffer)
+
+            # FPS measurement (once per second)
+            elapsed_since_fps = time.monotonic() - fps_timer
+            if elapsed_since_fps >= 1.0:
+                session.stats["fps_actual"] = round(fps_counter / elapsed_since_fps, 1)
+                fps_counter = 0
+                fps_timer = time.monotonic()
+
+            # Periodic detailed stats update
+            if session.stats["frames_out"] % max(1, int(fps)) == 0:
+                panel_count = reframer.panel_tracker.active_count if reframer.panel_tracker else 0
+                session.stats.update({
+                    "ball_confidence": round(reframer.ball_tracker.conf, 3) if reframer.ball_tracker is not None else 0.0,
+                    "overlay_top": reframer.overlay_detector.top_overlay is not None,
+                    "overlay_bottom": reframer.overlay_detector.bottom_overlay is not None,
+                    "panel_active_faces": panel_count,
+                    "panel_detector": getattr(reframer.panel_tracker, "detector_backend_name", "haar") if reframer.panel_tracker else "-",
+                    "mode": "panel" if reframer.panel_mode else "single",
+                })
+
+    except Exception as exc:
+        logger.exception("[WORKER CRASH] %s", exc)
+        session.status = "worker_error"
+        session.error = str(exc)
+    finally:
+        _terminate_process(ingest)
+        try:
+            if session.proc and session.proc.stdin:
+                session.proc.stdin.close()
+        except Exception:
+            pass
+        _terminate_process(session.proc)
+        if session.status not in {"ffmpeg_pipe_broken", "worker_error", "ffmpeg_start_failed", "source_ended"}:
+            session.status = "stopped"
 
 def start_realtime_delayed_vertical_push(
     cfg: CFStreamConfig,
@@ -1314,7 +2237,7 @@ def start_realtime_delayed_vertical_push(
     asset_name: str,
     target_w: int = DEFAULT_TARGET_W,
     target_h: int = DEFAULT_TARGET_H,
-    delay_seconds: float = 0.0,
+    delay_seconds: float = 5.0,
     smooth_strength: float = 0.975,
     analysis_stride: int = 4,
     deadzone_ratio: float = 0.05,
@@ -1327,9 +2250,9 @@ def start_realtime_delayed_vertical_push(
     preserve_bottom_overlay: bool = False,
     panel_mode: bool = False,
     panel_max_faces: int = 4,
-    panel_detection_stride: int = 3,
+    panel_detection_stride: int = 2,
     panel_gap: int = 4,
-    auto_mode: bool = False,
+    auto_mode: bool = False,                                        # ← NEW
 ) -> LiveSession:
     live_input = create_live_input(cfg, name=safe_token(Path(asset_name).stem))
     uid = live_input["uid"]
@@ -1369,30 +2292,20 @@ def start_realtime_delayed_vertical_push(
     worker.start()
     return session
 
-
 def stop_live_session(cfg: CFStreamConfig, session: Optional[LiveSession]) -> None:
     if not session:
         return
     session.stop_event.set()
     try:
         if session.worker and session.worker.is_alive():
-            session.worker.join(timeout=4)
+            session.worker.join(timeout=3)
     except Exception:
         pass
-    try:
-        if session.proc and session.proc.poll() is None:
-            session.proc.terminate()
-            try:
-                session.proc.wait(timeout=5)
-            except Exception:
-                session.proc.kill()
-    except Exception:
-        pass
+    _terminate_process(session.proc)
     try:
         disable_live_input(cfg, session.uid)
     except Exception:
         pass
-
 
 def read_log_tail(path: str, max_chars: int = 12000) -> str:
     try:
