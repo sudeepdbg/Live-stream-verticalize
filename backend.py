@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import collections
@@ -39,15 +38,16 @@ except Exception:
 DEFAULT_TARGET_W = 540
 DEFAULT_TARGET_H = 960
 MAX_UPLOAD_MB = 400
-WORKING_INPUT_W = 1280
-WORKING_INPUT_H = 720
+# Live working resolution is intentionally lower than 1280x720 to reduce sports CV p95 latency.
+WORKING_INPUT_W = 960
+WORKING_INPUT_H = 540
 PLACEHOLDER_FPS = 30.0
 DEFAULT_OUTPUT_FPS = 30.0
 DEFAULT_VIDEO_BITRATE = "3500k"
 DEFAULT_MAXRATE = "3500k"
 DEFAULT_BUFSIZE = "3500k"
-MAX_BUFFER_SECONDS = 0.50
-LIVE_STARTUP_PRIME_SECONDS = 0.15
+MAX_BUFFER_SECONDS = 0.35
+LIVE_STARTUP_PRIME_SECONDS = 0.12
 INGEST_READ_TIMEOUT = 0.75
 INGEST_READ_TIMEOUT_MIN = 0.25
 INGEST_READ_TIMEOUT_MAX = 1.25
@@ -55,7 +55,7 @@ CLEANUP_LOG_MAX_AGE_SECONDS = 6 * 60 * 60
 MAX_CONSECUTIVE_STALLS_NON_LOOP = 12
 
 # -----------------------------------------------------------------------------
-# Utilities
+# Utility helpers
 # -----------------------------------------------------------------------------
 def ffmpeg_ok() -> bool:
     try:
@@ -77,6 +77,11 @@ def is_network_source(source: str) -> bool:
 
 
 def _source_input_args(source: str, pace_input: bool = False, loop_file: bool = False) -> list[str]:
+    """FFmpeg input flags.
+
+    Important: +nobuffer is network-only. It is harmful for local/uploaded MP4 with
+    -re + -stream_loop because it can create fragile startup/empty-output behavior.
+    """
     is_net = is_network_source(source)
     args = [
         "-fflags", "+genpts+discardcorrupt+nobuffer" if is_net else "+genpts+discardcorrupt",
@@ -104,7 +109,11 @@ def _safe_json_loads(text: str) -> dict:
 
 
 def _ffprobe_json(source: str, timeout: int = 30) -> dict:
-    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", "-analyzeduration", "20000000", "-probesize", "20000000", source]
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-show_format",
+        "-analyzeduration", "20000000", "-probesize", "20000000", source,
+    ]
     out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=timeout)
     return _safe_json_loads(out)
 
@@ -789,38 +798,29 @@ class SmoothReframer:
         return self._process_single(frame)
 
 # -----------------------------------------------------------------------------
-# Offline VOD
+# Offline VOD + Cloudflare/session + live worker
 # -----------------------------------------------------------------------------
+
 def create_vertical_master(source_path: str, output_path: str, target_w: int = DEFAULT_TARGET_W, target_h: int = DEFAULT_TARGET_H, smooth_strength: float = 0.975, analysis_stride: int = 4, deadzone_ratio: float = 0.05, max_pan_ratio: float = 0.012, sport_profile: str = "auto", ball_tracking: bool = True, overlay_composite: bool = True, preserve_bottom_overlay: bool = False, panel_mode: bool = False, panel_max_faces: int = 4, panel_detection_stride: int = 2, panel_gap: int = 4, auto_mode: bool = False, progress_cb: Optional[Callable[[float, str], None]] = None):
     cap = cv2.VideoCapture(source_path)
-    if not cap.isOpened():
-        return False, "Could not open input source"
+    if not cap.isOpened(): return False, "Could not open input source"
     src_w, src_h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or DEFAULT_OUTPUT_FPS)
-    fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    if src_w <= 0 or src_h <= 0:
-        cap.release(); return False, "Invalid source dimensions"
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or DEFAULT_OUTPUT_FPS); fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if src_w <= 0 or src_h <= 0: cap.release(); return False, "Invalid source dimensions"
     reframer = SmoothReframer(src_w, src_h, target_w, target_h, smooth_strength, analysis_stride, deadzone_ratio, max_pan_ratio, sport_profile, ball_tracking, overlay_composite=overlay_composite, preserve_bottom_overlay=preserve_bottom_overlay, panel_mode=panel_mode, panel_max_faces=panel_max_faces, panel_detection_stride=panel_detection_stride, panel_gap=panel_gap, auto_mode=auto_mode)
     writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps if fps > 0 else DEFAULT_OUTPUT_FPS, (target_w, target_h))
-    if not writer.isOpened():
-        cap.release(); return False, "Could not create output file"
+    if not writer.isOpened(): cap.release(); return False, "Could not create output file"
     i = 0
     try:
         while True:
             ok, frame = cap.read()
-            if not ok:
-                break
-            writer.write(reframer.process(frame))
-            i += 1
-            if progress_cb and fc > 0 and i % 5 == 0:
-                progress_cb(i / fc, f"Creating vertical master {i}/{fc}")
+            if not ok: break
+            writer.write(reframer.process(frame)); i += 1
+            if progress_cb and fc > 0 and i % 5 == 0: progress_cb(i / fc, f"Creating vertical master {i}/{fc}")
     finally:
         cap.release(); writer.release()
     return True, "Done"
 
-# -----------------------------------------------------------------------------
-# Cloudflare + sessions
-# -----------------------------------------------------------------------------
 @dataclass
 class CFStreamConfig:
     account_id: str
@@ -846,43 +846,19 @@ class LiveSession:
     stats_lock: threading.Lock = field(default_factory=threading.Lock)
     error: str = ""
 
-
 def _stats_snapshot(session: LiveSession) -> dict:
-    lock = getattr(session, "stats_lock", None)
-    if lock:
-        with lock:
-            return dict(getattr(session, "stats", {}) or {})
-    return dict(getattr(session, "stats", {}) or {})
-
-
+    with getattr(session, "stats_lock", threading.Lock()): return dict(getattr(session, "stats", {}) or {})
 def _stats_update(session: LiveSession, values: dict) -> None:
-    lock = getattr(session, "stats_lock", None)
-    if lock:
-        with lock:
-            session.stats.update(values)
-    else:
-        session.stats.update(values)
-
-
+    with getattr(session, "stats_lock", threading.Lock()): session.stats.update(values)
 def _stats_inc(session: LiveSession, key: str, amount: int | float = 1) -> None:
-    lock = getattr(session, "stats_lock", None)
-    if lock:
-        with lock:
-            session.stats[key] = session.stats.get(key, 0) + amount
-    else:
-        session.stats[key] = session.stats.get(key, 0) + amount
-
+    with getattr(session, "stats_lock", threading.Lock()): session.stats[key] = session.stats.get(key, 0) + amount
 
 def cfstream_config_from_inputs(account_id: str, api_token: str, customer_code: str, prefer_low_latency: bool = False) -> CFStreamConfig:
-    if not account_id:
-        raise ValueError("Cloudflare account ID is required.")
-    if not api_token:
-        raise ValueError("Cloudflare API token is required.")
-    if not customer_code:
-        raise ValueError("Cloudflare customer code is required.")
+    if not account_id: raise ValueError("Cloudflare account ID is required.")
+    if not api_token: raise ValueError("Cloudflare API token is required.")
+    if not customer_code: raise ValueError("Cloudflare customer code is required.")
     code = customer_code.strip().replace("customer-", "").replace(".cloudflarestream.com", "").strip("/")
     return CFStreamConfig(account_id.strip(), api_token.strip(), code, bool(prefer_low_latency))
-
 
 def _cf_api_request(cfg: CFStreamConfig, method: str, path: str, payload: Optional[dict] = None):
     url = f"https://api.cloudflare.com/client/v4{path}"
@@ -895,858 +871,199 @@ def _cf_api_request(cfg: CFStreamConfig, method: str, path: str, payload: Option
             return resp.status, (_safe_json_loads(body) if body else {})
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="ignore")
-        parsed = _safe_json_loads(body) if body else {}
-        if not parsed:
-            parsed = {"success": False, "errors": [{"message": body}]}
+        parsed = _safe_json_loads(body) if body else {"success": False, "errors": [{"message": body}]}
         return exc.code, parsed
-
 
 def create_live_input(cfg: CFStreamConfig, name: str, recording_mode: str = "automatic") -> dict:
     payload = {"meta": {"name": name}, "recording": {"mode": recording_mode, "timeoutSeconds": 0}, "preferLowLatency": bool(cfg.prefer_low_latency), "enabled": True}
     status, parsed = _cf_api_request(cfg, "POST", f"/accounts/{cfg.account_id}/stream/live_inputs", payload)
-    if status not in (200, 201) or not parsed.get("success"):
-        raise RuntimeError(f"Create live input failed: {parsed}")
+    if status not in (200, 201) or not parsed.get("success"): raise RuntimeError(f"Create live input failed: {parsed}")
     return parsed["result"]
-
-
-def disable_live_input(cfg: CFStreamConfig, uid: str) -> None:
-    _cf_api_request(cfg, "PUT", f"/accounts/{cfg.account_id}/stream/live_inputs/{uid}", {"enabled": False})
-
-
+def disable_live_input(cfg: CFStreamConfig, uid: str) -> None: _cf_api_request(cfg, "PUT", f"/accounts/{cfg.account_id}/stream/live_inputs/{uid}", {"enabled": False})
 def build_public_playback_urls(cfg: CFStreamConfig, uid: str):
     base = f"https://customer-{cfg.customer_code}.cloudflarestream.com/{uid}"
     return f"{base}/manifest/video.m3u8" + ("?protocol=llhls" if cfg.prefer_low_latency else ""), f"{base}/manifest/video.mpd", f"{base}/iframe?autoplay=true&muted=true&controls=true&preload=metadata"
 
-
 def _common_output_args(fps_int: int) -> list[str]:
     return ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-fps_mode", "cfr", "-r", str(fps_int), "-b:v", DEFAULT_VIDEO_BITRATE, "-maxrate", DEFAULT_MAXRATE, "-bufsize", DEFAULT_BUFSIZE, "-g", str(fps_int), "-keyint_min", str(fps_int), "-sc_threshold", "0", "-profile:v", "high", "-x264-params", f"nal-hrd=cbr:force-cfr=1:scenecut=0:keyint={fps_int}:min-keyint={fps_int}", "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-flvflags", "no_duration_filesize", "-fflags", "nobuffer", "-flags", "low_delay", "-flush_packets", "1", "-muxdelay", "0", "-muxpreload", "0"]
 
-
 def build_push_file_command(reframed_mp4: str, rtmps_url: str, stream_key: str, loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS):
-    target = rtmps_url.rstrip("/") + "/" + stream_key
-    fps_int = max(24, min(60, int(round(output_fps or DEFAULT_OUTPUT_FPS))))
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-y"]
-    if loop_input:
-        cmd += ["-stream_loop", "-1"]
-    cmd += ["-re", "-i", reframed_mp4]
-    if _source_has_audio(reframed_mp4):
-        cmd += ["-map", "0:v:0", "-map", "0:a:0"]
-    else:
-        cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-map", "0:v:0", "-map", "1:a:0"]
+    target = rtmps_url.rstrip("/") + "/" + stream_key; fps_int = max(24, min(60, int(round(output_fps or DEFAULT_OUTPUT_FPS))))
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-y"] + (["-stream_loop", "-1"] if loop_input else []) + ["-re", "-i", reframed_mp4]
+    cmd += (["-map", "0:v:0", "-map", "0:a:0"] if _source_has_audio(reframed_mp4) else ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-map", "0:v:0", "-map", "1:a:0"])
     return cmd + _common_output_args(fps_int) + ["-f", "flv", target]
 
-
 def start_vod_to_live_push(cfg: CFStreamConfig, reframed_mp4: str, asset_name: str, loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS) -> LiveSession:
-    li = create_live_input(cfg, safe_token(Path(asset_name).stem))
-    uid, rtmps_url, key = li["uid"], li["rtmps"]["url"], li["rtmps"]["streamKey"]
-    hls, dash, iframe = build_public_playback_urls(cfg, uid)
-    cmd = build_push_file_command(reframed_mp4, rtmps_url, key, loop_input, output_fps)
+    li = create_live_input(cfg, safe_token(Path(asset_name).stem)); uid, rtmps_url, key = li["uid"], li["rtmps"]["url"], li["rtmps"]["streamKey"]
+    hls, dash, iframe = build_public_playback_urls(cfg, uid); cmd = build_push_file_command(reframed_mp4, rtmps_url, key, loop_input, output_fps)
     log_path = tempfile.NamedTemporaryFile(delete=False, suffix=".log").name
     proc = subprocess.Popen(cmd, stdout=open(log_path, "w", encoding="utf-8"), stderr=subprocess.STDOUT, text=True)
     return LiveSession(uid, rtmps_url, key, hls, dash, iframe, cmd, proc, log_path, status="streaming")
 
-
 def build_realtime_rtmps_push_command(target_w: int, target_h: int, fps: float, rtmps_url: str, stream_key: str):
-    target = rtmps_url.rstrip("/") + "/" + stream_key
-    fps_int = max(24, min(60, int(round(fps or DEFAULT_OUTPUT_FPS))))
+    target = rtmps_url.rstrip("/") + "/" + stream_key; fps_int = max(24, min(60, int(round(fps or DEFAULT_OUTPUT_FPS))))
     return ["ffmpeg", "-hide_banner", "-loglevel", "info", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{target_w}x{target_h}", "-r", str(fps_int), "-i", "-", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-map", "0:v:0", "-map", "1:a:0"] + _common_output_args(fps_int) + ["-f", "flv", target]
 
-# -----------------------------------------------------------------------------
-# Process helpers
-# -----------------------------------------------------------------------------
-def _read_exact(stream, nbytes: int) -> bytes:
-    chunks, remaining = [], nbytes
-    while remaining > 0:
-        data = stream.read(remaining)
-        if not data:
-            break
-        chunks.append(data)
-        remaining -= len(data)
-    return b"".join(chunks)
-
-
 def _read_frame_timeout(proc: subprocess.Popen, nbytes: int, timeout: float = INGEST_READ_TIMEOUT) -> Optional[bytes]:
-    if proc is None or proc.stdout is None:
-        return None
+    if proc is None or proc.stdout is None: return None
     timeout = max(INGEST_READ_TIMEOUT_MIN, min(float(timeout or INGEST_READ_TIMEOUT), INGEST_READ_TIMEOUT_MAX))
     if os.name == "nt":
         q: queue.Queue[Optional[bytes]] = queue.Queue(maxsize=1)
         def _reader():
-            try:
-                q.put(proc.stdout.read(nbytes), block=False)
-            except Exception:
-                with contextlib.suppress(Exception):
-                    q.put(None, block=False)
+            with contextlib.suppress(Exception): q.put(proc.stdout.read(nbytes), block=False)
         threading.Thread(target=_reader, daemon=True).start()
-        try:
-            data = q.get(timeout=timeout)
-        except queue.Empty:
-            return None
+        try: data = q.get(timeout=timeout)
+        except queue.Empty: return None
         return data if data and len(data) == nbytes else None
     fd, deadline, data = proc.stdout.fileno(), time.monotonic() + timeout, bytearray()
     while len(data) < nbytes:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None
-        try:
-            ready, _, _ = select.select([fd], [], [], min(remaining, 0.05))
-        except Exception:
-            return None
+        rem = deadline - time.monotonic()
+        if rem <= 0: return None
+        try: ready, _, _ = select.select([fd], [], [], min(rem, 0.05))
+        except Exception: return None
         if not ready:
-            if proc.poll() is not None:
-                return None
+            if proc.poll() is not None: return None
             continue
-        try:
-            chunk = os.read(fd, nbytes - len(data))
-        except OSError:
-            return None
-        if not chunk:
-            return None
+        try: chunk = os.read(fd, nbytes - len(data))
+        except OSError: return None
+        if not chunk: return None
         data.extend(chunk)
     return bytes(data)
-
 
 def _build_ingest_command(source: str, fps: float, pace_input: bool, loop_file: bool) -> list[str]:
     fps_int = max(24, min(60, int(round(fps or DEFAULT_OUTPUT_FPS))))
     vf = f"fps={fps_int},scale={WORKING_INPUT_W}:{WORKING_INPUT_H}:force_original_aspect_ratio=decrease,pad={WORKING_INPUT_W}:{WORKING_INPUT_H}:(ow-iw)/2:(oh-ih)/2:black"
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-flags", "low_delay"]
-    cmd += _source_input_args(source, pace_input=bool(pace_input) and not is_network_source(source), loop_file=loop_file)
-    cmd += ["-an", "-vf", vf, "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"]
-    return cmd
-
+    return ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-flags", "low_delay"] + _source_input_args(source, pace_input=bool(pace_input) and not is_network_source(source), loop_file=loop_file) + ["-an", "-vf", vf, "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"]
 
 def _open_ingest_process(source: str, fps: float, pace_input: bool, loop_file: bool, log_path: str) -> subprocess.Popen:
-    cmd = _build_ingest_command(source, fps, pace_input, loop_file)
-    log_fp = open(log_path, "a", encoding="utf-8")
-    log_fp.write("\n=== INGEST CMD ===\n" + " ".join(cmd) + "\n")
-    log_fp.flush()
+    cmd = _build_ingest_command(source, fps, pace_input, loop_file); log_fp = open(log_path, "a", encoding="utf-8")
+    log_fp.write("\n=== INGEST CMD ===\n" + " ".join(cmd) + "\n"); log_fp.flush()
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log_fp, bufsize=0)
-
-
 def _start_output_process(session: LiveSession) -> subprocess.Popen:
-    log_fp = open(session.log_path, "a", encoding="utf-8")
-    log_fp.write("\n=== PUSH CMD ===\n" + " ".join(session.ffmpeg_cmd) + "\n")
-    log_fp.flush()
+    log_fp = open(session.log_path, "a", encoding="utf-8"); log_fp.write("\n=== PUSH CMD ===\n" + " ".join(session.ffmpeg_cmd) + "\n"); log_fp.flush()
     return subprocess.Popen(session.ffmpeg_cmd, stdin=subprocess.PIPE, stdout=log_fp, stderr=subprocess.STDOUT, bufsize=0)
-
-
 def _terminate_process(proc: Optional[subprocess.Popen], timeout: float = 8.0) -> None:
-    if proc is None:
-        return
+    if proc is None: return
     with contextlib.suppress(Exception):
         if proc.poll() is None:
             proc.terminate()
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-
-
+            try: proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired: proc.kill()
 def _make_placeholder_frame(w: int, h: int, text: str = "Starting stream...") -> np.ndarray:
-    frame = np.zeros((h, w, 3), dtype=np.uint8)
-    frame[:] = (18, 22, 36)
-    cv2.putText(frame, "Vertical stream", (28, max(48, h // 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(frame, text, (28, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (210, 220, 255), 2, cv2.LINE_AA)
+    frame = np.zeros((h, w, 3), dtype=np.uint8); frame[:] = (18, 22, 36)
+    cv2.putText(frame, "Vertical stream", (28, max(48, h//10)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
     return frame
 
-# -----------------------------------------------------------------------------
-# Realtime worker
-# -----------------------------------------------------------------------------
-def _realtime_worker(session: LiveSession, source: str, target_w: int, target_h: int, delay_seconds: float, smooth_strength: float, analysis_stride: int, deadzone_ratio: float, max_pan_ratio: float, loop_file: bool, pace_input: bool, sport_profile: str, ball_tracking: bool, overlay_composite: bool, preserve_bottom_overlay: bool, panel_mode: bool = False, panel_max_faces: int = 4, panel_detection_stride: int = 2, panel_gap: int = 4, auto_mode: bool = False) -> None:
-    session.status = "probing"
-    start_ts = time.monotonic()
-    info = probe_source(source)
-    source_fps = float(info.get("fps") or DEFAULT_OUTPUT_FPS)
-    if source_fps <= 0 or source_fps > 120:
-        source_fps = DEFAULT_OUTPUT_FPS
-    fps = DEFAULT_OUTPUT_FPS
-    frame_interval = 1.0 / max(fps, 1.0)
-    adaptive_read_timeout = max(INGEST_READ_TIMEOUT_MIN, min(INGEST_READ_TIMEOUT_MAX, max(INGEST_READ_TIMEOUT, frame_interval * 4.0)))
-    src_w, src_h = WORKING_INPUT_W, WORKING_INPUT_H
-    frame_bytes = src_w * src_h * 3
-    delay_seconds = max(0.0, float(delay_seconds))
-    max_buffer_frames = max(4, int(round(MAX_BUFFER_SECONDS * fps)))
-    target_delay_frames = max(0, int(round(delay_seconds * fps)))
-    _stats_update(session, {
-        "fps": round(fps, 3), "fps_source": round(source_fps, 3), "fps_output": round(fps, 3), "ingest_read_timeout": round(adaptive_read_timeout, 3), "ingest_stall_policy": "timeout_is_stall_not_eof",
-        "fps_in": 0.0, "fps_out": 0.0, "fps_process": 0.0, "ingest_fps_1s": 0.0, "output_fps_1s": 0.0, "process_fps_1s": 0.0,
-        "delay_seconds_requested": round(delay_seconds, 2), "delay_seconds_configured": round(delay_seconds, 2), "target_delay_seconds": round(delay_seconds, 2), "target_delay_frames": target_delay_frames, "delay_frames": target_delay_frames, "effective_live_buffer_seconds": round(MAX_BUFFER_SECONDS, 2),
-        "working_resolution": f"{src_w}x{src_h}", "source_reported_resolution": f"{int(info.get('width') or 0)}x{int(info.get('height') or 0)}", "source_reported_fps": round(source_fps, 3),
-        "sport_profile": sport_profile, "panel_mode": panel_mode, "auto_mode": auto_mode and not panel_mode, "frames_in": 0, "frames_processed": 0, "frames_out": 0, "frame_drops": 0, "input_drop_count": 0, "startup_buffer_fill_frames": 0, "output_underruns": 0,
-        "write_failures": 0, "output_write_failures": 0, "buffer_len": 0, "buffer_seconds": 0.0, "buffer_seconds_est": 0.0, "buffer_fill_pct": 0.0, "placeholder_frames": 0, "source_stalls": 0, "consecutive_source_stalls": 0, "ingest_restarts": 0,
-        "processing_ms": 0.0, "avg_process_ms": 0.0, "p95_process_ms": 0.0, "read_ms": 0.0, "avg_ingest_read_ms": 0.0, "p95_ingest_read_ms": 0.0, "write_ms": 0.0, "avg_output_write_ms": 0.0, "p95_output_write_ms": 0.0,
-        "avg_schedule_drift_ms": 0.0, "p95_schedule_drift_ms": 0.0, "startup_ms_to_first_source_frame": 0.0, "startup_ms_to_first_live_frame": 0.0, "ball_confidence": 0.0, "overlay_top": False, "overlay_bottom": False, "panel_active_faces": 0, "panel_detector": "-",
-        "ffmpeg_alive": False, "ingest_alive": False, "ffmpeg_returncode": None, "ingest_returncode": None, "mode": "panel" if panel_mode else "sports" if ball_tracking else "single", "health": "starting", "updated_at_ms": int(time.time() * 1000),
-    })
-    reframer = SmoothReframer(src_w, src_h, target_w, target_h, smooth_strength, analysis_stride, deadzone_ratio, max_pan_ratio, sport_profile, False if panel_mode else ball_tracking, overlay_composite=overlay_composite, preserve_bottom_overlay=preserve_bottom_overlay, panel_mode=panel_mode, panel_max_faces=panel_max_faces, panel_detection_stride=panel_detection_stride, panel_gap=panel_gap, auto_mode=auto_mode and not panel_mode)
-    buffer: collections.deque[tuple[float, np.ndarray]] = collections.deque()
-    placeholder = _make_placeholder_frame(target_w, target_h)
-    last_good_frame = placeholder.copy()
-    try:
-        session.proc = _start_output_process(session)
-    except Exception as exc:
-        session.status = "ffmpeg_start_failed"; session.error = str(exc); return
-    try:
-        prime = max(1, int(fps * LIVE_STARTUP_PRIME_SECONDS))
-        if session.proc.stdin:
-            for _ in range(prime):
-                if session.stop_event.is_set():
-                    break
-                session.proc.stdin.write(placeholder.tobytes())
-                _stats_inc(session, "placeholder_frames"); _stats_inc(session, "frames_out")
-    except Exception as exc:
-        session.status = "ffmpeg_pipe_broken"; session.error = f"Could not prime output: {exc}"; return
-    ingest: Optional[subprocess.Popen] = None
-    source_ended = False
-    next_deadline = time.monotonic() + frame_interval
-    fps_window_start = time.monotonic()
-    win_in = win_out = win_proc = 0
-    consecutive_stalls = 0
-    live_ready = False
-    first_source_seen = False
-    first_live_written = False
-    process_samples: collections.deque[float] = collections.deque(maxlen=120)
-    read_samples: collections.deque[float] = collections.deque(maxlen=120)
-    write_samples: collections.deque[float] = collections.deque(maxlen=120)
-    drift_samples: collections.deque[float] = collections.deque(maxlen=120)
-
-    def p95(vals):
-        if not vals:
-            return 0.0
-        arr = sorted(vals)
-        return float(arr[min(len(arr) - 1, int(round((len(arr) - 1) * 0.95)))])
-
-    def restart_ingest() -> Optional[subprocess.Popen]:
-        nonlocal ingest, consecutive_stalls
-        _terminate_process(ingest)
-        _stats_inc(session, "ingest_restarts")
-        consecutive_stalls += 1
-        _stats_update(session, {"consecutive_source_stalls": consecutive_stalls})
-        if consecutive_stalls > LIVE_MAX_RECOVERABLE_STALLS and not is_network_source(source) and not loop_file:
-            return None
-        return _open_ingest_process(source, fps, pace_input, loop_file, session.log_path)
-
-    try:
-        session.status = "connecting_source"
-        ingest = _open_ingest_process(source, fps, pace_input, loop_file, session.log_path)
-        session.status = "streaming"
-        _stats_update(session, {"health": "running"})
-        while not session.stop_event.is_set():
-            if ingest is None or ingest.poll() is not None:
-                _stats_inc(session, "source_stalls")
-                ingest = restart_ingest()
-                if ingest is None:
-                    session.status = "source_ended"; session.error = f"Source ended/unavailable: {source}"; break
-            capture_time = time.monotonic()
-            rs = time.monotonic()
-            raw = _read_frame_timeout(ingest, frame_bytes, timeout=adaptive_read_timeout) if ingest else None
-            read_ms = (time.monotonic() - rs) * 1000
-            read_samples.append(read_ms)
-            if raw is not None and len(raw) == frame_bytes:
-                consecutive_stalls = 0
-                _stats_update(session, {"consecutive_source_stalls": 0})
-                _stats_inc(session, "frames_in"); win_in += 1
-                if not first_source_seen:
-                    first_source_seen = True
-                    _stats_update(session, {"startup_ms_to_first_source_frame": round((time.monotonic() - start_ts) * 1000, 2)})
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3))
-                ps = time.monotonic()
-                try:
-                    processed = reframer.process(frame)
-                except Exception as exc:
-                    logger.exception("[ReframerError] %s", exc)
-                    processed = last_good_frame
-                process_samples.append((time.monotonic() - ps) * 1000)
-                _stats_inc(session, "frames_processed"); win_proc += 1
-                buffer.append((capture_time, processed.copy()))
-                last_good_frame = processed.copy()
-            else:
-                _stats_inc(session, "source_stalls")
-                consecutive_stalls += 1
-                _stats_update(session, {"consecutive_source_stalls": consecutive_stalls})
-                if consecutive_stalls >= LIVE_MAX_RECOVERABLE_STALLS:
-                    restarted = restart_ingest()
-                    if restarted is not None:
-                        ingest = restarted
-                    elif not loop_file and not is_network_source(source):
-                        source_ended = True
-            while len(buffer) > max_buffer_frames:
-                buffer.popleft(); _stats_inc(session, "frame_drops"); _stats_inc(session, "input_drop_count")
-            cutoff = time.monotonic() - delay_seconds
-            if buffer and buffer[0][0] <= cutoff:
-                out_frame = buffer.popleft()[1]
-                live_ready = True
-            elif buffer:
-                out_frame = last_good_frame
-                _stats_inc(session, "output_underruns" if live_ready else "startup_buffer_fill_frames")
-            elif not source_ended:
-                out_frame = last_good_frame
-                _stats_inc(session, "output_underruns" if live_ready else "startup_buffer_fill_frames")
-            elif source_ended and buffer:
-                out_frame = buffer.popleft()[1]
-            else:
-                if not loop_file:
-                    session.status = "source_ended"
-                    break
-                out_frame = last_good_frame
-            ws = time.monotonic()
-            try:
-                if session.proc is None or session.proc.stdin is None or session.proc.poll() is not None:
-                    raise RuntimeError("Output FFmpeg process is not running")
-                session.proc.stdin.write(out_frame.tobytes())
-                _stats_inc(session, "frames_out"); win_out += 1
-                if not first_live_written:
-                    first_live_written = True
-                    _stats_update(session, {"startup_ms_to_first_live_frame": round((time.monotonic() - start_ts) * 1000, 2)})
-            except Exception as exc:
-                _stats_inc(session, "write_failures"); _stats_inc(session, "output_write_failures")
-                session.status = "ffmpeg_pipe_broken"; session.error = str(exc); break
-            write_ms = (time.monotonic() - ws) * 1000
-            write_samples.append(write_ms)
-            sleep_for = next_deadline - time.monotonic()
-            drift_samples.append(max(0.0, -sleep_for * 1000))
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-            elif -sleep_for > frame_interval * 2:
-                next_deadline = time.monotonic()
-                while len(buffer) > 1:
-                    buffer.popleft(); _stats_inc(session, "frame_drops"); _stats_inc(session, "input_drop_count")
-            next_deadline += frame_interval
-            elapsed = time.monotonic() - fps_window_start
-            if elapsed >= 1.0:
-                fps_in, fps_out, fps_proc = round(win_in / elapsed, 1), round(win_out / elapsed, 1), round(win_proc / elapsed, 1)
-                win_in = win_out = win_proc = 0
-                fps_window_start = time.monotonic()
-            else:
-                snap = _stats_snapshot(session)
-                fps_in, fps_out, fps_proc = snap.get("fps_in", 0.0), snap.get("fps_out", 0.0), snap.get("fps_process", 0.0)
-            bsec = len(buffer) / max(fps, 1)
-            p95_proc, p95_write = round(p95(process_samples), 2), round(p95(write_samples), 2)
-            health = "healthy"
-            if fps_out and fps_out < fps * 0.80:
-                health = "output_fps_low"
-            elif p95_proc > (1000 / fps) * 1.05:
-                health = "processing_bottleneck"
-            elif p95_write > 20:
-                health = "rtmps_backpressure"
-            elif _stats_snapshot(session).get("source_stalls", 0) > 0:
-                health = "source_stalls_detected"
-            _stats_update(session, {"read_ms": round(read_ms, 2), "processing_ms": round(process_samples[-1], 2) if process_samples else 0.0, "write_ms": round(write_ms, 2), "avg_process_ms": round(sum(process_samples) / max(len(process_samples), 1), 2), "p95_process_ms": p95_proc, "avg_ingest_read_ms": round(sum(read_samples) / max(len(read_samples), 1), 2), "p95_ingest_read_ms": round(p95(read_samples), 2), "avg_output_write_ms": round(sum(write_samples) / max(len(write_samples), 1), 2), "p95_output_write_ms": p95_write, "avg_schedule_drift_ms": round(sum(drift_samples) / max(len(drift_samples), 1), 2), "p95_schedule_drift_ms": round(p95(drift_samples), 2), "buffer_len": len(buffer), "buffer_seconds": round(bsec, 3), "buffer_seconds_est": round(bsec, 3), "buffer_fill_pct": round(100 * len(buffer) / max(max_buffer_frames, 1), 1), "fps_in": fps_in, "ingest_fps_1s": fps_in, "fps_out": fps_out, "output_fps_1s": fps_out, "fps_actual": fps_out, "fps_process": fps_proc, "process_fps_1s": fps_proc, "ffmpeg_alive": bool(session.proc is not None and session.proc.poll() is None), "ingest_alive": bool(ingest is not None and ingest.poll() is None), "ffmpeg_returncode": None if session.proc is None else session.proc.poll(), "ingest_returncode": None if ingest is None else ingest.poll(), "ball_confidence": round(reframer.ball_tracker.conf, 3) if reframer.ball_tracker else 0.0, "overlay_top": reframer.overlay_detector.top_overlay is not None, "overlay_bottom": reframer.overlay_detector.bottom_overlay is not None, "panel_active_faces": reframer.panel_tracker.active_count if reframer.panel_tracker else 0, "panel_detector": getattr(reframer.panel_tracker, "detector_backend_name", "-") if reframer.panel_tracker else "-", "mode": "panel" if reframer.panel_mode else "sports" if reframer.ball_tracker is not None else "single", "health": health, "updated_at_ms": int(time.time() * 1000)})
-    except Exception as exc:
-        logger.exception("[WORKER CRASH] %s", exc)
-        session.status = "worker_error"; session.error = str(exc)
-    finally:
-        _terminate_process(ingest)
-        with contextlib.suppress(Exception):
-            if session.proc and session.proc.stdin:
-                session.proc.stdin.close()
-        _terminate_process(session.proc)
-        _stats_update(session, {"updated_at_ms": int(time.time() * 1000)})
-        if session.status not in {"ffmpeg_pipe_broken", "worker_error", "ffmpeg_start_failed", "source_ended"}:
-            session.status = "stopped"
-
-
-def start_realtime_delayed_vertical_push(cfg: CFStreamConfig, source: str, asset_name: str, target_w: int = DEFAULT_TARGET_W, target_h: int = DEFAULT_TARGET_H, delay_seconds: float = 0.0, smooth_strength: float = 0.975, analysis_stride: int = 4, deadzone_ratio: float = 0.05, max_pan_ratio: float = 0.012, loop_file: bool = False, pace_input: bool = True, sport_profile: str = "auto", ball_tracking: bool = True, overlay_composite: bool = True, preserve_bottom_overlay: bool = False, panel_mode: bool = False, panel_max_faces: int = 4, panel_detection_stride: int = 2, panel_gap: int = 4, auto_mode: bool = False) -> LiveSession:
-    li = create_live_input(cfg, safe_token(Path(asset_name).stem))
-    uid, rtmps_url, key = li["uid"], li["rtmps"]["url"], li["rtmps"]["streamKey"]
-    hls, dash, iframe = build_public_playback_urls(cfg, uid)
-    cmd = build_realtime_rtmps_push_command(target_w, target_h, DEFAULT_OUTPUT_FPS, rtmps_url, key)
-    log_path = tempfile.NamedTemporaryFile(delete=False, suffix=".log").name
-    session = LiveSession(uid, rtmps_url, key, hls, dash, iframe, cmd, None, log_path)
-    worker = threading.Thread(target=_realtime_worker, args=(session, source, target_w, target_h, delay_seconds, smooth_strength, analysis_stride, deadzone_ratio, max_pan_ratio, loop_file, pace_input, sport_profile, ball_tracking, overlay_composite, preserve_bottom_overlay, panel_mode, panel_max_faces, panel_detection_stride, panel_gap, auto_mode), daemon=True)
-    session.worker = worker
-    worker.start()
-    return session
-
-
-def cleanup_old_logs(directory: str = "/tmp", max_age_seconds: int = CLEANUP_LOG_MAX_AGE_SECONDS) -> int:
-    now, removed = time.time(), 0
-    try:
-        for name in os.listdir(directory):
-            if name.endswith(".log"):
-                path = os.path.join(directory, name)
-                with contextlib.suppress(Exception):
-                    if now - os.path.getmtime(path) > max_age_seconds:
-                        os.remove(path); removed += 1
-    except Exception:
-        pass
-    return removed
-
-
-def stop_live_session(cfg: CFStreamConfig, session: Optional[LiveSession]) -> None:
-    if not session:
-        return
-    session.stop_event.set()
-    with contextlib.suppress(Exception):
-        if session.worker and session.worker.is_alive():
-            session.worker.join(timeout=8)
-    _terminate_process(session.proc)
-    with contextlib.suppress(Exception):
-        disable_live_input(cfg, session.uid)
-    cleanup_old_logs()
-
-
-def read_log_tail(path: str, max_chars: int = 12000) -> str:
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as fp:
-            return fp.read()[-max_chars:]
-    except Exception:
-        return ""
-
-
-# =============================================================================
-# P0 ARCHITECTURE PATCH: decoupled live pipeline
-# -----------------------------------------------------------------------------
-# This overrides the earlier synchronous realtime worker. The new design starts
-# RTMPS output immediately and decouples ingest, verticalization, and output clock:
-#   ingest thread    -> latest raw frame slot
-#   processor thread -> latest vertical frame slot, drops stale input
-#   output clock     -> fixed 30 FPS write, repeats latest vertical frame if needed
-# This keeps Cloudflare playback alive and low-buffer even when CV processing spikes.
-# =============================================================================
-
-def _realtime_worker(
-    session: LiveSession,
-    source: str,
-    target_w: int,
-    target_h: int,
-    delay_seconds: float,
-    smooth_strength: float,
-    analysis_stride: int,
-    deadzone_ratio: float,
-    max_pan_ratio: float,
-    loop_file: bool,
-    pace_input: bool,
-    sport_profile: str,
-    ball_tracking: bool,
-    overlay_composite: bool,
-    preserve_bottom_overlay: bool,
-    panel_mode: bool = False,
-    panel_max_faces: int = 4,
-    panel_detection_stride: int = 2,
-    panel_gap: int = 4,
-    auto_mode: bool = False,
-) -> None:
-    start_ts = time.monotonic()
-    fps = DEFAULT_OUTPUT_FPS
-    fps_int = max(24, min(60, int(round(fps))))
-    frame_interval = 1.0 / fps_int
-    src_w, src_h = WORKING_INPUT_W, WORKING_INPUT_H
-    frame_bytes = src_w * src_h * 3
-    adaptive_read_timeout = max(INGEST_READ_TIMEOUT_MIN, min(INGEST_READ_TIMEOUT_MAX, max(INGEST_READ_TIMEOUT, frame_interval * 4.0)))
-    delay_seconds = max(0.0, min(float(delay_seconds or 0.0), MAX_BUFFER_SECONDS))
-    max_buffer_frames = max(2, int(round(max(delay_seconds, 0.10) * fps_int)))
-
-    # Shared slots. We intentionally keep latest-only semantics to avoid live latency build-up.
-    lock = threading.Lock()
-    latest_input = {"seq": 0, "ts": 0.0, "frame": None}
+def _realtime_worker(session: LiveSession, source: str, target_w: int, target_h: int, delay_seconds: float, smooth_strength: float, analysis_stride: int, deadzone_ratio: float, max_pan_ratio: float, loop_file: bool, pace_input: bool, sport_profile: str, ball_tracking: bool, overlay_composite: bool, preserve_bottom_overlay: bool, panel_mode: bool=False, panel_max_faces: int=4, panel_detection_stride: int=2, panel_gap: int=4, auto_mode: bool=False) -> None:
+    start_ts = time.monotonic(); fps_int = int(DEFAULT_OUTPUT_FPS); frame_interval = 1.0 / fps_int
+    src_w, src_h = WORKING_INPUT_W, WORKING_INPUT_H; frame_bytes = src_w * src_h * 3
+    delay_seconds = max(0.0, min(float(delay_seconds or 0.0), MAX_BUFFER_SECONDS)); max_buffer_frames = max(3, int(round(max(delay_seconds, 0.25) * fps_int)))
+    lock = threading.Lock(); stop = session.stop_event
     latest_output = {"seq": 0, "ts": 0.0, "frame": _make_placeholder_frame(target_w, target_h)}
-    stop = session.stop_event
     input_buffer: collections.deque[tuple[int, float, np.ndarray]] = collections.deque(maxlen=max_buffer_frames)
-
-    counters = {
-        "frames_in": 0,
-        "frames_processed": 0,
-        "frames_out": 0,
-        "frames_repeated": 0,
-        "frames_dropped_input": 0,
-        "frames_dropped_processing": 0,
-        "source_stalls": 0,
-        "consecutive_source_stalls": 0,
-        "ingest_restarts": 0,
-        "write_failures": 0,
-        "output_write_failures": 0,
-        "frame_drops": 0,
-        "input_drop_count": 0,
-        "startup_buffer_fill_frames": 0,
-        "output_underruns": 0,
-    }
-    process_samples: collections.deque[float] = collections.deque(maxlen=180)
-    read_samples: collections.deque[float] = collections.deque(maxlen=180)
-    write_samples: collections.deque[float] = collections.deque(maxlen=180)
-    drift_samples: collections.deque[float] = collections.deque(maxlen=180)
-    win = {"t": time.monotonic(), "in": 0, "proc": 0, "out": 0}
-
-    def _p95(vals) -> float:
-        if not vals:
-            return 0.0
-        arr = sorted(vals)
-        return float(arr[min(len(arr) - 1, int(round((len(arr) - 1) * 0.95)))])
-
-    _stats_update(session, {
-        "pipeline_arch": "decoupled_fixed_output_clock_v2",
-        "health": "starting",
-        "fps": fps_int,
-        "fps_source": 0.0,
-        "fps_output": fps_int,
-        "fps_in": 0.0,
-        "fps_process": 0.0,
-        "fps_out": 0.0,
-        "ingest_fps_1s": 0.0,
-        "process_fps_1s": 0.0,
-        "output_fps_1s": 0.0,
-        "delay_seconds_requested": round(delay_seconds, 2),
-        "delay_seconds_configured": round(delay_seconds, 2),
-        "target_delay_seconds": round(delay_seconds, 2),
-        "target_delay_frames": int(round(delay_seconds * fps_int)),
-        "effective_live_buffer_seconds": round(max_buffer_frames / fps_int, 3),
-        "ingest_read_timeout": round(adaptive_read_timeout, 3),
-        "ingest_stall_policy": "timeout_is_stall_not_eof",
-        "buffer_policy": "latest_frame_drop_stale_repeat_last",
-        "working_resolution": f"{src_w}x{src_h}",
-        "sport_profile": sport_profile,
-        "panel_mode": bool(panel_mode),
-        "auto_mode": bool(auto_mode and not panel_mode),
-        "mode": "panel" if panel_mode else "sports" if ball_tracking else "single",
-        "frames_in": 0,
-        "frames_processed": 0,
-        "frames_out": 0,
-        "frames_repeated": 0,
-        "frames_dropped_input": 0,
-        "frames_dropped_processing": 0,
-        "frame_drops": 0,
-        "input_drop_count": 0,
-        "startup_buffer_fill_frames": 0,
-        "output_underruns": 0,
-        "source_stalls": 0,
-        "consecutive_source_stalls": 0,
-        "ingest_restarts": 0,
-        "write_failures": 0,
-        "output_write_failures": 0,
-        "processing_ms": 0.0,
-        "avg_process_ms": 0.0,
-        "p95_process_ms": 0.0,
-        "read_ms": 0.0,
-        "avg_ingest_read_ms": 0.0,
-        "p95_ingest_read_ms": 0.0,
-        "write_ms": 0.0,
-        "avg_output_write_ms": 0.0,
-        "p95_output_write_ms": 0.0,
-        "avg_schedule_drift_ms": 0.0,
-        "p95_schedule_drift_ms": 0.0,
-        "buffer_len": 0,
-        "buffer_seconds": 0.0,
-        "buffer_seconds_est": 0.0,
-        "buffer_fill_pct": 0.0,
-        "latest_frame_age_ms": 0.0,
-        "process_budget_exceeded_count": 0,
-        "ball_confidence": 0.0,
-        "panel_active_faces": 0,
-        "panel_detector": "-",
-        "ffmpeg_alive": False,
-        "ingest_alive": False,
-        "ffmpeg_returncode": None,
-        "ingest_returncode": None,
-        "startup_ms_to_first_live_frame": 0.0,
-        "startup_ms_to_first_source_frame": 0.0,
-        "updated_at_ms": int(time.time() * 1000),
-    })
-
+    counters = {k:0 for k in ["frames_in","frames_processed","frames_out","frames_repeated","frames_dropped_input","frames_dropped_processing","source_stalls","consecutive_source_stalls","ingest_restarts","write_failures","output_write_failures","frame_drops","input_drop_count","startup_buffer_fill_frames","output_underruns"]}
+    process_samples=collections.deque(maxlen=180); read_samples=collections.deque(maxlen=180); write_samples=collections.deque(maxlen=180); drift_samples=collections.deque(maxlen=180)
+    win={"t":time.monotonic(),"in":0,"proc":0,"out":0}
+    def p95(v):
+        if not v: return 0.0
+        a=sorted(v); return float(a[min(len(a)-1, int(round((len(a)-1)*.95)))])
+    _stats_update(session,{"pipeline_arch":"decoupled_smooth_microbuffer_v3","buffer_policy":"microbuffer_fifo_drop_when_full_repeat_last","health":"starting","fps":fps_int,"fps_output":fps_int,"effective_live_buffer_seconds":round(max_buffer_frames/fps_int,3),"working_resolution":f"{src_w}x{src_h}","mode":"panel" if panel_mode else "sports" if ball_tracking else "single", **counters, "updated_at_ms":int(time.time()*1000), "ingest_read_timeout": INGEST_READ_TIMEOUT})
     try:
-        session.proc = _start_output_process(session)
-        session.status = "streaming"
-        _stats_update(session, {"health": "running", "ffmpeg_alive": True})
+        session.proc=_start_output_process(session); session.status="streaming"
     except Exception as exc:
-        session.status = "ffmpeg_start_failed"
-        session.error = str(exc)
-        return
-
-    # Start immediately: prime Cloudflare/RTMPS with a few placeholder frames.
-    try:
-        prime = max(1, int(fps_int * LIVE_STARTUP_PRIME_SECONDS))
-        if session.proc.stdin:
-            for _ in range(prime):
-                session.proc.stdin.write(latest_output["frame"].tobytes())
-                counters["frames_out"] += 1
-                counters["frames_repeated"] += 1
-    except Exception as exc:
-        session.status = "ffmpeg_pipe_broken"
-        session.error = f"Could not prime output: {exc}"
-        return
-
-    ingest_holder = {"proc": None}
-
-    def _restart_ingest() -> Optional[subprocess.Popen]:
-        _terminate_process(ingest_holder.get("proc"))
-        counters["ingest_restarts"] += 1
-        if counters["consecutive_source_stalls"] > MAX_CONSECUTIVE_STALLS_NON_LOOP and not is_network_source(source) and not loop_file:
-            return None
-        try:
-            return _open_ingest_process(source, fps_int, pace_input, loop_file, session.log_path)
-        except Exception as exc:
-            session.error = f"Ingest restart failed: {exc}"
-            return None
-
-    def ingest_loop() -> None:
-        try:
-            ingest_holder["proc"] = _open_ingest_process(source, fps_int, pace_input, loop_file, session.log_path)
-            first = True
-            while not stop.is_set():
-                proc = ingest_holder.get("proc")
-                if proc is None or proc.poll() is not None:
-                    counters["source_stalls"] += 1
-                    counters["consecutive_source_stalls"] += 1
-                    proc = _restart_ingest()
-                    ingest_holder["proc"] = proc
-                    if proc is None:
-                        if not loop_file and not is_network_source(source):
-                            session.status = "source_ended"
-                            stop.set()
-                            break
-                        time.sleep(0.05)
-                        continue
-                rs = time.monotonic()
-                raw = _read_frame_timeout(proc, frame_bytes, timeout=adaptive_read_timeout)
-                read_ms = (time.monotonic() - rs) * 1000.0
-                read_samples.append(read_ms)
-                if raw is None or len(raw) != frame_bytes:
-                    counters["source_stalls"] += 1
-                    counters["consecutive_source_stalls"] += 1
-                    if counters["consecutive_source_stalls"] >= 3:
-                        proc = _restart_ingest()
-                        ingest_holder["proc"] = proc
-                    continue
-                counters["consecutive_source_stalls"] = 0
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3)).copy()
-                ts = time.monotonic()
-                with lock:
-                    if len(input_buffer) == input_buffer.maxlen:
-                        counters["frames_dropped_input"] += 1
-                        counters["frame_drops"] += 1
-                        counters["input_drop_count"] += 1
-                    latest_input["seq"] += 1
-                    latest_input["ts"] = ts
-                    latest_input["frame"] = frame
-                    input_buffer.append((latest_input["seq"], ts, frame))
-                counters["frames_in"] += 1
-                win["in"] += 1
-                if first:
-                    first = False
-                    _stats_update(session, {"startup_ms_to_first_source_frame": round((time.monotonic() - start_ts) * 1000.0, 2)})
-        except Exception as exc:
-            logger.exception("[INGEST THREAD ERROR] %s", exc)
-            session.error = f"ingest_error: {exc}"
-
-    def processor_loop() -> None:
-        try:
-            reframer = SmoothReframer(
-                src_w, src_h, target_w, target_h,
-                smooth_strength=smooth_strength,
-                analysis_stride=analysis_stride,
-                deadzone_ratio=deadzone_ratio,
-                max_pan_ratio=max_pan_ratio,
-                sport_profile=sport_profile,
-                ball_tracking=(False if panel_mode else ball_tracking),
-                overlay_composite=overlay_composite,
-                preserve_bottom_overlay=preserve_bottom_overlay,
-                panel_mode=panel_mode,
-                panel_max_faces=panel_max_faces,
-                panel_detection_stride=panel_detection_stride,
-                panel_gap=panel_gap,
-                auto_mode=(auto_mode and not panel_mode),
-            )
-            last_seq = 0
-            budget_ms = 1000.0 / fps_int
-            while not stop.is_set():
-                item = None
-                with lock:
-                    if input_buffer:
-                        # Latest-frame policy: drop stale frames before processing.
-                        if len(input_buffer) > 1:
-                            dropped = len(input_buffer) - 1
-                            counters["frames_dropped_processing"] += dropped
-                            counters["frame_drops"] += dropped
-                            while len(input_buffer) > 1:
-                                input_buffer.popleft()
-                        item = input_buffer.popleft()
-                    elif latest_input["frame"] is not None and latest_input["seq"] != last_seq:
-                        item = (latest_input["seq"], latest_input["ts"], latest_input["frame"])
-                if item is None:
-                    time.sleep(0.002)
-                    continue
-                seq, ts, frame = item
-                if seq == last_seq:
-                    continue
-                last_seq = seq
-                ps = time.monotonic()
-                try:
-                    out = reframer.process(frame)
-                except Exception as exc:
-                    logger.exception("[REFRAMER ERROR] %s", exc)
-                    out = latest_output["frame"]
-                proc_ms = (time.monotonic() - ps) * 1000.0
-                process_samples.append(proc_ms)
-                if proc_ms > budget_ms:
-                    _stats_inc(session, "process_budget_exceeded_count")
-                with lock:
-                    latest_output["seq"] += 1
-                    latest_output["ts"] = time.monotonic()
-                    latest_output["frame"] = out.copy()
-                counters["frames_processed"] += 1
-                win["proc"] += 1
-                _stats_update(session, {
-                    "ball_confidence": round(reframer.ball_tracker.conf, 3) if reframer.ball_tracker is not None else 0.0,
-                    "panel_active_faces": reframer.panel_tracker.active_count if reframer.panel_tracker else 0,
-                    "panel_detector": getattr(reframer.panel_tracker, "detector_backend_name", "-") if reframer.panel_tracker else "-",
-                    "mode": "panel" if reframer.panel_mode else "sports" if reframer.ball_tracker is not None else "single",
-                })
-        except Exception as exc:
-            logger.exception("[PROCESSOR THREAD ERROR] %s", exc)
-            session.error = f"processor_error: {exc}"
-
-    ingest_thread = threading.Thread(target=ingest_loop, daemon=True, name="ingest_loop")
-    processor_thread = threading.Thread(target=processor_loop, daemon=True, name="processor_loop")
-    ingest_thread.start()
-    processor_thread.start()
-
-    # Fixed output clock: never wait for processing. Repeat latest frame when needed.
-    next_deadline = time.monotonic()
-    last_written_seq = -1
-    first_live = True
+        session.status="ffmpeg_start_failed"; session.error=str(exc); return
+    with contextlib.suppress(Exception):
+        for _ in range(max(1,int(fps_int*LIVE_STARTUP_PRIME_SECONDS))): session.proc.stdin.write(latest_output["frame"].tobytes()); counters["frames_out"]+=1
+    ingest_holder={"proc":None}
+    def restart_ingest():
+        _terminate_process(ingest_holder.get("proc")); counters["ingest_restarts"]+=1
+        if counters["consecutive_source_stalls"]>MAX_CONSECUTIVE_STALLS_NON_LOOP and not is_network_source(source) and not loop_file: return None
+        return _open_ingest_process(source, fps_int, pace_input, loop_file, session.log_path)
+    def ingest_loop():
+        seq=0; ingest_holder["proc"]=restart_ingest(); first=True
+        while not stop.is_set():
+            proc=ingest_holder.get("proc")
+            if proc is None or proc.poll() is not None:
+                counters["source_stalls"]+=1; counters["consecutive_source_stalls"]+=1; ingest_holder["proc"]=restart_ingest(); time.sleep(.02); continue
+            rs=time.monotonic(); raw=_read_frame_timeout(proc, frame_bytes, INGEST_READ_TIMEOUT); read_samples.append((time.monotonic()-rs)*1000)
+            if raw is None or len(raw)!=frame_bytes:
+                counters["source_stalls"]+=1; counters["consecutive_source_stalls"]+=1
+                if counters["consecutive_source_stalls"]>=3: ingest_holder["proc"]=restart_ingest()
+                continue
+            counters["consecutive_source_stalls"]=0; seq+=1
+            frame=np.frombuffer(raw,dtype=np.uint8).reshape((src_h,src_w,3)).copy(); ts=time.monotonic()
+            with lock:
+                if len(input_buffer)==input_buffer.maxlen:
+                    counters["frames_dropped_input"]+=1; counters["frame_drops"]+=1; counters["input_drop_count"]+=1
+                input_buffer.append((seq,ts,frame))
+            counters["frames_in"]+=1; win["in"]+=1
+            if first: first=False; _stats_update(session,{"startup_ms_to_first_source_frame":round((time.monotonic()-start_ts)*1000,2)})
+    def proc_loop():
+        reframer=SmoothReframer(src_w,src_h,target_w,target_h,smooth_strength,analysis_stride,deadzone_ratio,max_pan_ratio,sport_profile,False if panel_mode else ball_tracking,overlay_composite=overlay_composite,preserve_bottom_overlay=preserve_bottom_overlay,panel_mode=panel_mode,panel_max_faces=panel_max_faces,panel_detection_stride=panel_detection_stride,panel_gap=panel_gap,auto_mode=auto_mode and not panel_mode)
+        while not stop.is_set():
+            with lock:
+                item=input_buffer.popleft() if input_buffer else None
+            if item is None: time.sleep(.002); continue
+            _,_,frame=item; ps=time.monotonic()
+            try: out=reframer.process(frame)
+            except Exception as exc: logger.exception("[REFRAMER ERROR] %s", exc); out=latest_output["frame"]
+            process_samples.append((time.monotonic()-ps)*1000)
+            with lock: latest_output.update(seq=latest_output["seq"]+1, ts=time.monotonic(), frame=out.copy())
+            counters["frames_processed"]+=1; win["proc"]+=1
+            _stats_update(session,{"ball_confidence":round(reframer.ball_tracker.conf,3) if reframer.ball_tracker else 0.0,"panel_active_faces":reframer.panel_tracker.active_count if reframer.panel_tracker else 0,"panel_detector":getattr(reframer.panel_tracker,"detector_backend_name","-") if reframer.panel_tracker else "-"})
+    threading.Thread(target=ingest_loop,daemon=True,name="ingest_loop").start(); threading.Thread(target=proc_loop,daemon=True,name="processor_loop").start()
+    next_deadline=time.monotonic(); last_seq=-1
     try:
         while not stop.is_set():
             with lock:
-                out_frame = latest_output["frame"].copy()
-                out_seq = latest_output["seq"]
-                blen = len(input_buffer)
-                latest_age_ms = (time.monotonic() - latest_output["ts"]) * 1000.0 if latest_output["ts"] else 0.0
-            if out_seq == last_written_seq:
-                counters["frames_repeated"] += 1
-                if first_live:
-                    counters["startup_buffer_fill_frames"] += 1
-                else:
-                    counters["output_underruns"] += 1
-            last_written_seq = out_seq
-            ws = time.monotonic()
+                out_frame=latest_output["frame"].copy(); out_seq=latest_output["seq"]; blen=len(input_buffer); age=(time.monotonic()-latest_output["ts"])*1000 if latest_output["ts"] else 0
+            if out_seq==last_seq: counters["frames_repeated"]+=1; counters["output_underruns"]+=1
+            last_seq=out_seq; ws=time.monotonic()
             try:
-                if session.proc is None or session.proc.stdin is None or session.proc.poll() is not None:
-                    raise RuntimeError("Output FFmpeg process is not running")
-                session.proc.stdin.write(out_frame.tobytes())
-                counters["frames_out"] += 1
-                win["out"] += 1
-                if first_live:
-                    first_live = False
-                    _stats_update(session, {"startup_ms_to_first_live_frame": round((time.monotonic() - start_ts) * 1000.0, 2)})
+                if session.proc is None or session.proc.stdin is None or session.proc.poll() is not None: raise RuntimeError("Output FFmpeg process is not running")
+                session.proc.stdin.write(out_frame.tobytes()); counters["frames_out"]+=1; win["out"]+=1
             except Exception as exc:
-                counters["write_failures"] += 1
-                counters["output_write_failures"] += 1
-                session.status = "ffmpeg_pipe_broken"
-                session.error = str(exc)
-                break
-            write_samples.append((time.monotonic() - ws) * 1000.0)
-
-            sleep_for = next_deadline - time.monotonic()
-            drift_ms = max(0.0, -sleep_for * 1000.0)
-            drift_samples.append(drift_ms)
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-            elif -sleep_for > frame_interval * 3:
-                next_deadline = time.monotonic()
-            next_deadline += frame_interval
-
-            now = time.monotonic()
-            if now - win["t"] >= 1.0:
-                elapsed = now - win["t"]
-                fps_in = round(win["in"] / elapsed, 1)
-                fps_proc = round(win["proc"] / elapsed, 1)
-                fps_out = round(win["out"] / elapsed, 1)
-                win["t"], win["in"], win["proc"], win["out"] = now, 0, 0, 0
-                p95_proc = round(_p95(process_samples), 2)
-                p95_write = round(_p95(write_samples), 2)
-                health = "healthy"
-                if fps_out < fps_int * 0.90:
-                    health = "output_fps_low"
-                elif p95_proc > (1000.0 / fps_int) * 2.5:
-                    health = "processing_tail_latency_high"
-                elif p95_write > 20:
-                    health = "rtmps_backpressure"
-                elif counters["source_stalls"] > 0:
-                    health = "source_stalls_detected"
-                _stats_update(session, {
-                    "health": health,
-                    "fps_in": fps_in,
-                    "ingest_fps_1s": fps_in,
-                    "fps_process": fps_proc,
-                    "process_fps_1s": fps_proc,
-                    "fps_out": fps_out,
-                    "output_fps_1s": fps_out,
-                    "fps_actual": fps_out,
-                    **counters,
-                    "read_ms": round(read_samples[-1], 2) if read_samples else 0.0,
-                    "avg_ingest_read_ms": round(sum(read_samples) / max(len(read_samples), 1), 2),
-                    "p95_ingest_read_ms": round(_p95(read_samples), 2),
-                    "processing_ms": round(process_samples[-1], 2) if process_samples else 0.0,
-                    "avg_process_ms": round(sum(process_samples) / max(len(process_samples), 1), 2),
-                    "p95_process_ms": p95_proc,
-                    "write_ms": round(write_samples[-1], 2) if write_samples else 0.0,
-                    "avg_output_write_ms": round(sum(write_samples) / max(len(write_samples), 1), 2),
-                    "p95_output_write_ms": p95_write,
-                    "avg_schedule_drift_ms": round(sum(drift_samples) / max(len(drift_samples), 1), 2),
-                    "p95_schedule_drift_ms": round(_p95(drift_samples), 2),
-                    "buffer_len": blen,
-                    "buffer_seconds": round(blen / fps_int, 3),
-                    "buffer_seconds_est": round(blen / fps_int, 3),
-                    "buffer_fill_pct": round(100.0 * blen / max(max_buffer_frames, 1), 1),
-                    "latest_frame_age_ms": round(latest_age_ms, 2),
-                    "ffmpeg_alive": bool(session.proc is not None and session.proc.poll() is None),
-                    "ingest_alive": bool(ingest_holder.get("proc") is not None and ingest_holder["proc"].poll() is None),
-                    "ffmpeg_returncode": None if session.proc is None else session.proc.poll(),
-                    "ingest_returncode": None if ingest_holder.get("proc") is None else ingest_holder["proc"].poll(),
-                    "updated_at_ms": int(time.time() * 1000),
-                })
-    except Exception as exc:
-        logger.exception("[OUTPUT CLOCK ERROR] %s", exc)
-        session.status = "worker_error"
-        session.error = str(exc)
+                counters["write_failures"]+=1; counters["output_write_failures"]+=1; session.status="ffmpeg_pipe_broken"; session.error=str(exc); break
+            write_samples.append((time.monotonic()-ws)*1000); sleep_for=next_deadline-time.monotonic(); drift_samples.append(max(0,-sleep_for*1000))
+            if sleep_for>0: time.sleep(sleep_for)
+            elif -sleep_for>frame_interval*3: next_deadline=time.monotonic()
+            next_deadline+=frame_interval; now=time.monotonic()
+            if now-win["t"]>=1:
+                elapsed=now-win["t"]; fps_in=round(win["in"]/elapsed,1); fps_proc=round(win["proc"]/elapsed,1); fps_out=round(win["out"]/elapsed,1); win={"t":now,"in":0,"proc":0,"out":0}
+                health="healthy" if fps_out>=fps_int*.90 else "output_fps_low"
+                _stats_update(session,{"health":health,"fps_in":fps_in,"ingest_fps_1s":fps_in,"fps_process":fps_proc,"process_fps_1s":fps_proc,"fps_out":fps_out,"output_fps_1s":fps_out,"fps_actual":fps_out,**counters,"read_ms":round(read_samples[-1],2) if read_samples else 0,"p95_ingest_read_ms":round(p95(read_samples),2),"processing_ms":round(process_samples[-1],2) if process_samples else 0,"p95_process_ms":round(p95(process_samples),2),"write_ms":round(write_samples[-1],2) if write_samples else 0,"p95_output_write_ms":round(p95(write_samples),2),"avg_schedule_drift_ms":round(sum(drift_samples)/max(len(drift_samples),1),2),"p95_schedule_drift_ms":round(p95(drift_samples),2),"buffer_len":blen,"buffer_seconds":round(blen/fps_int,3),"buffer_seconds_est":round(blen/fps_int,3),"buffer_fill_pct":round(100*blen/max(max_buffer_frames,1),1),"latest_frame_age_ms":round(age,2),"ffmpeg_alive":session.proc.poll() is None,"ingest_alive":ingest_holder.get("proc") is not None and ingest_holder["proc"].poll() is None,"updated_at_ms":int(time.time()*1000)})
     finally:
-        stop.set()
-        _terminate_process(ingest_holder.get("proc"))
+        stop.set(); _terminate_process(ingest_holder.get("proc"));
         with contextlib.suppress(Exception):
-            if session.proc and session.proc.stdin:
-                session.proc.stdin.close()
+            if session.proc and session.proc.stdin: session.proc.stdin.close()
         _terminate_process(session.proc)
-        _stats_update(session, {"updated_at_ms": int(time.time() * 1000)})
-        if session.status not in {"ffmpeg_pipe_broken", "worker_error", "ffmpeg_start_failed", "source_ended"}:
-            session.status = "stopped"
+        if session.status not in {"ffmpeg_pipe_broken","worker_error","ffmpeg_start_failed","source_ended"}: session.status="stopped"
 
+def start_realtime_delayed_vertical_push(cfg: CFStreamConfig, source: str, asset_name: str, target_w: int = DEFAULT_TARGET_W, target_h: int = DEFAULT_TARGET_H, delay_seconds: float = 0.0, smooth_strength: float = 0.975, analysis_stride: int = 4, deadzone_ratio: float = 0.05, max_pan_ratio: float = 0.012, loop_file: bool = False, pace_input: bool = True, sport_profile: str = "auto", ball_tracking: bool = True, overlay_composite: bool = True, preserve_bottom_overlay: bool = False, panel_mode: bool = False, panel_max_faces: int = 4, panel_detection_stride: int = 2, panel_gap: int = 4, auto_mode: bool = False) -> LiveSession:
+    li=create_live_input(cfg,safe_token(Path(asset_name).stem)); uid,rtmps_url,key=li["uid"],li["rtmps"]["url"],li["rtmps"]["streamKey"]
+    hls,dash,iframe=build_public_playback_urls(cfg,uid); cmd=build_realtime_rtmps_push_command(target_w,target_h,DEFAULT_OUTPUT_FPS,rtmps_url,key); log_path=tempfile.NamedTemporaryFile(delete=False,suffix=".log").name
+    session=LiveSession(uid,rtmps_url,key,hls,dash,iframe,cmd,None,log_path)
+    session.worker=threading.Thread(target=_realtime_worker,args=(session,source,target_w,target_h,delay_seconds,smooth_strength,analysis_stride,deadzone_ratio,max_pan_ratio,loop_file,pace_input,sport_profile,ball_tracking,overlay_composite,preserve_bottom_overlay,panel_mode,panel_max_faces,panel_detection_stride,panel_gap,auto_mode),daemon=True,name="decoupled_realtime_worker"); session.worker.start(); return session
 
-def start_realtime_delayed_vertical_push(
-    cfg: CFStreamConfig,
-    source: str,
-    asset_name: str,
-    target_w: int = DEFAULT_TARGET_W,
-    target_h: int = DEFAULT_TARGET_H,
-    delay_seconds: float = 0.0,
-    smooth_strength: float = 0.975,
-    analysis_stride: int = 4,
-    deadzone_ratio: float = 0.05,
-    max_pan_ratio: float = 0.012,
-    loop_file: bool = False,
-    pace_input: bool = True,
-    sport_profile: str = "auto",
-    ball_tracking: bool = True,
-    overlay_composite: bool = True,
-    preserve_bottom_overlay: bool = False,
-    panel_mode: bool = False,
-    panel_max_faces: int = 4,
-    panel_detection_stride: int = 2,
-    panel_gap: int = 4,
-    auto_mode: bool = False,
-) -> LiveSession:
-    li = create_live_input(cfg, safe_token(Path(asset_name).stem))
-    uid = li["uid"]
-    rtmps_url = li["rtmps"]["url"]
-    key = li["rtmps"]["streamKey"]
-    hls, dash, iframe = build_public_playback_urls(cfg, uid)
-    cmd = build_realtime_rtmps_push_command(target_w, target_h, DEFAULT_OUTPUT_FPS, rtmps_url, key)
-    log_path = tempfile.NamedTemporaryFile(delete=False, suffix=".log").name
-    session = LiveSession(uid, rtmps_url, key, hls, dash, iframe, cmd, None, log_path)
-    worker = threading.Thread(
-        target=_realtime_worker,
-        args=(session, source, target_w, target_h, delay_seconds, smooth_strength, analysis_stride, deadzone_ratio, max_pan_ratio, loop_file, pace_input, sport_profile, ball_tracking, overlay_composite, preserve_bottom_overlay, panel_mode, panel_max_faces, panel_detection_stride, panel_gap, auto_mode),
-        daemon=True,
-        name="decoupled_realtime_worker",
-    )
-    session.worker = worker
-    worker.start()
-    return session
+def cleanup_old_logs(directory: str = "/tmp", max_age_seconds: int = CLEANUP_LOG_MAX_AGE_SECONDS) -> int:
+    removed=0; now=time.time()
+    with contextlib.suppress(Exception):
+        for name in os.listdir(directory):
+            if name.endswith(".log"):
+                p=os.path.join(directory,name)
+                with contextlib.suppress(Exception):
+                    if now-os.path.getmtime(p)>max_age_seconds: os.remove(p); removed+=1
+    return removed
+
+def stop_live_session(cfg: CFStreamConfig, session: Optional[LiveSession]) -> None:
+    if not session: return
+    session.stop_event.set()
+    with contextlib.suppress(Exception):
+        if session.worker and session.worker.is_alive(): session.worker.join(timeout=8)
+    _terminate_process(session.proc)
+    with contextlib.suppress(Exception): disable_live_input(cfg, session.uid)
+    cleanup_old_logs()
+def read_log_tail(path: str, max_chars: int = 12000) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fp: return fp.read()[-max_chars:]
+    except Exception: return ""
