@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import collections
@@ -35,9 +36,6 @@ try:
 except Exception:
     pass
 
-# -----------------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------------
 DEFAULT_TARGET_W = 540
 DEFAULT_TARGET_H = 960
 MAX_UPLOAD_MB = 400
@@ -48,16 +46,16 @@ DEFAULT_OUTPUT_FPS = 30.0
 DEFAULT_VIDEO_BITRATE = "3500k"
 DEFAULT_MAXRATE = "3500k"
 DEFAULT_BUFSIZE = "3500k"
-MAX_BUFFER_SECONDS = 1.0
-LIVE_STARTUP_PRIME_SECONDS = 0.25
-LIVE_MAX_RECOVERABLE_STALLS = 3
+MAX_BUFFER_SECONDS = 0.50
+LIVE_STARTUP_PRIME_SECONDS = 0.15
 INGEST_READ_TIMEOUT = 0.75
 INGEST_READ_TIMEOUT_MIN = 0.25
 INGEST_READ_TIMEOUT_MAX = 1.25
 CLEANUP_LOG_MAX_AGE_SECONDS = 6 * 60 * 60
+MAX_CONSECUTIVE_STALLS_NON_LOOP = 12
 
 # -----------------------------------------------------------------------------
-# Basic utilities
+# Utilities
 # -----------------------------------------------------------------------------
 def ffmpeg_ok() -> bool:
     try:
@@ -79,9 +77,8 @@ def is_network_source(source: str) -> bool:
 
 
 def _source_input_args(source: str, pace_input: bool = False, loop_file: bool = False) -> list[str]:
-    """Input args. Critical fix: +nobuffer is network-only; local files should not use it."""
     is_net = is_network_source(source)
-    args: list[str] = [
+    args = [
         "-fflags", "+genpts+discardcorrupt+nobuffer" if is_net else "+genpts+discardcorrupt",
         "-analyzeduration", "20000000",
         "-probesize", "20000000",
@@ -200,7 +197,7 @@ def _overlay_heights(target_h: int, top_strip: Optional[np.ndarray], bottom_stri
     return top_h, bottom_h
 
 # -----------------------------------------------------------------------------
-# Overlay / scene detection
+# CV components
 # -----------------------------------------------------------------------------
 class OverlayDetector:
     def __init__(self, src_w: int, src_h: int, top_scan_ratio: float = 0.18, bottom_scan_ratio: float = 0.14, warmup_frames: int = 18):
@@ -217,7 +214,7 @@ class OverlayDetector:
         self.bottom_hold = 0
         self.exclusion_mask = np.zeros((self.src_h, self.src_w), dtype=np.uint8)
 
-    def _detect_top(self, patch: np.ndarray, avg: np.ndarray) -> Optional[tuple[int, int]]:
+    def _detect_band(self, patch: np.ndarray, avg: np.ndarray, top: bool) -> Optional[tuple[int, int]]:
         gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
         avg_g = cv2.cvtColor(np.clip(avg, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
         diff = np.abs(gray.astype(np.float32) - avg_g.astype(np.float32)).mean(axis=1)
@@ -227,20 +224,10 @@ class OverlayDetector:
         if idx.size == 0:
             return None
         y0, y1 = int(idx[0]), int(idx[-1] + 1)
-        if y0 > int(0.18 * patch.shape[0]) or y1 - y0 < 10:
-            return None
-        return max(0, y0 - 6), min(patch.shape[0], y1 + 6)
-
-    def _detect_bottom(self, patch: np.ndarray, avg: np.ndarray) -> Optional[tuple[int, int]]:
-        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-        avg_g = cv2.cvtColor(np.clip(avg, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
-        diff = np.abs(gray.astype(np.float32) - avg_g.astype(np.float32)).mean(axis=1)
-        edges = cv2.Canny(gray, 60, 180).mean(axis=1) / 255.0
-        active = (diff < 12.0) & (edges > 0.018)
-        idx = np.where(active)[0]
-        if idx.size == 0:
-            return None
-        y0, y1 = int(idx[0]), int(idx[-1] + 1)
+        if top:
+            if y0 > int(0.18 * patch.shape[0]) or y1 - y0 < 10:
+                return None
+            return max(0, y0 - 6), min(patch.shape[0], y1 + 6)
         if y1 < int(0.50 * patch.shape[0]) or y1 - y0 < 8:
             return None
         return max(0, y0 - 4), min(patch.shape[0], y1 + 4)
@@ -257,8 +244,8 @@ class OverlayDetector:
         self.bottom_avg = alpha * self.bottom_avg + (1 - alpha) * bot_patch
         if self.frame_count <= self.warmup_frames:
             return
-        tr = self._detect_top(frame[:self.top_scan_h], self.top_avg)
-        br_local = self._detect_bottom(frame[self.src_h - self.bottom_scan_h:], self.bottom_avg)
+        tr = self._detect_band(frame[:self.top_scan_h], self.top_avg, True)
+        br_local = self._detect_band(frame[self.src_h - self.bottom_scan_h:], self.bottom_avg, False)
         br = None
         if br_local:
             off = self.src_h - self.bottom_scan_h
@@ -324,9 +311,6 @@ class SceneChangeDetector:
         self.prev_hist, self.prev_gray = hist, gray.copy()
         return cut
 
-# -----------------------------------------------------------------------------
-# Tracking / reframing
-# -----------------------------------------------------------------------------
 class BallTracker:
     def __init__(self, src_w: int, src_h: int, sport_profile: str = "auto"):
         self.src_w, self.src_h = int(src_w), int(src_h)
@@ -336,25 +320,19 @@ class BallTracker:
         self.radius = 0.0
         self.conf = 0.0
         self.missing_count = 0
-        self.max_missing = 18
         md = min(src_w, src_h)
         self.min_r = max(3, int(md * 0.006))
         self.max_r = max(self.min_r + 4, int(md * 0.038))
 
     def update(self, frame: np.ndarray, gray: np.ndarray, motion_mask: Optional[np.ndarray], exclusion_mask: Optional[np.ndarray] = None):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        masks = []
         if self.sport == "basketball":
-            masks.append(cv2.inRange(hsv, np.array([3, 80, 80]), np.array([22, 255, 255])))
+            mask = cv2.inRange(hsv, np.array([3, 80, 80]), np.array([22, 255, 255]))
         elif self.sport == "cricket":
-            masks.append(cv2.inRange(hsv, np.array([0, 0, 180]), np.array([179, 50, 255])))
-            masks.append(cv2.inRange(hsv, np.array([0, 100, 60]), np.array([10, 255, 255])))
-            masks.append(cv2.inRange(hsv, np.array([165, 100, 60]), np.array([179, 255, 255])))
+            mask = cv2.bitwise_or(cv2.inRange(hsv, np.array([0, 0, 180]), np.array([179, 50, 255])), cv2.inRange(hsv, np.array([0, 100, 60]), np.array([10, 255, 255])))
+            mask = cv2.bitwise_or(mask, cv2.inRange(hsv, np.array([165, 100, 60]), np.array([179, 255, 255])))
         else:
-            masks.append(cv2.inRange(hsv, np.array([0, 0, 170]), np.array([179, 65, 255])))
-        mask = masks[0]
-        for m in masks[1:]:
-            mask = cv2.bitwise_or(mask, m)
+            mask = cv2.inRange(hsv, np.array([0, 0, 170]), np.array([179, 65, 255]))
         if exclusion_mask is not None:
             mask[exclusion_mask > 0] = 0
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
@@ -374,7 +352,7 @@ class BallTracker:
         if best is None or best_score < 0.12:
             self.missing_count += 1
             self.conf *= 0.93
-            if self.missing_count > self.max_missing:
+            if self.missing_count > 18:
                 self.conf = 0.0
             return None
         cx, cy, r = best
@@ -1314,3 +1292,461 @@ def read_log_tail(path: str, max_chars: int = 12000) -> str:
             return fp.read()[-max_chars:]
     except Exception:
         return ""
+
+
+# =============================================================================
+# P0 ARCHITECTURE PATCH: decoupled live pipeline
+# -----------------------------------------------------------------------------
+# This overrides the earlier synchronous realtime worker. The new design starts
+# RTMPS output immediately and decouples ingest, verticalization, and output clock:
+#   ingest thread    -> latest raw frame slot
+#   processor thread -> latest vertical frame slot, drops stale input
+#   output clock     -> fixed 30 FPS write, repeats latest vertical frame if needed
+# This keeps Cloudflare playback alive and low-buffer even when CV processing spikes.
+# =============================================================================
+
+def _realtime_worker(
+    session: LiveSession,
+    source: str,
+    target_w: int,
+    target_h: int,
+    delay_seconds: float,
+    smooth_strength: float,
+    analysis_stride: int,
+    deadzone_ratio: float,
+    max_pan_ratio: float,
+    loop_file: bool,
+    pace_input: bool,
+    sport_profile: str,
+    ball_tracking: bool,
+    overlay_composite: bool,
+    preserve_bottom_overlay: bool,
+    panel_mode: bool = False,
+    panel_max_faces: int = 4,
+    panel_detection_stride: int = 2,
+    panel_gap: int = 4,
+    auto_mode: bool = False,
+) -> None:
+    start_ts = time.monotonic()
+    fps = DEFAULT_OUTPUT_FPS
+    fps_int = max(24, min(60, int(round(fps))))
+    frame_interval = 1.0 / fps_int
+    src_w, src_h = WORKING_INPUT_W, WORKING_INPUT_H
+    frame_bytes = src_w * src_h * 3
+    adaptive_read_timeout = max(INGEST_READ_TIMEOUT_MIN, min(INGEST_READ_TIMEOUT_MAX, max(INGEST_READ_TIMEOUT, frame_interval * 4.0)))
+    delay_seconds = max(0.0, min(float(delay_seconds or 0.0), MAX_BUFFER_SECONDS))
+    max_buffer_frames = max(2, int(round(max(delay_seconds, 0.10) * fps_int)))
+
+    # Shared slots. We intentionally keep latest-only semantics to avoid live latency build-up.
+    lock = threading.Lock()
+    latest_input = {"seq": 0, "ts": 0.0, "frame": None}
+    latest_output = {"seq": 0, "ts": 0.0, "frame": _make_placeholder_frame(target_w, target_h)}
+    stop = session.stop_event
+    input_buffer: collections.deque[tuple[int, float, np.ndarray]] = collections.deque(maxlen=max_buffer_frames)
+
+    counters = {
+        "frames_in": 0,
+        "frames_processed": 0,
+        "frames_out": 0,
+        "frames_repeated": 0,
+        "frames_dropped_input": 0,
+        "frames_dropped_processing": 0,
+        "source_stalls": 0,
+        "consecutive_source_stalls": 0,
+        "ingest_restarts": 0,
+        "write_failures": 0,
+        "output_write_failures": 0,
+        "frame_drops": 0,
+        "input_drop_count": 0,
+        "startup_buffer_fill_frames": 0,
+        "output_underruns": 0,
+    }
+    process_samples: collections.deque[float] = collections.deque(maxlen=180)
+    read_samples: collections.deque[float] = collections.deque(maxlen=180)
+    write_samples: collections.deque[float] = collections.deque(maxlen=180)
+    drift_samples: collections.deque[float] = collections.deque(maxlen=180)
+    win = {"t": time.monotonic(), "in": 0, "proc": 0, "out": 0}
+
+    def _p95(vals) -> float:
+        if not vals:
+            return 0.0
+        arr = sorted(vals)
+        return float(arr[min(len(arr) - 1, int(round((len(arr) - 1) * 0.95)))])
+
+    _stats_update(session, {
+        "pipeline_arch": "decoupled_fixed_output_clock_v2",
+        "health": "starting",
+        "fps": fps_int,
+        "fps_source": 0.0,
+        "fps_output": fps_int,
+        "fps_in": 0.0,
+        "fps_process": 0.0,
+        "fps_out": 0.0,
+        "ingest_fps_1s": 0.0,
+        "process_fps_1s": 0.0,
+        "output_fps_1s": 0.0,
+        "delay_seconds_requested": round(delay_seconds, 2),
+        "delay_seconds_configured": round(delay_seconds, 2),
+        "target_delay_seconds": round(delay_seconds, 2),
+        "target_delay_frames": int(round(delay_seconds * fps_int)),
+        "effective_live_buffer_seconds": round(max_buffer_frames / fps_int, 3),
+        "ingest_read_timeout": round(adaptive_read_timeout, 3),
+        "ingest_stall_policy": "timeout_is_stall_not_eof",
+        "buffer_policy": "latest_frame_drop_stale_repeat_last",
+        "working_resolution": f"{src_w}x{src_h}",
+        "sport_profile": sport_profile,
+        "panel_mode": bool(panel_mode),
+        "auto_mode": bool(auto_mode and not panel_mode),
+        "mode": "panel" if panel_mode else "sports" if ball_tracking else "single",
+        "frames_in": 0,
+        "frames_processed": 0,
+        "frames_out": 0,
+        "frames_repeated": 0,
+        "frames_dropped_input": 0,
+        "frames_dropped_processing": 0,
+        "frame_drops": 0,
+        "input_drop_count": 0,
+        "startup_buffer_fill_frames": 0,
+        "output_underruns": 0,
+        "source_stalls": 0,
+        "consecutive_source_stalls": 0,
+        "ingest_restarts": 0,
+        "write_failures": 0,
+        "output_write_failures": 0,
+        "processing_ms": 0.0,
+        "avg_process_ms": 0.0,
+        "p95_process_ms": 0.0,
+        "read_ms": 0.0,
+        "avg_ingest_read_ms": 0.0,
+        "p95_ingest_read_ms": 0.0,
+        "write_ms": 0.0,
+        "avg_output_write_ms": 0.0,
+        "p95_output_write_ms": 0.0,
+        "avg_schedule_drift_ms": 0.0,
+        "p95_schedule_drift_ms": 0.0,
+        "buffer_len": 0,
+        "buffer_seconds": 0.0,
+        "buffer_seconds_est": 0.0,
+        "buffer_fill_pct": 0.0,
+        "latest_frame_age_ms": 0.0,
+        "process_budget_exceeded_count": 0,
+        "ball_confidence": 0.0,
+        "panel_active_faces": 0,
+        "panel_detector": "-",
+        "ffmpeg_alive": False,
+        "ingest_alive": False,
+        "ffmpeg_returncode": None,
+        "ingest_returncode": None,
+        "startup_ms_to_first_live_frame": 0.0,
+        "startup_ms_to_first_source_frame": 0.0,
+        "updated_at_ms": int(time.time() * 1000),
+    })
+
+    try:
+        session.proc = _start_output_process(session)
+        session.status = "streaming"
+        _stats_update(session, {"health": "running", "ffmpeg_alive": True})
+    except Exception as exc:
+        session.status = "ffmpeg_start_failed"
+        session.error = str(exc)
+        return
+
+    # Start immediately: prime Cloudflare/RTMPS with a few placeholder frames.
+    try:
+        prime = max(1, int(fps_int * LIVE_STARTUP_PRIME_SECONDS))
+        if session.proc.stdin:
+            for _ in range(prime):
+                session.proc.stdin.write(latest_output["frame"].tobytes())
+                counters["frames_out"] += 1
+                counters["frames_repeated"] += 1
+    except Exception as exc:
+        session.status = "ffmpeg_pipe_broken"
+        session.error = f"Could not prime output: {exc}"
+        return
+
+    ingest_holder = {"proc": None}
+
+    def _restart_ingest() -> Optional[subprocess.Popen]:
+        _terminate_process(ingest_holder.get("proc"))
+        counters["ingest_restarts"] += 1
+        if counters["consecutive_source_stalls"] > MAX_CONSECUTIVE_STALLS_NON_LOOP and not is_network_source(source) and not loop_file:
+            return None
+        try:
+            return _open_ingest_process(source, fps_int, pace_input, loop_file, session.log_path)
+        except Exception as exc:
+            session.error = f"Ingest restart failed: {exc}"
+            return None
+
+    def ingest_loop() -> None:
+        try:
+            ingest_holder["proc"] = _open_ingest_process(source, fps_int, pace_input, loop_file, session.log_path)
+            first = True
+            while not stop.is_set():
+                proc = ingest_holder.get("proc")
+                if proc is None or proc.poll() is not None:
+                    counters["source_stalls"] += 1
+                    counters["consecutive_source_stalls"] += 1
+                    proc = _restart_ingest()
+                    ingest_holder["proc"] = proc
+                    if proc is None:
+                        if not loop_file and not is_network_source(source):
+                            session.status = "source_ended"
+                            stop.set()
+                            break
+                        time.sleep(0.05)
+                        continue
+                rs = time.monotonic()
+                raw = _read_frame_timeout(proc, frame_bytes, timeout=adaptive_read_timeout)
+                read_ms = (time.monotonic() - rs) * 1000.0
+                read_samples.append(read_ms)
+                if raw is None or len(raw) != frame_bytes:
+                    counters["source_stalls"] += 1
+                    counters["consecutive_source_stalls"] += 1
+                    if counters["consecutive_source_stalls"] >= 3:
+                        proc = _restart_ingest()
+                        ingest_holder["proc"] = proc
+                    continue
+                counters["consecutive_source_stalls"] = 0
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3)).copy()
+                ts = time.monotonic()
+                with lock:
+                    if len(input_buffer) == input_buffer.maxlen:
+                        counters["frames_dropped_input"] += 1
+                        counters["frame_drops"] += 1
+                        counters["input_drop_count"] += 1
+                    latest_input["seq"] += 1
+                    latest_input["ts"] = ts
+                    latest_input["frame"] = frame
+                    input_buffer.append((latest_input["seq"], ts, frame))
+                counters["frames_in"] += 1
+                win["in"] += 1
+                if first:
+                    first = False
+                    _stats_update(session, {"startup_ms_to_first_source_frame": round((time.monotonic() - start_ts) * 1000.0, 2)})
+        except Exception as exc:
+            logger.exception("[INGEST THREAD ERROR] %s", exc)
+            session.error = f"ingest_error: {exc}"
+
+    def processor_loop() -> None:
+        try:
+            reframer = SmoothReframer(
+                src_w, src_h, target_w, target_h,
+                smooth_strength=smooth_strength,
+                analysis_stride=analysis_stride,
+                deadzone_ratio=deadzone_ratio,
+                max_pan_ratio=max_pan_ratio,
+                sport_profile=sport_profile,
+                ball_tracking=(False if panel_mode else ball_tracking),
+                overlay_composite=overlay_composite,
+                preserve_bottom_overlay=preserve_bottom_overlay,
+                panel_mode=panel_mode,
+                panel_max_faces=panel_max_faces,
+                panel_detection_stride=panel_detection_stride,
+                panel_gap=panel_gap,
+                auto_mode=(auto_mode and not panel_mode),
+            )
+            last_seq = 0
+            budget_ms = 1000.0 / fps_int
+            while not stop.is_set():
+                item = None
+                with lock:
+                    if input_buffer:
+                        # Latest-frame policy: drop stale frames before processing.
+                        if len(input_buffer) > 1:
+                            dropped = len(input_buffer) - 1
+                            counters["frames_dropped_processing"] += dropped
+                            counters["frame_drops"] += dropped
+                            while len(input_buffer) > 1:
+                                input_buffer.popleft()
+                        item = input_buffer.popleft()
+                    elif latest_input["frame"] is not None and latest_input["seq"] != last_seq:
+                        item = (latest_input["seq"], latest_input["ts"], latest_input["frame"])
+                if item is None:
+                    time.sleep(0.002)
+                    continue
+                seq, ts, frame = item
+                if seq == last_seq:
+                    continue
+                last_seq = seq
+                ps = time.monotonic()
+                try:
+                    out = reframer.process(frame)
+                except Exception as exc:
+                    logger.exception("[REFRAMER ERROR] %s", exc)
+                    out = latest_output["frame"]
+                proc_ms = (time.monotonic() - ps) * 1000.0
+                process_samples.append(proc_ms)
+                if proc_ms > budget_ms:
+                    _stats_inc(session, "process_budget_exceeded_count")
+                with lock:
+                    latest_output["seq"] += 1
+                    latest_output["ts"] = time.monotonic()
+                    latest_output["frame"] = out.copy()
+                counters["frames_processed"] += 1
+                win["proc"] += 1
+                _stats_update(session, {
+                    "ball_confidence": round(reframer.ball_tracker.conf, 3) if reframer.ball_tracker is not None else 0.0,
+                    "panel_active_faces": reframer.panel_tracker.active_count if reframer.panel_tracker else 0,
+                    "panel_detector": getattr(reframer.panel_tracker, "detector_backend_name", "-") if reframer.panel_tracker else "-",
+                    "mode": "panel" if reframer.panel_mode else "sports" if reframer.ball_tracker is not None else "single",
+                })
+        except Exception as exc:
+            logger.exception("[PROCESSOR THREAD ERROR] %s", exc)
+            session.error = f"processor_error: {exc}"
+
+    ingest_thread = threading.Thread(target=ingest_loop, daemon=True, name="ingest_loop")
+    processor_thread = threading.Thread(target=processor_loop, daemon=True, name="processor_loop")
+    ingest_thread.start()
+    processor_thread.start()
+
+    # Fixed output clock: never wait for processing. Repeat latest frame when needed.
+    next_deadline = time.monotonic()
+    last_written_seq = -1
+    first_live = True
+    try:
+        while not stop.is_set():
+            with lock:
+                out_frame = latest_output["frame"].copy()
+                out_seq = latest_output["seq"]
+                blen = len(input_buffer)
+                latest_age_ms = (time.monotonic() - latest_output["ts"]) * 1000.0 if latest_output["ts"] else 0.0
+            if out_seq == last_written_seq:
+                counters["frames_repeated"] += 1
+                if first_live:
+                    counters["startup_buffer_fill_frames"] += 1
+                else:
+                    counters["output_underruns"] += 1
+            last_written_seq = out_seq
+            ws = time.monotonic()
+            try:
+                if session.proc is None or session.proc.stdin is None or session.proc.poll() is not None:
+                    raise RuntimeError("Output FFmpeg process is not running")
+                session.proc.stdin.write(out_frame.tobytes())
+                counters["frames_out"] += 1
+                win["out"] += 1
+                if first_live:
+                    first_live = False
+                    _stats_update(session, {"startup_ms_to_first_live_frame": round((time.monotonic() - start_ts) * 1000.0, 2)})
+            except Exception as exc:
+                counters["write_failures"] += 1
+                counters["output_write_failures"] += 1
+                session.status = "ffmpeg_pipe_broken"
+                session.error = str(exc)
+                break
+            write_samples.append((time.monotonic() - ws) * 1000.0)
+
+            sleep_for = next_deadline - time.monotonic()
+            drift_ms = max(0.0, -sleep_for * 1000.0)
+            drift_samples.append(drift_ms)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            elif -sleep_for > frame_interval * 3:
+                next_deadline = time.monotonic()
+            next_deadline += frame_interval
+
+            now = time.monotonic()
+            if now - win["t"] >= 1.0:
+                elapsed = now - win["t"]
+                fps_in = round(win["in"] / elapsed, 1)
+                fps_proc = round(win["proc"] / elapsed, 1)
+                fps_out = round(win["out"] / elapsed, 1)
+                win["t"], win["in"], win["proc"], win["out"] = now, 0, 0, 0
+                p95_proc = round(_p95(process_samples), 2)
+                p95_write = round(_p95(write_samples), 2)
+                health = "healthy"
+                if fps_out < fps_int * 0.90:
+                    health = "output_fps_low"
+                elif p95_proc > (1000.0 / fps_int) * 2.5:
+                    health = "processing_tail_latency_high"
+                elif p95_write > 20:
+                    health = "rtmps_backpressure"
+                elif counters["source_stalls"] > 0:
+                    health = "source_stalls_detected"
+                _stats_update(session, {
+                    "health": health,
+                    "fps_in": fps_in,
+                    "ingest_fps_1s": fps_in,
+                    "fps_process": fps_proc,
+                    "process_fps_1s": fps_proc,
+                    "fps_out": fps_out,
+                    "output_fps_1s": fps_out,
+                    "fps_actual": fps_out,
+                    **counters,
+                    "read_ms": round(read_samples[-1], 2) if read_samples else 0.0,
+                    "avg_ingest_read_ms": round(sum(read_samples) / max(len(read_samples), 1), 2),
+                    "p95_ingest_read_ms": round(_p95(read_samples), 2),
+                    "processing_ms": round(process_samples[-1], 2) if process_samples else 0.0,
+                    "avg_process_ms": round(sum(process_samples) / max(len(process_samples), 1), 2),
+                    "p95_process_ms": p95_proc,
+                    "write_ms": round(write_samples[-1], 2) if write_samples else 0.0,
+                    "avg_output_write_ms": round(sum(write_samples) / max(len(write_samples), 1), 2),
+                    "p95_output_write_ms": p95_write,
+                    "avg_schedule_drift_ms": round(sum(drift_samples) / max(len(drift_samples), 1), 2),
+                    "p95_schedule_drift_ms": round(_p95(drift_samples), 2),
+                    "buffer_len": blen,
+                    "buffer_seconds": round(blen / fps_int, 3),
+                    "buffer_seconds_est": round(blen / fps_int, 3),
+                    "buffer_fill_pct": round(100.0 * blen / max(max_buffer_frames, 1), 1),
+                    "latest_frame_age_ms": round(latest_age_ms, 2),
+                    "ffmpeg_alive": bool(session.proc is not None and session.proc.poll() is None),
+                    "ingest_alive": bool(ingest_holder.get("proc") is not None and ingest_holder["proc"].poll() is None),
+                    "ffmpeg_returncode": None if session.proc is None else session.proc.poll(),
+                    "ingest_returncode": None if ingest_holder.get("proc") is None else ingest_holder["proc"].poll(),
+                    "updated_at_ms": int(time.time() * 1000),
+                })
+    except Exception as exc:
+        logger.exception("[OUTPUT CLOCK ERROR] %s", exc)
+        session.status = "worker_error"
+        session.error = str(exc)
+    finally:
+        stop.set()
+        _terminate_process(ingest_holder.get("proc"))
+        with contextlib.suppress(Exception):
+            if session.proc and session.proc.stdin:
+                session.proc.stdin.close()
+        _terminate_process(session.proc)
+        _stats_update(session, {"updated_at_ms": int(time.time() * 1000)})
+        if session.status not in {"ffmpeg_pipe_broken", "worker_error", "ffmpeg_start_failed", "source_ended"}:
+            session.status = "stopped"
+
+
+def start_realtime_delayed_vertical_push(
+    cfg: CFStreamConfig,
+    source: str,
+    asset_name: str,
+    target_w: int = DEFAULT_TARGET_W,
+    target_h: int = DEFAULT_TARGET_H,
+    delay_seconds: float = 0.0,
+    smooth_strength: float = 0.975,
+    analysis_stride: int = 4,
+    deadzone_ratio: float = 0.05,
+    max_pan_ratio: float = 0.012,
+    loop_file: bool = False,
+    pace_input: bool = True,
+    sport_profile: str = "auto",
+    ball_tracking: bool = True,
+    overlay_composite: bool = True,
+    preserve_bottom_overlay: bool = False,
+    panel_mode: bool = False,
+    panel_max_faces: int = 4,
+    panel_detection_stride: int = 2,
+    panel_gap: int = 4,
+    auto_mode: bool = False,
+) -> LiveSession:
+    li = create_live_input(cfg, safe_token(Path(asset_name).stem))
+    uid = li["uid"]
+    rtmps_url = li["rtmps"]["url"]
+    key = li["rtmps"]["streamKey"]
+    hls, dash, iframe = build_public_playback_urls(cfg, uid)
+    cmd = build_realtime_rtmps_push_command(target_w, target_h, DEFAULT_OUTPUT_FPS, rtmps_url, key)
+    log_path = tempfile.NamedTemporaryFile(delete=False, suffix=".log").name
+    session = LiveSession(uid, rtmps_url, key, hls, dash, iframe, cmd, None, log_path)
+    worker = threading.Thread(
+        target=_realtime_worker,
+        args=(session, source, target_w, target_h, delay_seconds, smooth_strength, analysis_stride, deadzone_ratio, max_pan_ratio, loop_file, pace_input, sport_profile, ball_tracking, overlay_composite, preserve_bottom_overlay, panel_mode, panel_max_faces, panel_detection_stride, panel_gap, auto_mode),
+        daemon=True,
+        name="decoupled_realtime_worker",
+    )
+    session.worker = worker
+    worker.start()
+    return session
