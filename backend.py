@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import collections
 import contextlib
 import json
@@ -885,7 +884,7 @@ def build_public_playback_urls(cfg: CFStreamConfig, uid: str):
     return f"{base}/manifest/video.m3u8" + ("?protocol=llhls" if cfg.prefer_low_latency else ""), f"{base}/manifest/video.mpd", f"{base}/iframe?autoplay=true&muted=true&controls=true&preload=metadata"
 
 def _common_output_args(fps_int: int) -> list[str]:
-    return ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-fps_mode", "cfr", "-r", str(fps_int), "-b:v", DEFAULT_VIDEO_BITRATE, "-maxrate", DEFAULT_MAXRATE, "-bufsize", DEFAULT_BUFSIZE, "-g", str(fps_int), "-keyint_min", str(fps_int), "-sc_threshold", "0", "-profile:v", "high", "-x264-params", f"nal-hrd=cbr:force-cfr=1:scenecut=0:keyint={fps_int}:min-keyint={fps_int}", "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-flvflags", "no_duration_filesize", "-fflags", "nobuffer", "-flags", "low_delay", "-flush_packets", "1", "-muxdelay", "0", "-muxpreload", "0"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-fps_mode", "cfr", "-r", str(fps_int), "-b:v", DEFAULT_VIDEO_BITRATE, "-maxrate", DEFAULT_MAXRATE, "-bufsize", DEFAULT_BUFSIZE, "-g", str(fps_int * 2), "-keyint_min", str(fps_int), "-sc_threshold", "0", "-profile:v", "high", "-x264-params", f"nal-hrd=cbr:force-cfr=1:scenecut=0:keyint={fps_int * 2}:min-keyint={fps_int}", "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-flvflags", "no_duration_filesize", "-fflags", "nobuffer", "-flags", "low_delay", "-flush_packets", "1", "-muxdelay", "0", "-muxpreload", "0"]
 
 def build_push_file_command(reframed_mp4: str, rtmps_url: str, stream_key: str, loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS):
     target = rtmps_url.rstrip("/") + "/" + stream_key; fps_int = max(24, min(60, int(round(output_fps or DEFAULT_OUTPUT_FPS))))
@@ -957,7 +956,7 @@ def _make_placeholder_frame(w: int, h: int, text: str = "Starting stream...") ->
 def _realtime_worker(session: LiveSession, source: str, target_w: int, target_h: int, delay_seconds: float, smooth_strength: float, analysis_stride: int, deadzone_ratio: float, max_pan_ratio: float, loop_file: bool, pace_input: bool, sport_profile: str, ball_tracking: bool, overlay_composite: bool, preserve_bottom_overlay: bool, panel_mode: bool=False, panel_max_faces: int=4, panel_detection_stride: int=2, panel_gap: int=4, auto_mode: bool=False) -> None:
     start_ts = time.monotonic(); fps_int = int(DEFAULT_OUTPUT_FPS); frame_interval = 1.0 / fps_int
     src_w, src_h = WORKING_INPUT_W, WORKING_INPUT_H; frame_bytes = src_w * src_h * 3
-    delay_seconds = max(0.0, min(float(delay_seconds or 0.0), MAX_BUFFER_SECONDS)); max_buffer_frames = max(3, int(round(max(delay_seconds, 0.25) * fps_int)))
+    delay_seconds = max(0.0, min(float(delay_seconds or 0.0), MAX_BUFFER_SECONDS)); max_buffer_frames = max(15, int(round(max(delay_seconds, 0.5) * fps_int)))
     lock = threading.Lock(); stop = session.stop_event
     latest_output = {"seq": 0, "ts": 0.0, "frame": _make_placeholder_frame(target_w, target_h)}
     input_buffer: collections.deque[tuple[int, float, np.ndarray]] = collections.deque(maxlen=max_buffer_frames)
@@ -1002,8 +1001,15 @@ def _realtime_worker(session: LiveSession, source: str, target_w: int, target_h:
         reframer=SmoothReframer(src_w,src_h,target_w,target_h,smooth_strength,analysis_stride,deadzone_ratio,max_pan_ratio,sport_profile,False if panel_mode else ball_tracking,overlay_composite=overlay_composite,preserve_bottom_overlay=preserve_bottom_overlay,panel_mode=panel_mode,panel_max_faces=panel_max_faces,panel_detection_stride=panel_detection_stride,panel_gap=panel_gap,auto_mode=auto_mode and not panel_mode)
         while not stop.is_set():
             with lock:
-                item=input_buffer.popleft() if input_buffer else None
+                if not input_buffer:
+                    item=None; skipped=0
+                else:
+                    skipped=max(0,len(input_buffer)-1)
+                    while len(input_buffer)>1:
+                        input_buffer.popleft()
+                    item=input_buffer.popleft()
             if item is None: time.sleep(.002); continue
+            if skipped>0: counters["frames_dropped_processing"]+=skipped
             _,_,frame=item; ps=time.monotonic()
             try: out=reframer.process(frame)
             except Exception as exc: logger.exception("[REFRAMER ERROR] %s", exc); out=latest_output["frame"]
@@ -1029,7 +1035,7 @@ def _realtime_worker(session: LiveSession, source: str, target_w: int, target_h:
             elif -sleep_for>frame_interval*3: next_deadline=time.monotonic()
             next_deadline+=frame_interval; now=time.monotonic()
             if now-win["t"]>=1:
-                elapsed=now-win["t"]; fps_in=round(win["in"]/elapsed,1); fps_proc=round(win["proc"]/elapsed,1); fps_out=round(win["out"]/elapsed,1); win={"t":now,"in":0,"proc":0,"out":0}
+                elapsed=now-win["t"]; fps_in=round(win["in"]/elapsed,1); fps_proc=round(win["proc"]/elapsed,1); fps_out=round(win["out"]/elapsed,1); win["t"]=now; win["in"]=0; win["proc"]=0; win["out"]=0
                 health="healthy" if fps_out>=fps_int*.90 else "output_fps_low"
                 _stats_update(session,{"health":health,"fps_in":fps_in,"ingest_fps_1s":fps_in,"fps_process":fps_proc,"process_fps_1s":fps_proc,"fps_out":fps_out,"output_fps_1s":fps_out,"fps_actual":fps_out,**counters,"read_ms":round(read_samples[-1],2) if read_samples else 0,"p95_ingest_read_ms":round(p95(read_samples),2),"processing_ms":round(process_samples[-1],2) if process_samples else 0,"p95_process_ms":round(p95(process_samples),2),"write_ms":round(write_samples[-1],2) if write_samples else 0,"p95_output_write_ms":round(p95(write_samples),2),"avg_schedule_drift_ms":round(sum(drift_samples)/max(len(drift_samples),1),2),"p95_schedule_drift_ms":round(p95(drift_samples),2),"buffer_len":blen,"buffer_seconds":round(blen/fps_int,3),"buffer_seconds_est":round(blen/fps_int,3),"buffer_fill_pct":round(100*blen/max(max_buffer_frames,1),1),"latest_frame_age_ms":round(age,2),"ffmpeg_alive":session.proc.poll() is None,"ingest_alive":ingest_holder.get("proc") is not None and ingest_holder["proc"].poll() is None,"updated_at_ms":int(time.time()*1000)})
     finally:
