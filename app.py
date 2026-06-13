@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import os
 import tempfile
 import time
@@ -184,7 +183,8 @@ def _render_analytics(session) -> None:
     c[0].metric("Output FPS", f"{_num(_stat(stats, 'fps_out', 'output_fps_1s', 'fps_actual', default=0)):.1f}")
     c[1].metric("Process FPS", f"{_num(_stat(stats, 'fps_process', 'process_fps_1s', default=0)):.1f}")
     c[2].metric("Ingest FPS", f"{_num(_stat(stats, 'fps_in', 'ingest_fps_1s', default=0)):.1f}")
-    c[3].metric("Pipeline", _stat(stats, "pipeline_arch", default="-"))
+    c[3].metric("Target FPS", f"{_num(_stat(stats, 'fps', default=30)):.0f}")
+    st.caption(f"Pipeline: {_stat(stats, 'pipeline_arch', default='-')}")
     c = st.columns(4)
     c[0].metric("P95 process", _fmt_ms(_stat(stats, "p95_process_ms", default=0)))
     c[1].metric("Latest frame age", _fmt_ms(_stat(stats, "latest_frame_age_ms", default=0)))
