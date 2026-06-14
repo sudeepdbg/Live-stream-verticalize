@@ -44,7 +44,7 @@ PLACEHOLDER_FPS = 30.0
 DEFAULT_OUTPUT_FPS = 30.0
 DEFAULT_VIDEO_BITRATE = "3500k"
 DEFAULT_MAXRATE = "3500k"
-DEFAULT_BUFSIZE = "3500k"
+DEFAULT_BUFSIZE = "7000k"
 MAX_BUFFER_SECONDS = 0.35
 LIVE_STARTUP_PRIME_SECONDS = 0.12
 INGEST_READ_TIMEOUT = 0.75
@@ -957,7 +957,7 @@ def _realtime_worker(session: LiveSession, source: str, target_w: int, target_h:
     start_ts = time.monotonic(); fps_int = int(DEFAULT_OUTPUT_FPS); frame_interval = 1.0 / fps_int
     src_w, src_h = WORKING_INPUT_W, WORKING_INPUT_H; frame_bytes = src_w * src_h * 3
     delay_seconds = max(0.0, min(float(delay_seconds or 0.0), MAX_BUFFER_SECONDS)); max_buffer_frames = max(15, int(round(max(delay_seconds, 0.5) * fps_int)))
-    lock = threading.Lock(); stop = session.stop_event
+    input_lock = threading.Lock(); output_lock = threading.Lock(); new_frame_evt = threading.Event(); stop = session.stop_event
     latest_output = {"seq": 0, "ts": 0.0, "frame": _make_placeholder_frame(target_w, target_h)}
     input_buffer: collections.deque[tuple[int, float, np.ndarray]] = collections.deque(maxlen=max_buffer_frames)
     counters = {k:0 for k in ["frames_in","frames_processed","frames_out","frames_repeated","frames_dropped_input","frames_dropped_processing","source_stalls","consecutive_source_stalls","ingest_restarts","write_failures","output_write_failures","frame_drops","input_drop_count","startup_buffer_fill_frames","output_underruns"]}
@@ -991,7 +991,7 @@ def _realtime_worker(session: LiveSession, source: str, target_w: int, target_h:
                 continue
             counters["consecutive_source_stalls"]=0; seq+=1
             frame=np.frombuffer(raw,dtype=np.uint8).reshape((src_h,src_w,3)).copy(); ts=time.monotonic()
-            with lock:
+            with input_lock:
                 if len(input_buffer)==input_buffer.maxlen:
                     counters["frames_dropped_input"]+=1; counters["frame_drops"]+=1; counters["input_drop_count"]+=1
                 input_buffer.append((seq,ts,frame))
@@ -1000,13 +1000,12 @@ def _realtime_worker(session: LiveSession, source: str, target_w: int, target_h:
     def proc_loop():
         reframer=SmoothReframer(src_w,src_h,target_w,target_h,smooth_strength,analysis_stride,deadzone_ratio,max_pan_ratio,sport_profile,False if panel_mode else ball_tracking,overlay_composite=overlay_composite,preserve_bottom_overlay=preserve_bottom_overlay,panel_mode=panel_mode,panel_max_faces=panel_max_faces,panel_detection_stride=panel_detection_stride,panel_gap=panel_gap,auto_mode=auto_mode and not panel_mode)
         while not stop.is_set():
-            with lock:
+            with input_lock:
                 if not input_buffer:
                     item=None; skipped=0
                 else:
                     skipped=max(0,len(input_buffer)-1)
-                    while len(input_buffer)>1:
-                        input_buffer.popleft()
+                    while len(input_buffer)>1: input_buffer.popleft()
                     item=input_buffer.popleft()
             if item is None: time.sleep(.002); continue
             if skipped>0: counters["frames_dropped_processing"]+=skipped
@@ -1014,15 +1013,18 @@ def _realtime_worker(session: LiveSession, source: str, target_w: int, target_h:
             try: out=reframer.process(frame)
             except Exception as exc: logger.exception("[REFRAMER ERROR] %s", exc); out=latest_output["frame"]
             process_samples.append((time.monotonic()-ps)*1000)
-            with lock: latest_output.update(seq=latest_output["seq"]+1, ts=time.monotonic(), frame=out.copy())
+            with output_lock: latest_output.update(seq=latest_output["seq"]+1, ts=time.monotonic(), frame=out)
+            new_frame_evt.set()
             counters["frames_processed"]+=1; win["proc"]+=1
             _stats_update(session,{"ball_confidence":round(reframer.ball_tracker.conf,3) if reframer.ball_tracker else 0.0,"panel_active_faces":reframer.panel_tracker.active_count if reframer.panel_tracker else 0,"panel_detector":getattr(reframer.panel_tracker,"detector_backend_name","-") if reframer.panel_tracker else "-"})
     threading.Thread(target=ingest_loop,daemon=True,name="ingest_loop").start(); threading.Thread(target=proc_loop,daemon=True,name="processor_loop").start()
     next_deadline=time.monotonic(); last_seq=-1
     try:
         while not stop.is_set():
-            with lock:
-                out_frame=latest_output["frame"].copy(); out_seq=latest_output["seq"]; blen=len(input_buffer); age=(time.monotonic()-latest_output["ts"])*1000 if latest_output["ts"] else 0
+            with output_lock:
+                out_frame=latest_output["frame"]; out_seq=latest_output["seq"]; age=(time.monotonic()-latest_output["ts"])*1000 if latest_output["ts"] else 0
+            with input_lock:
+                blen=len(input_buffer)
             if out_seq==last_seq: counters["frames_repeated"]+=1; counters["output_underruns"]+=1
             last_seq=out_seq; ws=time.monotonic()
             try:
@@ -1031,7 +1033,7 @@ def _realtime_worker(session: LiveSession, source: str, target_w: int, target_h:
             except Exception as exc:
                 counters["write_failures"]+=1; counters["output_write_failures"]+=1; session.status="ffmpeg_pipe_broken"; session.error=str(exc); break
             write_samples.append((time.monotonic()-ws)*1000); sleep_for=next_deadline-time.monotonic(); drift_samples.append(max(0,-sleep_for*1000))
-            if sleep_for>0: time.sleep(sleep_for)
+            if sleep_for>0: new_frame_evt.wait(timeout=sleep_for); new_frame_evt.clear()
             elif -sleep_for>frame_interval*3: next_deadline=time.monotonic()
             next_deadline+=frame_interval; now=time.monotonic()
             if now-win["t"]>=1:
