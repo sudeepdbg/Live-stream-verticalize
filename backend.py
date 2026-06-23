@@ -21,6 +21,16 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 
+try:
+    import psutil  # optional analytics
+except Exception:
+    psutil = None
+
+try:
+    from ultralytics import YOLO as _YOLO  # optional P1 sports-ball detector
+except Exception:
+    _YOLO = None
+
 logger = logging.getLogger("backend")
 if not logger.handlers:
     h = logging.StreamHandler()
@@ -52,6 +62,15 @@ INGEST_READ_TIMEOUT_MIN = 0.25
 INGEST_READ_TIMEOUT_MAX = 1.25
 CLEANUP_LOG_MAX_AGE_SECONDS = 6 * 60 * 60
 MAX_CONSECUTIVE_STALLS_NON_LOOP = 12
+
+# P0/P1 runtime tuning
+LIVE_OUTPUT_FPS_MIN = 24
+LIVE_OUTPUT_FPS_MAX = 30
+LIVE_BACKLOG_SOFT_FRAMES = 2          # keep 1-2 frames for smoothness before aggressive dropping
+LIVE_BACKLOG_HARD_FRAMES = 5          # hard cap to avoid runaway latency
+LIVE_MAX_ACCEPTABLE_FRAME_AGE_MS = 220
+YOLO_BALL_DETECT_EVERY_N = 6          # lightweight optional detector cadence
+YOLO_BALL_MODEL_CANDIDATES = ("yolo11n.pt", "yolov8n.pt", "yolov8s.pt")
 
 def ffmpeg_ok() -> bool:
     try:
@@ -368,6 +387,9 @@ class BallTracker:
         self.gate_radius = max(self.src_w * 0.18, 40.0)
         self._hough_param2 = {"basketball": 32, "cricket": 32, "soccer": 26}.get(self.sport, 24)
         self._first_detection = True
+        self._frame_idx = 0
+        self._last_source = "none"
+        self._yolo_enabled = YOLOBallDetector.available()
 
     def _build_field_mask(self, hsv: np.ndarray) -> Optional[np.ndarray]:
         if self.sport not in {"soccer", "cricket"}:
@@ -471,6 +493,20 @@ class BallTracker:
         return float(weights[0] * color_score + weights[1] * motion_score + weights[2] * proximity_score + weights[3] * size_score + 0.10 * source_bonus)
 
     def update(self, frame: np.ndarray, gray: np.ndarray, motion_mask: Optional[np.ndarray], exclusion_mask: Optional[np.ndarray] = None) -> Optional[tuple[float, float, float, float]]:
+        self._frame_idx += 1
+        if self._yolo_enabled and (self._frame_idx % YOLO_BALL_DETECT_EVERY_N == 1 or self.conf < 0.22 or self._first_detection):
+            yolo_hit = YOLOBallDetector.detect_ball(frame)
+            if yolo_hit is not None:
+                cx, cy, radius, conf = yolo_hit
+                self.vx = (cx - self.cx) * 0.35 + self.vx * 0.65
+                self.vy = (cy - self.cy) * 0.35 + self.vy * 0.65
+                self.cx, self.cy = cx, cy
+                self.radius = float(_clamp(radius, self.min_r, self.max_r * 1.5))
+                self.conf = max(self.conf * 0.70, conf)
+                self.missing_count = 0
+                self._first_detection = False
+                self._last_source = "yolo"
+                return (self.cx, self.cy, self.radius, self.conf)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         det_gray = gray.copy()
         if exclusion_mask is not None:
@@ -536,6 +572,73 @@ class BallTracker:
         self.cx, self.cy, self.vx, self.vy = cx, cy, 0.0, 0.0
         self.conf *= 0.3
         self._first_detection = True
+
+
+class YOLOBallDetector:
+    """Optional lightweight sports-ball detector.
+    Falls back silently when ultralytics or local weights are unavailable.
+    """
+    _model = None
+    _loaded = False
+
+    @classmethod
+    def available(cls) -> bool:
+        if _YOLO is None:
+            return False
+        if cls._loaded:
+            return cls._model is not None
+        cls._loaded = True
+        for cand in YOLO_BALL_MODEL_CANDIDATES:
+            if os.path.exists(cand):
+                try:
+                    cls._model = _YOLO(cand)
+                    logger.info("Loaded optional YOLO ball detector: %s", cand)
+                    return True
+                except Exception:
+                    continue
+        return False
+
+    @classmethod
+    def detect_ball(cls, frame: np.ndarray) -> Optional[tuple[float, float, float, float]]:
+        if not cls.available() or frame is None or frame.size == 0:
+            return None
+        try:
+            h, w = frame.shape[:2]
+            det_w = min(w, 960)
+            scale = det_w / float(w)
+            det_h = max(2, int(round(h * scale)))
+            det = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame
+            res = cls._model(det, verbose=False, conf=0.20)[0]
+            boxes = getattr(res, 'boxes', None)
+            if boxes is None or len(boxes) == 0:
+                return None
+            best = None
+            best_score = -1.0
+            inv = 1.0 / scale
+            for box in boxes:
+                try:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                except Exception:
+                    continue
+                if cls_id != 32:  # COCO sports ball
+                    continue
+                x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
+                bw = x2 - x1
+                bh = y2 - y1
+                if bw <= 1 or bh <= 1:
+                    continue
+                radius = max(bw, bh) * 0.5 * inv
+                cx = (x1 + x2) * 0.5 * inv
+                cy = (y1 + y2) * 0.5 * inv
+                score = conf
+                if score > best_score:
+                    best_score = score
+                    best = (float(cx), float(cy), float(radius), float(conf))
+            return best
+        except Exception:
+            return None
+
 
 @dataclass
 class _TrackedFace:
@@ -1159,6 +1262,20 @@ def _stats_inc(session: LiveSession, key: str, amount: int | float = 1) -> None:
     with getattr(session, "stats_lock", threading.Lock()):
         session.stats[key] = session.stats.get(key, 0) + amount
 
+
+def _resource_snapshot() -> dict:
+    if psutil is None:
+        return {}
+    try:
+        proc = psutil.Process(os.getpid())
+        return {
+            "cpu_percent": round(proc.cpu_percent(interval=None), 1),
+            "rss_mb": round(proc.memory_info().rss / (1024 * 1024), 1),
+            "threads": proc.num_threads(),
+        }
+    except Exception:
+        return {}
+
 def cfstream_config_from_inputs(account_id: str, api_token: str, customer_code: str, prefer_low_latency: bool = False) -> CFStreamConfig:
     if not account_id: raise ValueError("Cloudflare account ID is required.")
     if not api_token: raise ValueError("Cloudflare API token is required.")
@@ -1360,15 +1477,16 @@ def _realtime_worker(
     session: LiveSession, source: str, target_w: int, target_h: int, delay_seconds: float, smooth_strength: float,
     analysis_stride: int, deadzone_ratio: float, max_pan_ratio: float, loop_file: bool, pace_input: bool,
     sport_profile: str, ball_tracking: bool, overlay_composite: bool, preserve_bottom_overlay: bool,
-    panel_mode: bool = False, panel_max_faces: int = 4, panel_detection_stride: int = 2, panel_gap: int = 4, auto_mode: bool = False
+    panel_mode: bool = False, panel_max_faces: int = 4, panel_detection_stride: int = 2, panel_gap: int = 4, auto_mode: bool = False,
+    output_fps: float = DEFAULT_OUTPUT_FPS
 ) -> None:
     start_ts = time.monotonic()
-    fps_int = int(DEFAULT_OUTPUT_FPS)
+    fps_int = max(LIVE_OUTPUT_FPS_MIN, min(60, int(round(float(output_fps or DEFAULT_OUTPUT_FPS)))))
     frame_interval = 1.0 / fps_int
     src_w, src_h = WORKING_INPUT_W, WORKING_INPUT_H
     frame_bytes = src_w * src_h * 3
     delay_seconds = max(0.0, min(float(delay_seconds or 0.0), MAX_BUFFER_SECONDS))
-    max_buffer_frames = max(15, int(round(max(delay_seconds, 0.5) * fps_int)))
+    max_buffer_frames = max(LIVE_BACKLOG_HARD_FRAMES + 2, int(round(max(delay_seconds, 0.5) * fps_int)))
 
     input_lock = threading.Lock()
     output_lock = threading.Lock()
@@ -1392,7 +1510,7 @@ def _realtime_worker(
         return float(a[min(len(a)-1, int(round((len(a)-1)*.95)))])
 
     _stats_update(session, {
-        "pipeline_arch": "decoupled_smooth_microbuffer_v3", "buffer_policy": "microbuffer_fifo_drop_when_full_repeat_last",
+        "pipeline_arch": "decoupled_smooth_microbuffer_v4", "buffer_policy": "adaptive_fifo_keep_context_drop_stale",
         "health": "starting", "fps": fps_int, "fps_output": fps_int, "effective_live_buffer_seconds": round(max_buffer_frames/fps_int, 3),
         "working_resolution": f"{src_w}x{src_h}", "mode": "panel" if panel_mode else "sports" if ball_tracking else "single",
         **counters, "updated_at_ms": int(time.time() * 1000), "ingest_read_timeout": INGEST_READ_TIMEOUT
@@ -1478,9 +1596,18 @@ def _realtime_worker(
                     item = None
                     skipped = 0
                 else:
-                    skipped = max(0, len(input_buffer) - 1)
-                    while len(input_buffer) > 1:
-                        input_buffer.popleft()
+                    backlog = len(input_buffer)
+                    skipped = 0
+                    if backlog > LIVE_BACKLOG_HARD_FRAMES:
+                        # Hard latency guard: drop oldest frames aggressively until one contextual frame remains.
+                        skipped = max(0, backlog - LIVE_BACKLOG_SOFT_FRAMES)
+                        while len(input_buffer) > LIVE_BACKLOG_SOFT_FRAMES:
+                            input_buffer.popleft()
+                    elif backlog > LIVE_BACKLOG_SOFT_FRAMES:
+                        # Soft pressure: keep the newest two frames to reduce visible jumpiness.
+                        skipped = max(0, backlog - LIVE_BACKLOG_SOFT_FRAMES)
+                        while len(input_buffer) > LIVE_BACKLOG_SOFT_FRAMES:
+                            input_buffer.popleft()
                     item = input_buffer.popleft()
                     
             if item is None:
@@ -1515,8 +1642,11 @@ def _realtime_worker(
             win["proc"] += 1
             _stats_update(session, {
                 "ball_confidence": round(reframer.ball_tracker.conf, 3) if reframer.ball_tracker else 0.0,
+                "ball_source": getattr(reframer.ball_tracker, "_last_source", "-") if reframer.ball_tracker else "-",
                 "panel_active_faces": reframer.panel_tracker.active_count if reframer.panel_tracker else 0,
-                "panel_detector": getattr(reframer.panel_tracker, "detector_backend_name", "-") if reframer.panel_tracker else "-"
+                "panel_detector": getattr(reframer.panel_tracker, "detector_backend_name", "-") if reframer.panel_tracker else "-",
+                "analysis_stride_runtime": runtime_stride,
+                "process_queue_age_ms": round((time.monotonic() - ts) * 1000, 2),
             })
 
     threading.Thread(target=ingest_loop, daemon=True, name="ingest_loop").start()
@@ -1538,7 +1668,7 @@ def _realtime_worker(
             if out_seq == last_seq:
                 counters["frames_repeated"] += 1
                 counters["output_underruns"] += 1
-                if age > 400:
+                if age > LIVE_MAX_ACCEPTABLE_FRAME_AGE_MS:
                     out_frame = _make_placeholder_frame(
                         target_w,
                         target_h,
@@ -1608,17 +1738,21 @@ def start_realtime_delayed_vertical_push(
     delay_seconds: float = 0.0, smooth_strength: float = 0.975, analysis_stride: int = 4, deadzone_ratio: float = 0.05,
     max_pan_ratio: float = 0.012, loop_file: bool = False, pace_input: bool = True, sport_profile: str = "auto",
     ball_tracking: bool = True, overlay_composite: bool = True, preserve_bottom_overlay: bool = False,
-    panel_mode: bool = False, panel_max_faces: int = 4, panel_detection_stride: int = 2, panel_gap: int = 4, auto_mode: bool = False
+    panel_mode: bool = False, panel_max_faces: int = 4, panel_detection_stride: int = 2, panel_gap: int = 4, auto_mode: bool = False,
+    output_fps: Optional[float] = None
 ) -> LiveSession:
     li = create_live_input(cfg, safe_token(Path(asset_name).stem))
     uid, rtmps_url, key = li["uid"], li["rtmps"]["url"], li["rtmps"]["streamKey"]
     hls, dash, iframe = build_public_playback_urls(cfg, uid)
-    cmd = build_realtime_rtmps_push_command(target_w, target_h, DEFAULT_OUTPUT_FPS, rtmps_url, key)
+    src_meta = probe_source(source)
+    selected_output_fps = max(LIVE_OUTPUT_FPS_MIN, min(LIVE_OUTPUT_FPS_MAX, int(round(float(output_fps or src_meta.get("fps") or DEFAULT_OUTPUT_FPS)))))
+    cmd = build_realtime_rtmps_push_command(target_w, target_h, selected_output_fps, rtmps_url, key)
     log_path = tempfile.NamedTemporaryFile(delete=False, suffix=".log").name
     session = LiveSession(uid, rtmps_url, key, hls, dash, iframe, cmd, None, log_path)
+    _stats_update(session, {"selected_output_fps": selected_output_fps, "source_fps": src_meta.get("fps", 0.0), "source_width": src_meta.get("width", 0), "source_height": src_meta.get("height", 0)})
     session.worker = threading.Thread(
         target=_realtime_worker,
-        args=(session, source, target_w, target_h, delay_seconds, smooth_strength, analysis_stride, deadzone_ratio, max_pan_ratio, loop_file, pace_input, sport_profile, ball_tracking, overlay_composite, preserve_bottom_overlay, panel_mode, panel_max_faces, panel_detection_stride, panel_gap, auto_mode),
+        args=(session, source, target_w, target_h, delay_seconds, smooth_strength, analysis_stride, deadzone_ratio, max_pan_ratio, loop_file, pace_input, sport_profile, ball_tracking, overlay_composite, preserve_bottom_overlay, panel_mode, panel_max_faces, panel_detection_stride, panel_gap, auto_mode, selected_output_fps),
         daemon=True,
         name="decoupled_realtime_worker"
     )
