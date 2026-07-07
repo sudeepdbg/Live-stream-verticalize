@@ -66,11 +66,12 @@ MAX_CONSECUTIVE_STALLS_NON_LOOP = 12
 # P0/P1 runtime tuning
 LIVE_OUTPUT_FPS_MIN = 24
 LIVE_OUTPUT_FPS_MAX = 30
-LIVE_BACKLOG_SOFT_FRAMES = 2          # keep 1-2 frames for smoothness before aggressive dropping
-LIVE_BACKLOG_HARD_FRAMES = 5          # hard cap to avoid runaway latency
+LIVE_BACKLOG_SOFT_FRAMES = 2
+LIVE_BACKLOG_HARD_FRAMES = 5
 LIVE_MAX_ACCEPTABLE_FRAME_AGE_MS = 220
-YOLO_BALL_DETECT_EVERY_N = 6          # lightweight optional detector cadence
+YOLO_BALL_DETECT_EVERY_N = 6
 YOLO_BALL_MODEL_CANDIDATES = ("yolo11n.pt", "yolov8n.pt", "yolov8s.pt")
+
 
 def ffmpeg_ok() -> bool:
     try:
@@ -80,13 +81,16 @@ def ffmpeg_ok() -> bool:
     except Exception:
         return False
 
+
 def safe_token(value: str) -> str:
     value = value or "stream"
     return re.sub(r"[^A-Za-z0-9._-]+", "", value).strip(".-") or "stream"
 
+
 def is_network_source(source: str) -> bool:
-    s = (source or "").lower().strip()
+    s = (source or " ").lower().strip()
     return s.startswith(("rtmp://", "rtmps://", "srt://", "udp://", "tcp://", "http://", "https://"))
+
 
 def _source_input_args(source: str, pace_input: bool = False, loop_file: bool = False) -> list[str]:
     is_net = is_network_source(source)
@@ -106,12 +110,14 @@ def _source_input_args(source: str, pace_input: bool = False, loop_file: bool = 
     args += ["-i", source]
     return args
 
+
 def _safe_json_loads(text: str) -> dict:
     try:
         p = json.loads(text)
         return p if isinstance(p, dict) else {}
     except Exception:
         return {}
+
 
 def _ffprobe_json(source: str, timeout: int = 30) -> dict:
     cmd = [
@@ -122,8 +128,9 @@ def _ffprobe_json(source: str, timeout: int = 30) -> dict:
     out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=timeout)
     return _safe_json_loads(out)
 
+
 def probe_source(source: str) -> dict:
-    res = {"duration": 0.0, "width": 0, "height": 0, "fps": 0.0, "vcodec": "unknown"}
+    res = {"duration": 0.0, "width": 0, "height": 0, "fps": 0.0, "vcodec": "unknown", "has_audio": False}
     try:
         data = _ffprobe_json(source, timeout=35 if is_network_source(source) else 20)
         fmt = data.get("format", {}) if isinstance(data, dict) else {}
@@ -139,10 +146,11 @@ def probe_source(source: str) -> dict:
                     res["fps"] = round(n / d, 3) if d else 0.0
                 except Exception:
                     pass
-                break
+            elif s.get("codec_type") == "audio":
+                res["has_audio"] = True
     except Exception:
         pass
-    
+
     if (res["width"] <= 0 or res["height"] <= 0 or res["fps"] <= 0) and not is_network_source(source):
         cap = None
         try:
@@ -167,15 +175,18 @@ def probe_source(source: str) -> dict:
         res["fps"] = PLACEHOLDER_FPS
     return res
 
+
 def _source_has_audio(path: str) -> bool:
     try:
         data = _ffprobe_json(path, timeout=15)
         return any(s.get("codec_type") == "audio" for s in data.get("streams", []))
     except Exception:
-        return True
+        return False
+
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
 
 def _vertical_crop_box(src_w: int, src_h: int) -> tuple[int, int]:
     if src_w / max(src_h, 1) >= 9 / 16:
@@ -185,6 +196,7 @@ def _vertical_crop_box(src_w: int, src_h: int) -> tuple[int, int]:
         crop_w = src_w
         crop_h = int(round(src_w * 16 / 9))
     return max(32, crop_w - crop_w % 2), max(32, crop_h - crop_h % 2)
+
 
 def _resize_cover(img: np.ndarray, width: int, height: int) -> np.ndarray:
     if img is None or img.size == 0:
@@ -196,6 +208,7 @@ def _resize_cover(img: np.ndarray, width: int, height: int) -> np.ndarray:
     x0, y0 = max(0, (nw - width) // 2), max(0, (nh - height) // 2)
     return resized[y0:y0 + height, x0:x0 + width]
 
+
 def _overlay_heights(target_h: int, top_strip: Optional[np.ndarray], bottom_strip: Optional[np.ndarray], src_h: int, overlay_composite: bool, preserve_bottom: bool) -> tuple[int, int]:
     top_h = 0
     if overlay_composite and top_strip is not None and top_strip.size:
@@ -205,6 +218,7 @@ def _overlay_heights(target_h: int, top_strip: Optional[np.ndarray], bottom_stri
     if overlay_composite and preserve_bottom and bottom_strip is not None and bottom_strip.size:
         bottom_h = int(_clamp(round(target_h * 0.045), 20, int(target_h * 0.07)))
     return top_h, bottom_h
+
 
 class OverlayDetector:
     def __init__(
@@ -218,7 +232,7 @@ class OverlayDetector:
         self.stable_diff_threshold = float(stable_diff_threshold)
         self.row_text_threshold = float(row_text_threshold)
         self.overlay_hold_frames = max(1, int(overlay_hold_frames))
-        
+
         self.top_avg: Optional[np.ndarray] = None
         self.bottom_avg: Optional[np.ndarray] = None
         self.frame_count = 0
@@ -243,7 +257,6 @@ class OverlayDetector:
         curr_gray = cv2.cvtColor(current_bgr, cv2.COLOR_BGR2GRAY)
         avg_gray = cv2.cvtColor(np.clip(avg_bgr, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
         diff = np.abs(curr_gray.astype(np.float32) - avg_gray.astype(np.float32))
-        
         row_diff = diff.mean(axis=1)
         row_edges = self._row_edge_density(curr_gray)
         row_sat = self._row_sat_mean(current_bgr)
@@ -253,7 +266,6 @@ class OverlayDetector:
         texty = row_edges > self.row_text_threshold
         colorful = row_sat > 0.10
         not_field = row_green < 0.28
-
         active = stable & texty & (colorful | not_field) if top else stable & texty & colorful & not_field
 
         if active.any():
@@ -275,6 +287,7 @@ class OverlayDetector:
                 start, prev = v, v
         runs.append((start, prev + 1))
         runs.sort(key=lambda x: (x[1] - x[0]), reverse=True)
+
         y0, y1 = runs[0]
         band_h = y1 - y0
 
@@ -340,12 +353,13 @@ class OverlayDetector:
             return None
         strip = frame[self.top_overlay[0]:self.top_overlay[1]]
         return strip.copy() if strip.size else None
- 
+
     def extract_bottom_strip(self, frame: np.ndarray) -> Optional[np.ndarray]:
         if not self.bottom_overlay:
             return None
         strip = frame[self.bottom_overlay[0]:self.bottom_overlay[1]]
         return strip.copy() if strip.size else None
+
 
 class SceneChangeDetector:
     def __init__(self, hist_diff_thresh: float = 0.55, pixel_diff_thresh: float = 45.0, cooldown_frames: int = 8):
@@ -359,16 +373,15 @@ class SceneChangeDetector:
             self.cooldown -= 1
         hist = cv2.calcHist([gray], [0], None, [64], [0, 256])
         cv2.normalize(hist, hist)
-        
         is_cut = False
         if self.prev_hist is not None and self.cooldown <= 0:
             corr = float(cv2.compareHist(self.prev_hist, hist, cv2.HISTCMP_CORREL))
             mean_pixel_diff = float(np.mean(cv2.absdiff(gray, self.prev_gray))) if self.prev_gray is not None else 0.0
             if (1.0 - corr) > self.hist_diff_thresh and mean_pixel_diff > self.pixel_diff_thresh:
                 is_cut, self.cooldown = True, self.cooldown_frames
-                
         self.prev_hist, self.prev_gray = hist, gray.copy()
         return is_cut
+
 
 class BallTracker:
     def __init__(self, src_w: int, src_h: int, sport_profile: str = "auto"):
@@ -376,11 +389,10 @@ class BallTracker:
         self.sport = (sport_profile or "auto").strip().lower()
         if self.sport not in {"basketball", "cricket", "soccer"}:
             self.sport = "generic"
-        
+
         self.cx, self.cy = src_w / 2.0, src_h / 2.0
         self.radius, self.conf, self.vx, self.vy = 0.0, 0.0, 0.0, 0.0
         self.missing_count, self.max_missing = 0, 12
-        
         min_dim = min(src_w, src_h)
         self.min_r = max(3, int(round(min_dim * 0.006)))
         self.max_r = max(self.min_r + 4, int(round(min_dim * 0.038)))
@@ -411,7 +423,6 @@ class BallTracker:
         if field_mask is not None:
             edges = cv2.bitwise_and(edges, field_mask)
         edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-        
         results = []
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in contours:
@@ -437,16 +448,16 @@ class BallTracker:
             masks.append(cv2.inRange(hsv, np.array([0, 0, 170]), np.array([179, 60, 255])))
         else:
             masks.append(cv2.inRange(hsv, np.array([0, 0, 180]), np.array([179, 55, 255])))
-            
+
         combined = masks[0]
         for m in masks[1:]:
             combined = cv2.bitwise_or(combined, m)
+
         if field_mask is not None and self.sport in {"soccer", "cricket"}:
             combined = cv2.bitwise_and(combined, field_mask)
-            
+
         kernel = np.ones((3, 3), np.uint8)
         combined = cv2.dilate(cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel, iterations=1), kernel, iterations=1)
-        
         results = []
         contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in contours:
@@ -463,8 +474,7 @@ class BallTracker:
         patch = hsv[
             max(0, int(cy - r_int)):min(self.src_h, int(cy + r_int + 1)),
             max(0, int(cx - r_int)):min(self.src_w, int(cx + r_int + 1))
-        ] 
-        
+        ]
         color_score = 0.0
         if patch.size > 0:
             mh, ms, mv = patch.reshape(-1, 3).mean(axis=0)
@@ -507,11 +517,12 @@ class BallTracker:
                 self._first_detection = False
                 self._last_source = "yolo"
                 return (self.cx, self.cy, self.radius, self.conf)
+
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         det_gray = gray.copy()
         if exclusion_mask is not None:
             det_gray[exclusion_mask > 0] = 0
-            
+
         field_mask = self._build_field_mask(hsv)
         raw_candidates = []
         for cx, cy, r in self._candidates_hough(det_gray): raw_candidates.append((cx, cy, r, "hough"))
@@ -552,7 +563,6 @@ class BallTracker:
         cx, cy, r, score = best
         pos_alpha = {"basketball": 0.65, "cricket": 0.55, "soccer": 0.60}.get(self.sport, 0.60)
         vel_alpha = pos_alpha * 0.75
-
         self.vx = vel_alpha * self.vx + (1.0 - vel_alpha) * (cx - self.cx)
         self.vy = vel_alpha * self.vy + (1.0 - vel_alpha) * (cy - self.cy)
         self.cx = pos_alpha * self.cx + (1.0 - pos_alpha) * cx
@@ -564,7 +574,7 @@ class BallTracker:
             self._first_detection = False
         else:
             self.conf = min(1.0, 0.7 * self.conf + 0.35 * score)
-            
+
         self.missing_count = 0
         return (self.cx, self.cy, self.radius, self.conf)
 
@@ -575,9 +585,7 @@ class BallTracker:
 
 
 class YOLOBallDetector:
-    """Optional lightweight sports-ball detector.
-    Falls back silently when ultralytics or local weights are unavailable.
-    """
+    """Optional lightweight sports-ball detector."""
     _model = None
     _loaded = False
 
@@ -673,6 +681,7 @@ class _TrackedFace:
     def tick_smooth(self) -> None:
         pass
 
+
 def _match_faces_to_detections(tracked: list[_TrackedFace], detections: list[tuple[float, float, float, float]], max_dist: float) -> tuple[dict[int, int], list[int], list[int]]:
     matched, used_det = {}, set()
     for ti, tf in enumerate(tracked):
@@ -687,12 +696,14 @@ def _match_faces_to_detections(tracked: list[_TrackedFace], detections: list[tup
             used_det.add(best_di)
     return matched, [ti for ti in range(len(tracked)) if ti not in matched], [di for di in range(len(detections)) if di not in used_det]
 
+
 @dataclass
 class _PanelCell:
     dst_x: int
     dst_y: int
     dst_w: int
     dst_h: int
+
 
 def _compute_panel_layout(n: int, canvas_w: int, canvas_h: int, gap: int = 4) -> list[_PanelCell]:
     n = max(1, min(n, 4))
@@ -712,26 +723,25 @@ def _compute_panel_layout(n: int, canvas_w: int, canvas_h: int, gap: int = 4) ->
         _PanelCell(col_w + gap, row_h + gap, canvas_w - col_w - gap, canvas_h - row_h - gap)
     ]
 
+
 class PanelTracker:
-    def __init__(self, src_w: int, src_h: int, max_faces: int = 4, max_missing_frames: int = 24, 
-                 layout_hold_frames: int = 24, blend_frames: int = 18, min_face_area_ratio: float = 0.0012, 
+    def __init__(self, src_w: int, src_h: int, max_faces: int = 4, max_missing_frames: int = 24,
+                 layout_hold_frames: int = 24, blend_frames: int = 18, min_face_area_ratio: float = 0.0012,
                  pos_alpha: float = 0.90, size_alpha: float = 0.92):
         self.src_w, self.src_h = src_w, src_h
         self.max_faces, self.max_missing_frames = max_faces, max_missing_frames
         self.layout_hold_frames, self.blend_frames = layout_hold_frames, blend_frames
         self.min_face_area = min_face_area_ratio * src_w * src_h
         self.pos_alpha, self.size_alpha = pos_alpha, size_alpha
-        
+
         self._tracked: list[_TrackedFace] = []
         self._next_id, self._active_count, self._candidate_count, self._candidate_hold = 0, 0, 0, 0
         self._blend_remaining = 0
         self._prev_output: Optional[np.ndarray] = None
         self._match_dist = max(src_w, src_h) * 0.18
         self._canvas_buffer: Optional[np.ndarray] = None
-
         self.face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
         self.profile_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
-        
         self.detector_backend_name = "haar"
         self._mp_face = None
         self._mp_available = False
@@ -808,13 +818,15 @@ class PanelTracker:
     def update_detections(self, raw_faces: list[tuple[int, int, int, int]]) -> None:
         faces = [(float(x), float(y), float(w), float(h)) for x, y, w, h in raw_faces if w * h >= self.min_face_area]
         faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[:self.max_faces]
-        
         matched, unmatched_t, unmatched_d = _match_faces_to_detections(self._tracked, faces, self._match_dist)
+
         for ti, di in matched.items():
             dx, dy, dw, dh = faces[di]
             self._tracked[ti].update(dx + dw / 2.0, dy + dh / 2.0, dw, dh)
+
         for ti in unmatched_t:
             self._tracked[ti].extrapolate()
+
         for di in unmatched_d:
             dx, dy, dw, dh = faces[di]
             self._tracked.append(_TrackedFace(self._next_id, dx + dw / 2.0, dy + dh / 2.0, dw, dh, dx + dw / 2.0, dy + dh / 2.0, dw, dh, _pos_alpha=self.pos_alpha, _size_alpha=self.size_alpha))
@@ -823,12 +835,12 @@ class PanelTracker:
         self._tracked = [tf for tf in self._tracked if tf.missing_frames <= self.max_missing_frames]
         visible = [tf for tf in self._tracked if tf.active]
         current_n = max(1, min(len(visible), self.max_faces))
-        
+
         if current_n != self._candidate_count:
             self._candidate_count, self._candidate_hold = current_n, 0
         else:
             self._candidate_hold += 1
-            
+
         if self._candidate_hold >= self.layout_hold_frames and current_n != self._active_count:
             self._active_count = current_n
             self._blend_remaining = self.blend_frames
@@ -843,24 +855,24 @@ class PanelTracker:
         crop_w = max(face.sw * 3.0 * zoom_factor, face.sw * 2.5)
         crop_h = crop_w / max(cell_ar, 0.01)
         crop_w, crop_h = min(crop_w, fw * 0.95), min(crop_h, fh * 0.95)
-        
+
         if crop_w / max(crop_h, 1) > cell_ar:
             crop_w = crop_h * cell_ar
         else:
             crop_h = crop_w / max(cell_ar, 0.01)
-            
+
         cx, cy = face.sx, face.sy - face.sh * 0.35
         x0, y0 = int(round(cx - crop_w / 2.0)), int(round(cy - crop_h * 0.42))
         x1, y1 = int(round(x0 + crop_w)), int(round(y0 + crop_h))
-        
+
         if x0 < 0: x1 -= x0; x0 = 0
         if y0 < 0: y1 -= y0; y0 = 0
         if x1 > fw: x0 -= (x1 - fw); x1 = fw
         if y1 > fh: y0 -= (y1 - fh); y1 = fh
-        
+
         x0, y0 = max(0, x0), max(0, y0)
         actual_w, actual_h = x1 - x0, y1 - y0
-        
+
         if actual_w > 0 and actual_h > 0:
             actual_ar = actual_w / actual_h
             if actual_ar > cell_ar * 1.02:
@@ -869,10 +881,10 @@ class PanelTracker:
             elif actual_ar < cell_ar * 0.98:
                 trim = max(0, min(int((actual_h - actual_w / cell_ar) / 2), (actual_h // 2) - 5))
                 y0 += trim; y1 -= trim
-                
+
         x0, y0 = max(0, min(x0, fw - 1)), max(0, min(y0, fh - 1))
         x1, y1 = max(x0 + 1, min(x1, fw)), max(y0 + 1, min(y1, fh))
-        
+
         if x1 <= x0 or y1 <= y0:
             c_w, c_h = int(fw * 0.45), int(fw * 0.45 / max(cell_ar, 0.01))
             c_h = min(c_h, fh)
@@ -895,8 +907,8 @@ class PanelTracker:
     def render(self, source_frame: np.ndarray, canvas_w: int, canvas_h: int, gap: int = 4) -> np.ndarray:
         if self._active_count == 0:
             self._active_count = 1
-            
         all_active = sorted([tf for tf in self._tracked if tf.active], key=lambda tf: tf.sx)
+
         if not all_active:
             fallback = _resize_cover(source_frame, canvas_w, canvas_h)
             if self._blend_remaining > 0 and self._prev_output is not None and self._prev_output.shape[:2] == fallback.shape[:2]:
@@ -914,9 +926,10 @@ class PanelTracker:
             self._canvas_buffer = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
         else:
             self._canvas_buffer[:] = 0
-        canvas = self._canvas_buffer
 
+        canvas = self._canvas_buffer
         avg_size = sum(f.sw * f.sh for f in active_faces) / max(len(active_faces), 1)
+
         for idx, cell in enumerate(cells):
             if idx < len(active_faces):
                 face = active_faces[idx]
@@ -926,7 +939,7 @@ class PanelTracker:
             else:
                 canvas[cell.dst_y:cell.dst_y + cell.dst_h, cell.dst_x:cell.dst_x + cell.dst_w] = 0
 
-        self._draw_dividers(canvas, cells, gap) 
+        self._draw_dividers(canvas, cells, gap)
         canvas_copy = canvas.copy()
 
         if self._blend_remaining > 0 and self._prev_output is not None and self._prev_output.shape[:2] == canvas_copy.shape[:2]:
@@ -938,6 +951,7 @@ class PanelTracker:
 
         self._prev_output = output.copy()
         return output.copy()
+
 
 class AutoModeDetector:
     def __init__(self, probe_frames: int = 45, min_faces: int = 2, panel_ratio: float = 0.55):
@@ -962,6 +976,7 @@ class AutoModeDetector:
     def result(self) -> str:
         return "panel" if self._fed and self._panel_hits / max(self._fed, 1) >= self.panel_ratio else "single"
 
+
 class SmoothReframer:
     def __init__(
         self, src_w: int, src_h: int, target_w: int, target_h: int, smooth_strength: float = 0.975, analysis_stride: int = 4,
@@ -980,11 +995,10 @@ class SmoothReframer:
         self.ball_weight, self.context_bias = ball_weight, context_bias
         self.overlay_composite, self.preserve_bottom_overlay = overlay_composite, preserve_bottom_overlay
         self.sport_profile = (sport_profile or "auto").strip().lower()
-        
+
         self.panel_mode = bool(panel_mode)
         self.panel_gap, self.panel_detection_stride = int(panel_gap), max(1, int(panel_detection_stride))
         self.overlay_stride = max(1, int(overlay_stride))
-
         self.face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
         self.saliency = None
         try:
@@ -995,7 +1009,6 @@ class SmoothReframer:
 
         self.overlay_detector = OverlayDetector(src_w, src_h)
         self.scene_detector = SceneChangeDetector()
-
         self.ball_tracker = None if self.panel_mode or not ball_tracking else BallTracker(src_w, src_h, sport_profile=self.sport_profile)
         self.panel_tracker = None
         if self.panel_mode:
@@ -1024,7 +1037,6 @@ class SmoothReframer:
         motion = cv2.dilate(motion, None, iterations=2)
         if self.overlay_detector.exclusion_mask is not None:
             motion[self.overlay_detector.exclusion_mask > 0] = 0
-            
         contours, _ = cv2.findContours(motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         boxes = []
         for c in sorted(contours, key=cv2.contourArea, reverse=True)[:10]:
@@ -1038,7 +1050,6 @@ class SmoothReframer:
         mid_h = max(1, self.target_h - top_h - bottom_h)
         output = np.zeros((self.target_h, self.target_w, 3), dtype=np.uint8)
         output[top_h:top_h + mid_h] = _resize_cover(play_crop, self.target_w, mid_h)
-        
         if top_h > 0 and top_strip is not None and top_strip.size:
             output[:top_h] = cv2.resize(top_strip, (self.target_w, top_h), interpolation=cv2.INTER_AREA)
             cv2.line(output, (0, top_h - 1), (self.target_w - 1, top_h - 1), (10, 10, 10), 1)
@@ -1073,7 +1084,6 @@ class SmoothReframer:
         bottom_strip = self.overlay_detector.extract_bottom_strip(frame) if self.overlay_composite else None
         top_h, bottom_h = _overlay_heights(self.target_h, top_strip, bottom_strip, self.src_h, self.overlay_composite, self.preserve_bottom_overlay)
         panel_canvas_h = max(1, self.target_h - top_h - bottom_h)
-
         panel_frame = self.panel_tracker.render(frame, self.target_w, panel_canvas_h, self.panel_gap)
         return self._compose_output(panel_frame, top_strip, bottom_strip)
 
@@ -1081,7 +1091,6 @@ class SmoothReframer:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         self.overlay_detector.update(frame)
         is_cut = self.scene_detector.check(gray)
-        
         if is_cut:
             self.smoothed_cx = (self.smoothed_cx + self.src_w / 2.0) / 2.0
             self.smoothed_cy = (self.smoothed_cy + self.src_h / 2.0) / 2.0
@@ -1102,7 +1111,7 @@ class SmoothReframer:
             if motion_boxes:
                 x0, y0 = min(b[0] for b in motion_boxes), min(b[1] for b in motion_boxes)
                 x1, y1 = max(b[0] + b[2] for b in motion_boxes), max(b[1] + b[3] for b in motion_boxes)
-                candidates.append((0.20 if self.ball_tracker else 0.38, ((x0 + x1) / 2.0, (y0 + y1) / 2.0))) 
+                candidates.append((0.20 if self.ball_tracker else 0.38, ((x0 + x1) / 2.0, (y0 + y1) / 2.0)))
             else:
                 motion_mask = None
 
@@ -1138,20 +1147,20 @@ class SmoothReframer:
                 self.target_cy = sum(cy * w for w, (_, cy) in candidates) / max(sw, 1e-6)
             else:
                 self.target_cx, self.target_cy = self.src_w / 2.0, self.src_h / 2.0
+
             self.target_cy = _clamp(self.target_cy, play_top + 12, play_bot - 12)
 
         self.prev_gray = gray
         dx, dy = self.target_cx - self.smoothed_cx, self.target_cy - self.smoothed_cy
         if abs(dx) < self.deadzone_px: dx = 0.0
         if abs(dy) < self.deadzone_px * 0.45: dy = 0.0
-        
+
         alpha = (1 - self.smooth_strength) * (3 if is_cut else 1)
         self.smoothed_cx += max(-self.max_pan_px, min(self.max_pan_px, dx * alpha))
         self.smoothed_cy += max(-self.max_pan_px * 0.45, min(self.max_pan_px * 0.45, dy * alpha))
 
         play_top, play_bot = self.overlay_detector.get_play_area_bounds()
         x0 = int(_clamp(round(self.smoothed_cx - self.crop_w / 2), 0, self.max_x))
-        
         play_h = play_bot - play_top
         if play_h >= self.crop_h:
             y0 = int(_clamp(round(self.smoothed_cy - self.crop_h / 2), play_top, play_bot - self.crop_h))
@@ -1162,7 +1171,7 @@ class SmoothReframer:
 
         crop = frame[y0:y0 + self.crop_h, x0:x0 + self.crop_w]
         if crop.size == 0: crop = frame
-        
+
         top_strip = self.overlay_detector.extract_top_strip(frame) if self.overlay_composite else None
         bottom_strip = self.overlay_detector.extract_bottom_strip(frame) if self.overlay_composite else None
         return self._compose_output(crop, top_strip, bottom_strip)
@@ -1177,10 +1186,11 @@ class SmoothReframer:
                     self.panel_mode, self.ball_tracker = True, None
                     p = self._init_panel
                     self.panel_tracker = PanelTracker(self.src_w, self.src_h, p["panel_max_faces"], p["panel_max_missing_frames"], p["panel_layout_hold_frames"], p["panel_blend_frames"], p["panel_min_face_area_ratio"], p["panel_pos_alpha"], p["panel_size_alpha"])
-        
+
         if self.panel_mode and self.panel_tracker is not None:
             return self._process_panel(frame)
         return self._process_single(frame)
+
 
 def create_vertical_master(
     source_path: str, output_path: str, target_w: int = DEFAULT_TARGET_W, target_h: int = DEFAULT_TARGET_H,
@@ -1198,13 +1208,14 @@ def create_vertical_master(
     if src_w <= 0 or src_h <= 0:
         cap.release()
         return False, "Invalid source dimensions"
-        
+
     reframer = SmoothReframer(
         src_w, src_h, target_w, target_h, smooth_strength, analysis_stride, deadzone_ratio, max_pan_ratio,
         sport_profile, ball_tracking, overlay_composite=overlay_composite, preserve_bottom_overlay=preserve_bottom_overlay,
         panel_mode=panel_mode, panel_max_faces=panel_max_faces, panel_detection_stride=panel_detection_stride,
         panel_gap=panel_gap, auto_mode=auto_mode,
     )
+
     writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps if fps > 0 else DEFAULT_OUTPUT_FPS, (target_w, target_h))
     if not writer.isOpened():
         cap.release()
@@ -1225,12 +1236,14 @@ def create_vertical_master(
         writer.release()
     return True, "Done"
 
+
 @dataclass
 class CFStreamConfig:
     account_id: str
     api_token: str
     customer_code: str
     prefer_low_latency: bool = False
+
 
 @dataclass
 class LiveSession:
@@ -1250,13 +1263,16 @@ class LiveSession:
     stats_lock: threading.Lock = field(default_factory=threading.Lock)
     error: str = ""
 
+
 def _stats_snapshot(session: LiveSession) -> dict:
     with getattr(session, "stats_lock", threading.Lock()):
         return dict(getattr(session, "stats", {}) or {})
 
+
 def _stats_update(session: LiveSession, values: dict) -> None:
     with getattr(session, "stats_lock", threading.Lock()):
         session.stats.update(values)
+
 
 def _stats_inc(session: LiveSession, key: str, amount: int | float = 1) -> None:
     with getattr(session, "stats_lock", threading.Lock()):
@@ -1276,6 +1292,7 @@ def _resource_snapshot() -> dict:
     except Exception:
         return {}
 
+
 def cfstream_config_from_inputs(account_id: str, api_token: str, customer_code: str, prefer_low_latency: bool = False) -> CFStreamConfig:
     if not account_id: raise ValueError("Cloudflare account ID is required.")
     if not api_token: raise ValueError("Cloudflare API token is required.")
@@ -1283,10 +1300,15 @@ def cfstream_config_from_inputs(account_id: str, api_token: str, customer_code: 
     code = customer_code.strip().replace("customer-", "").replace(".cloudflarestream.com", "").strip("/")
     return CFStreamConfig(account_id.strip(), api_token.strip(), code, bool(prefer_low_latency))
 
+
 def _cf_api_request(cfg: CFStreamConfig, method: str, path: str, payload: Optional[dict] = None):
     url = f"https://api.cloudflare.com/client/v4{path}"
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    headers = {"Authorization": f"Bearer {cfg.api_token}", "Content-Type": "application/json", "User-Agent": "DualFlow-Vertical-Cloudflare"}
+    headers = {
+        "Authorization": f"Bearer {cfg.api_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "DualFlow-Vertical-Cloudflare"
+    }
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -1297,19 +1319,32 @@ def _cf_api_request(cfg: CFStreamConfig, method: str, path: str, payload: Option
         parsed = _safe_json_loads(body) if body else {"success": False, "errors": [{"message": body}]}
         return exc.code, parsed
 
+
 def create_live_input(cfg: CFStreamConfig, name: str, recording_mode: str = "automatic") -> dict:
-    payload = {"meta": {"name": name}, "recording": {"mode": recording_mode, "timeoutSeconds": 0}, "preferLowLatency": bool(cfg.prefer_low_latency), "enabled": True}
+    payload = {
+        "meta": {"name": name},
+        "recording": {"mode": recording_mode, "timeoutSeconds": 0},
+        "preferLowLatency": bool(cfg.prefer_low_latency),
+        "enabled": True
+    }
     status, parsed = _cf_api_request(cfg, "POST", f"/accounts/{cfg.account_id}/stream/live_inputs", payload)
     if status not in (200, 201) or not parsed.get("success"):
         raise RuntimeError(f"Create live input failed: {parsed}")
     return parsed["result"]
 
+
 def disable_live_input(cfg: CFStreamConfig, uid: str) -> None:
     _cf_api_request(cfg, "PUT", f"/accounts/{cfg.account_id}/stream/live_inputs/{uid}", {"enabled": False})
 
+
 def build_public_playback_urls(cfg: CFStreamConfig, uid: str):
     base = f"https://customer-{cfg.customer_code}.cloudflarestream.com/{uid}"
-    return f"{base}/manifest/video.m3u8" + ("?protocol=llhls" if cfg.prefer_low_latency else ""), f"{base}/manifest/video.mpd", f"{base}/iframe?autoplay=true&muted=true&controls=true&preload=metadata"
+    return (
+        f"{base}/manifest/video.m3u8" + ("?protocol=llhls" if cfg.prefer_low_latency else ""),
+        f"{base}/manifest/video.mpd",
+        f"{base}/iframe?autoplay=true&muted=true&controls=true&preload=metadata"
+    )
+
 
 def _common_output_args(fps_int: int) -> list[str]:
     return [
@@ -1352,12 +1387,14 @@ def _common_output_args(fps_int: int) -> list[str]:
         "-muxpreload", "0",
     ]
 
+
 def build_push_file_command(reframed_mp4: str, rtmps_url: str, stream_key: str, loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS):
     target = rtmps_url.rstrip("/") + "/" + stream_key
     fps_int = max(24, min(60, int(round(output_fps or DEFAULT_OUTPUT_FPS))))
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-y"] + (["-stream_loop", "-1"] if loop_input else []) + ["-re", "-i", reframed_mp4]
     cmd += (["-map", "0:v:0", "-map", "0:a:0"] if _source_has_audio(reframed_mp4) else ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-map", "0:v:0", "-map", "1:a:0"])
     return cmd + _common_output_args(fps_int) + ["-f", "flv", target]
+
 
 def start_vod_to_live_push(cfg: CFStreamConfig, reframed_mp4: str, asset_name: str, loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS) -> LiveSession:
     li = create_live_input(cfg, safe_token(Path(asset_name).stem))
@@ -1368,13 +1405,24 @@ def start_vod_to_live_push(cfg: CFStreamConfig, reframed_mp4: str, asset_name: s
     proc = subprocess.Popen(cmd, stdout=open(log_path, "w", encoding="utf-8"), stderr=subprocess.STDOUT, text=True)
     return LiveSession(uid, rtmps_url, key, hls, dash, iframe, cmd, proc, log_path, status="streaming")
 
-def build_realtime_rtmps_push_command(target_w: int, target_h: int, fps: float, rtmps_url: str, stream_key: str):
+
+def build_realtime_rtmps_push_command(target_w: int, target_h: int, fps: float, rtmps_url: str, stream_key: str, source: Optional[str] = None):
     target = rtmps_url.rstrip("/") + "/" + stream_key
     fps_int = max(24, min(60, int(round(fps or DEFAULT_OUTPUT_FPS))))
-    return [
-        "ffmpeg", "-hide_banner", "-loglevel", "info", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{target_w}x{target_h}", "-r", str(fps_int), "-i", "-",
-        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-map", "0:v:0", "-map", "1:a:0"
-    ] + _common_output_args(fps_int) + ["-f", "flv", target]
+    
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "info", "-y",
+        "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{target_w}x{target_h}", "-r", str(fps_int), "-i", "-",
+    ]
+    
+    # FIX: Map audio directly from the original source if it contains audio streams
+    if source and _source_has_audio(source):
+        cmd += ["-i", source, "-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+    else:
+        cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-map", "0:v:0", "-map", "1:a:0"]
+        
+    return cmd + _common_output_args(fps_int) + ["-f", "flv", target]
+
 
 def _read_frame_timeout(proc: subprocess.Popen, nbytes: int, timeout: float = INGEST_READ_TIMEOUT) -> Optional[bytes]:
     if proc is None or proc.stdout is None:
@@ -1391,7 +1439,7 @@ def _read_frame_timeout(proc: subprocess.Popen, nbytes: int, timeout: float = IN
         except queue.Empty:
             return None
         return data if data and len(data) == nbytes else None
-    
+
     fd, deadline, data = proc.stdout.fileno(), time.monotonic() + timeout, bytearray()
     while len(data) < nbytes:
         rem = deadline - time.monotonic()
@@ -1414,6 +1462,7 @@ def _read_frame_timeout(proc: subprocess.Popen, nbytes: int, timeout: float = IN
         data.extend(chunk)
     return bytes(data)
 
+
 def _build_ingest_command(source: str, fps: float, pace_input: bool, loop_file: bool) -> list[str]:
     fps_int = max(24, min(60, int(round(fps or DEFAULT_OUTPUT_FPS))))
     vf = (
@@ -1423,7 +1472,6 @@ def _build_ingest_command(source: str, fps: float, pace_input: bool, loop_file: 
         f"pad={WORKING_INPUT_W}:{WORKING_INPUT_H}:"
         f"(ow-iw)/2:(oh-ih)/2:black"
     )
-
     return [
         "ffmpeg",
         "-hide_banner",
@@ -1434,7 +1482,7 @@ def _build_ingest_command(source: str, fps: float, pace_input: bool, loop_file: 
         pace_input=bool(pace_input) and not is_network_source(source),
         loop_file=loop_file,
     ) + [
-        "-an",
+        "-an",  # Audio is handled directly by the output FFmpeg process
         "-vf", vf,
         "-pix_fmt", "bgr24",
         "-fflags", "nobuffer",
@@ -1443,6 +1491,7 @@ def _build_ingest_command(source: str, fps: float, pace_input: bool, loop_file: 
         "pipe:1",
     ]
 
+
 def _open_ingest_process(source: str, fps: float, pace_input: bool, loop_file: bool, log_path: str) -> subprocess.Popen:
     cmd = _build_ingest_command(source, fps, pace_input, loop_file)
     log_fp = open(log_path, "a", encoding="utf-8")
@@ -1450,11 +1499,13 @@ def _open_ingest_process(source: str, fps: float, pace_input: bool, loop_file: b
     log_fp.flush()
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log_fp, bufsize=0)
 
+
 def _start_output_process(session: LiveSession) -> subprocess.Popen:
     log_fp = open(session.log_path, "a", encoding="utf-8")
     log_fp.write("\n=== PUSH CMD ===\n" + " ".join(session.ffmpeg_cmd) + "\n")
     log_fp.flush()
     return subprocess.Popen(session.ffmpeg_cmd, stdin=subprocess.PIPE, stdout=log_fp, stderr=subprocess.STDOUT, bufsize=0)
+
 
 def _terminate_process(proc: Optional[subprocess.Popen], timeout: float = 8.0) -> None:
     if proc is None:
@@ -1467,11 +1518,13 @@ def _terminate_process(proc: Optional[subprocess.Popen], timeout: float = 8.0) -
             except subprocess.TimeoutExpired:
                 proc.kill()
 
+
 def _make_placeholder_frame(w: int, h: int, text: str = "Starting stream...") -> np.ndarray:
     frame = np.zeros((h, w, 3), dtype=np.uint8)
     frame[:] = (18, 22, 36)
     cv2.putText(frame, "Vertical stream", (28, max(48, h//10)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
     return frame
+
 
 def _realtime_worker(
     session: LiveSession, source: str, target_w: int, target_h: int, delay_seconds: float, smooth_strength: float,
@@ -1497,7 +1550,6 @@ def _realtime_worker(
     input_buffer: collections.deque[tuple[int, float, np.ndarray]] = collections.deque(maxlen=max_buffer_frames)
 
     counters = {k: 0 for k in ["frames_in", "frames_processed", "frames_out", "frames_repeated", "frames_dropped_input", "frames_dropped_processing", "source_stalls", "consecutive_source_stalls", "ingest_restarts", "write_failures", "output_write_failures", "frame_drops", "input_drop_count", "startup_buffer_fill_frames", "output_underruns"]}
-
     process_samples = collections.deque(maxlen=180)
     read_samples = collections.deque(maxlen=180)
     write_samples = collections.deque(maxlen=180)
@@ -1550,23 +1602,23 @@ def _realtime_worker(
                 ingest_holder["proc"] = restart_ingest()
                 time.sleep(0.02)
                 continue
-                
+
             rs = time.monotonic()
             raw = _read_frame_timeout(proc, frame_bytes, INGEST_READ_TIMEOUT)
             read_samples.append((time.monotonic() - rs) * 1000)
-            
+
             if raw is None or len(raw) != frame_bytes:
                 counters["source_stalls"] += 1
                 counters["consecutive_source_stalls"] += 1
                 if counters["consecutive_source_stalls"] >= 3:
                     ingest_holder["proc"] = restart_ingest()
                 continue
-                
+
             counters["consecutive_source_stalls"] = 0
             seq += 1
             frame = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3)).copy()
             ts = time.monotonic()
-            
+
             with input_lock:
                 if len(input_buffer) == input_buffer.maxlen:
                     counters["frames_dropped_input"] += 1
@@ -1575,7 +1627,7 @@ def _realtime_worker(
                 input_buffer.append((seq, ts, frame))
                 counters["frames_in"] += 1
                 win["in"] += 1
-                
+
             if first:
                 first = False
                 _stats_update(session, {"startup_ms_to_first_source_frame": round((time.monotonic() - start_ts) * 1000, 2)})
@@ -1599,24 +1651,22 @@ def _realtime_worker(
                     backlog = len(input_buffer)
                     skipped = 0
                     if backlog > LIVE_BACKLOG_HARD_FRAMES:
-                        # Hard latency guard: drop oldest frames aggressively until one contextual frame remains.
                         skipped = max(0, backlog - LIVE_BACKLOG_SOFT_FRAMES)
                         while len(input_buffer) > LIVE_BACKLOG_SOFT_FRAMES:
                             input_buffer.popleft()
                     elif backlog > LIVE_BACKLOG_SOFT_FRAMES:
-                        # Soft pressure: keep the newest two frames to reduce visible jumpiness.
                         skipped = max(0, backlog - LIVE_BACKLOG_SOFT_FRAMES)
                         while len(input_buffer) > LIVE_BACKLOG_SOFT_FRAMES:
                             input_buffer.popleft()
                     item = input_buffer.popleft()
-                    
+
             if item is None:
                 time.sleep(0.002)
                 continue
-                
+
             if skipped > 0:
                 counters["frames_dropped_processing"] += skipped
-                
+
             seq, ts, frame = item
             ps = time.monotonic()
             try:
@@ -1624,20 +1674,19 @@ def _realtime_worker(
             except Exception as exc:
                 logger.exception("[REFRAMER ERROR] %s", exc)
                 out = latest_output["frame"]
-                
+
             process_samples.append((time.monotonic() - ps) * 1000)
-            
             p95_proc = p95(process_samples)
             if p95_proc > 85:
                 runtime_stride = min(runtime_stride + 1, 10)
             elif p95_proc < 45:
                 runtime_stride = max(runtime_stride - 1, 2)
             reframer.analysis_stride = runtime_stride
-            
+
             with output_lock:
                 latest_output.update(seq=latest_output["seq"] + 1, ts=time.monotonic(), frame=out)
                 new_frame_evt.set()
-                
+
             counters["frames_processed"] += 1
             win["proc"] += 1
             _stats_update(session, {
@@ -1654,28 +1703,23 @@ def _realtime_worker(
 
     next_deadline = time.monotonic()
     last_seq = -1
-
     try:
         while not stop.is_set():
             with output_lock:
                 out_frame = latest_output["frame"]
                 out_seq = latest_output["seq"]
                 age = (time.monotonic() - latest_output["ts"]) * 1000 if latest_output["ts"] else 0
-                
+
             with input_lock:
                 blen = len(input_buffer)
-                
+
             if out_seq == last_seq:
                 counters["frames_repeated"] += 1
                 counters["output_underruns"] += 1
                 if age > LIVE_MAX_ACCEPTABLE_FRAME_AGE_MS:
-                    out_frame = _make_placeholder_frame(
-                        target_w,
-                        target_h,
-                        "Re-syncing live feed..."
-                    )
+                    out_frame = _make_placeholder_frame(target_w, target_h, "Re-syncing live feed...")
             last_seq = out_seq
-            
+
             ws = time.monotonic()
             try:
                 if session.proc is None or session.proc.stdin is None or session.proc.poll() is not None:
@@ -1689,18 +1733,18 @@ def _realtime_worker(
                 session.status = "ffmpeg_pipe_broken"
                 session.error = str(exc)
                 break
-                
+
             write_samples.append((time.monotonic() - ws) * 1000)
             sleep_for = next_deadline - time.monotonic()
             drift_samples.append(max(0, -sleep_for * 1000))
-            
+
             if sleep_for > 0:
                 new_frame_evt.wait(timeout=sleep_for)
                 new_frame_evt.clear()
             elif -sleep_for > frame_interval * 3:
                 next_deadline = time.monotonic()
             next_deadline += frame_interval
-            
+
             now = time.monotonic()
             if now - win["t"] >= 1:
                 elapsed = now - win["t"]
@@ -1708,7 +1752,7 @@ def _realtime_worker(
                 fps_proc = round(win["proc"] / elapsed, 1)
                 fps_out = round(win["out"] / elapsed, 1)
                 win["t"], win["in"], win["proc"], win["out"] = now, 0, 0, 0
-                
+
                 health = "healthy" if fps_out >= fps_int * 0.90 else "output_fps_low"
                 _stats_update(session, {
                     "health": health, "fps_in": fps_in, "ingest_fps_1s": fps_in, "fps_process": fps_proc, "process_fps_1s": fps_proc,
@@ -1733,6 +1777,7 @@ def _realtime_worker(
         if session.status not in {"ffmpeg_pipe_broken", "worker_error", "ffmpeg_start_failed", "source_ended"}:
             session.status = "stopped"
 
+
 def start_realtime_delayed_vertical_push(
     cfg: CFStreamConfig, source: str, asset_name: str, target_w: int = DEFAULT_TARGET_W, target_h: int = DEFAULT_TARGET_H,
     delay_seconds: float = 0.0, smooth_strength: float = 0.975, analysis_stride: int = 4, deadzone_ratio: float = 0.05,
@@ -1744,12 +1789,21 @@ def start_realtime_delayed_vertical_push(
     li = create_live_input(cfg, safe_token(Path(asset_name).stem))
     uid, rtmps_url, key = li["uid"], li["rtmps"]["url"], li["rtmps"]["streamKey"]
     hls, dash, iframe = build_public_playback_urls(cfg, uid)
+    
     src_meta = probe_source(source)
     selected_output_fps = max(LIVE_OUTPUT_FPS_MIN, min(LIVE_OUTPUT_FPS_MAX, int(round(float(output_fps or src_meta.get("fps") or DEFAULT_OUTPUT_FPS)))))
-    cmd = build_realtime_rtmps_push_command(target_w, target_h, selected_output_fps, rtmps_url, key)
+    
+    # Pass source to map audio directly if available
+    audio_source = source if src_meta.get("has_audio") else None
+    cmd = build_realtime_rtmps_push_command(target_w, target_h, selected_output_fps, rtmps_url, key, source=audio_source)
+    
     log_path = tempfile.NamedTemporaryFile(delete=False, suffix=".log").name
     session = LiveSession(uid, rtmps_url, key, hls, dash, iframe, cmd, None, log_path)
-    _stats_update(session, {"selected_output_fps": selected_output_fps, "source_fps": src_meta.get("fps", 0.0), "source_width": src_meta.get("width", 0), "source_height": src_meta.get("height", 0)})
+    _stats_update(session, {
+        "selected_output_fps": selected_output_fps, "source_fps": src_meta.get("fps", 0.0),
+        "source_width": src_meta.get("width", 0), "source_height": src_meta.get("height", 0)
+    })
+
     session.worker = threading.Thread(
         target=_realtime_worker,
         args=(session, source, target_w, target_h, delay_seconds, smooth_strength, analysis_stride, deadzone_ratio, max_pan_ratio, loop_file, pace_input, sport_profile, ball_tracking, overlay_composite, preserve_bottom_overlay, panel_mode, panel_max_faces, panel_detection_stride, panel_gap, auto_mode, selected_output_fps),
@@ -1758,6 +1812,7 @@ def start_realtime_delayed_vertical_push(
     )
     session.worker.start()
     return session
+
 
 def cleanup_old_logs(directory: str = "/tmp", max_age_seconds: int = CLEANUP_LOG_MAX_AGE_SECONDS) -> int:
     removed = 0
@@ -1772,6 +1827,7 @@ def cleanup_old_logs(directory: str = "/tmp", max_age_seconds: int = CLEANUP_LOG
                         removed += 1
     return removed
 
+
 def stop_live_session(cfg: CFStreamConfig, session: Optional[LiveSession]) -> None:
     if not session:
         return
@@ -1783,6 +1839,7 @@ def stop_live_session(cfg: CFStreamConfig, session: Optional[LiveSession]) -> No
     with contextlib.suppress(Exception):
         disable_live_input(cfg, session.uid)
     cleanup_old_logs()
+
 
 def read_log_tail(path: str, max_chars: int = 12000) -> str:
     try:
