@@ -73,6 +73,50 @@ YOLO_BALL_DETECT_EVERY_N = 6
 YOLO_BALL_MODEL_CANDIDATES = ("yolo11n.pt", "yolov8n.pt", "yolov8s.pt")
 
 
+
+def _normalize_output_fps(value: float | int | str | None, *, live: bool = False) -> int:
+    """Normalize fps for streaming paths while avoiding accidental live overload."""
+    try:
+        fps = int(round(float(value or DEFAULT_OUTPUT_FPS)))
+    except Exception:
+        fps = int(round(DEFAULT_OUTPUT_FPS))
+    hi = LIVE_OUTPUT_FPS_MAX if live else 60
+    return max(LIVE_OUTPUT_FPS_MIN, min(hi, fps))
+
+
+def _redact_url(value: str) -> str:
+    """Redact stream keys and URL credentials before writing commands to logs."""
+    if not value:
+        return value
+    text = str(value)
+    text = re.sub(r"(rtmps?://[^\s]+/)[^/\s]+$", r"\1<redacted-stream-key>", text)
+    text = re.sub(r"(?i)(api[_-]?token|token|key|sig|signature|access_token)=([^&\s]+)", r"\1=<redacted>", text)
+    text = re.sub(r"(?i)(password|pass|pwd)=([^&\s]+)", r"\1=<redacted>", text)
+    return text
+
+
+def _redact_cmd(cmd: list[str]) -> str:
+    return " ".join(_redact_url(part) for part in (cmd or []))
+
+
+def _audio_source_input_args(source: str, fps: float, *, loop_audio: bool = False, pace_audio: bool = True) -> list[str]:
+    """Build input args for preserving source audio in the RTMPS output muxer."""
+    if not source:
+        return []
+    is_net = is_network_source(source)
+    args = ["-thread_queue_size", "512"]
+    if loop_audio and not is_net:
+        args += ["-stream_loop", "-1"]
+    if pace_audio and not is_net:
+        args += ["-re"]
+    if is_net:
+        args += ["-rw_timeout", "15000000"]
+    if str(source).lower().startswith(("http://", "https://")):
+        args += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"]
+    args += ["-i", source]
+    return args
+
+
 def ffmpeg_ok() -> bool:
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=5)
@@ -1379,6 +1423,7 @@ def _common_output_args(fps_int: int) -> list[str]:
         "-b:a", "128k",
         "-ar", "48000",
         "-ac", "2",
+        "-af", "aresample=async=1:first_pts=0",
         "-flvflags", "no_duration_filesize",
         "-fflags", "nobuffer",
         "-flags", "low_delay",
@@ -1390,7 +1435,7 @@ def _common_output_args(fps_int: int) -> list[str]:
 
 def build_push_file_command(reframed_mp4: str, rtmps_url: str, stream_key: str, loop_input: bool = True, output_fps: float = DEFAULT_OUTPUT_FPS):
     target = rtmps_url.rstrip("/") + "/" + stream_key
-    fps_int = max(24, min(60, int(round(output_fps or DEFAULT_OUTPUT_FPS))))
+    fps_int = _normalize_output_fps(output_fps, live=False)
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-y"] + (["-stream_loop", "-1"] if loop_input else []) + ["-re", "-i", reframed_mp4]
     cmd += (["-map", "0:v:0", "-map", "0:a:0"] if _source_has_audio(reframed_mp4) else ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-map", "0:v:0", "-map", "1:a:0"])
     return cmd + _common_output_args(fps_int) + ["-f", "flv", target]
@@ -1406,21 +1451,39 @@ def start_vod_to_live_push(cfg: CFStreamConfig, reframed_mp4: str, asset_name: s
     return LiveSession(uid, rtmps_url, key, hls, dash, iframe, cmd, proc, log_path, status="streaming")
 
 
-def build_realtime_rtmps_push_command(target_w: int, target_h: int, fps: float, rtmps_url: str, stream_key: str, source: Optional[str] = None):
+def build_realtime_rtmps_push_command(
+    target_w: int,
+    target_h: int,
+    fps: float,
+    rtmps_url: str,
+    stream_key: str,
+    source: Optional[str] = None,
+    *,
+    loop_audio: bool = False,
+    pace_audio: bool = True,
+):
+    """Build the RTMPS output command for processed raw-video frames.
+
+    Raw vertical frames are input #0 from stdin. When source audio exists, the
+    original source becomes input #1 and is mapped explicitly. The output does
+    not use -shortest; the worker owns lifetime by closing stdin, which avoids
+    premature audio EOF stopping the live push.
+    """
     target = rtmps_url.rstrip("/") + "/" + stream_key
-    fps_int = max(24, min(60, int(round(fps or DEFAULT_OUTPUT_FPS))))
-    
+    fps_int = _normalize_output_fps(fps, live=True)
+
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "info", "-y",
+        "-thread_queue_size", "512",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{target_w}x{target_h}", "-r", str(fps_int), "-i", "-",
     ]
-    
-    # FIX: Map audio directly from the original source if it contains audio streams
+
     if source and _source_has_audio(source):
-        cmd += ["-i", source, "-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+        cmd += _audio_source_input_args(source, fps_int, loop_audio=loop_audio, pace_audio=pace_audio)
+        cmd += ["-map", "0:v:0", "-map", "1:a:0"]
     else:
         cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-map", "0:v:0", "-map", "1:a:0"]
-        
+
     return cmd + _common_output_args(fps_int) + ["-f", "flv", target]
 
 
@@ -1464,7 +1527,7 @@ def _read_frame_timeout(proc: subprocess.Popen, nbytes: int, timeout: float = IN
 
 
 def _build_ingest_command(source: str, fps: float, pace_input: bool, loop_file: bool) -> list[str]:
-    fps_int = max(24, min(60, int(round(fps or DEFAULT_OUTPUT_FPS))))
+    fps_int = _normalize_output_fps(fps, live=True)
     vf = (
         f"fps={fps_int},"
         f"scale={WORKING_INPUT_W}:{WORKING_INPUT_H}:"
@@ -1495,14 +1558,14 @@ def _build_ingest_command(source: str, fps: float, pace_input: bool, loop_file: 
 def _open_ingest_process(source: str, fps: float, pace_input: bool, loop_file: bool, log_path: str) -> subprocess.Popen:
     cmd = _build_ingest_command(source, fps, pace_input, loop_file)
     log_fp = open(log_path, "a", encoding="utf-8")
-    log_fp.write("\n=== INGEST CMD ===\n" + " ".join(cmd) + "\n")
+    log_fp.write("\n=== INGEST CMD ===\n" + _redact_cmd(cmd) + "\n")
     log_fp.flush()
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log_fp, bufsize=0)
 
 
 def _start_output_process(session: LiveSession) -> subprocess.Popen:
     log_fp = open(session.log_path, "a", encoding="utf-8")
-    log_fp.write("\n=== PUSH CMD ===\n" + " ".join(session.ffmpeg_cmd) + "\n")
+    log_fp.write("\n=== PUSH CMD ===\n" + _redact_cmd(session.ffmpeg_cmd) + "\n")
     log_fp.flush()
     return subprocess.Popen(session.ffmpeg_cmd, stdin=subprocess.PIPE, stdout=log_fp, stderr=subprocess.STDOUT, bufsize=0)
 
@@ -1534,7 +1597,7 @@ def _realtime_worker(
     output_fps: float = DEFAULT_OUTPUT_FPS
 ) -> None:
     start_ts = time.monotonic()
-    fps_int = max(LIVE_OUTPUT_FPS_MIN, min(60, int(round(float(output_fps or DEFAULT_OUTPUT_FPS)))))
+    fps_int = _normalize_output_fps(output_fps, live=True)
     frame_interval = 1.0 / fps_int
     src_w, src_h = WORKING_INPUT_W, WORKING_INPUT_H
     frame_bytes = src_w * src_h * 3
@@ -1570,6 +1633,11 @@ def _realtime_worker(
 
     try:
         session.proc = _start_output_process(session)
+        time.sleep(0.05)
+        if session.proc.poll() is not None:
+            session.status = "ffmpeg_start_failed"
+            session.error = read_log_tail(session.log_path, 4000)
+            return
         session.status = "streaming"
     except Exception as exc:
         session.status = "ffmpeg_start_failed"
@@ -1578,6 +1646,10 @@ def _realtime_worker(
 
     with contextlib.suppress(Exception):
         for _ in range(max(1, int(fps_int * LIVE_STARTUP_PRIME_SECONDS))):
+            if session.proc.poll() is not None:
+                session.status = "ffmpeg_pipe_broken"
+                session.error = read_log_tail(session.log_path, 4000)
+                return
             session.proc.stdin.write(latest_output["frame"].tobytes())
             counters["frames_out"] += 1
 
@@ -1791,11 +1863,11 @@ def start_realtime_delayed_vertical_push(
     hls, dash, iframe = build_public_playback_urls(cfg, uid)
     
     src_meta = probe_source(source)
-    selected_output_fps = max(LIVE_OUTPUT_FPS_MIN, min(LIVE_OUTPUT_FPS_MAX, int(round(float(output_fps or src_meta.get("fps") or DEFAULT_OUTPUT_FPS)))))
+    selected_output_fps = _normalize_output_fps(output_fps or src_meta.get("fps") or DEFAULT_OUTPUT_FPS, live=True)
     
     # Pass source to map audio directly if available
     audio_source = source if src_meta.get("has_audio") else None
-    cmd = build_realtime_rtmps_push_command(target_w, target_h, selected_output_fps, rtmps_url, key, source=audio_source)
+    cmd = build_realtime_rtmps_push_command(target_w, target_h, selected_output_fps, rtmps_url, key, source=audio_source, loop_audio=loop_file, pace_audio=pace_input)
     
     log_path = tempfile.NamedTemporaryFile(delete=False, suffix=".log").name
     session = LiveSession(uid, rtmps_url, key, hls, dash, iframe, cmd, None, log_path)
